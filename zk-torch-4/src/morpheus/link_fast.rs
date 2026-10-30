@@ -316,7 +316,13 @@ pub fn cpu_memory_plan(p: &Profile, st: &Statement, b0: usize) -> Option<CpuMemo
                 dense_blocks.push((r.source, (r.base >> b0)+k, (r.base >> b0)+k+1));
             } else { dense_blocks.push((r.source, r.base >> b0, (r.base >> b0).checked_add(nb)?)); }
         } else {
-            block_term_entries = block_term_entries.checked_add(nb)?;
+            // Exact public support of eq(high, k). Boolean coordinates fix a bit;
+            // other field coordinates have two nonzero factors. Scale zero has
+            // empty support. Challenge-dependent zero coefficients may further
+            // reduce execution entries, so this remains a public upper bound.
+            let free = t.r[b0-r.p..].iter().filter(|x| **x != K8::ZERO && **x != K8::ONE).count();
+            let supported = if t.scale.is_zero() { 0 } else { pow(free)? };
+            block_term_entries = block_term_entries.checked_add(supported)?;
             for i in 0..b0 {
                 let d = p.deg_old;
                 let (a,b) = if i < r.p { ((d+1).checked_mul(pow(r.p-i-1)?)?, pow(b0-r.p)?) }
@@ -430,12 +436,26 @@ pub fn prove_with(
             terms.push(TermInfo { p: pp, pw: t.pw.clone(), r: t.r.clone() });
             let idx_bits = b0 - pp;
             let nb = 1usize << (m + pp - b0);
+            // Preserve every TermInfo (and its tables/validation), omitting
+            // only algebraically zero block coefficients. Do not alter declared
+            // bit blocks: their chi obligations are independent of query support.
+            let mut fixed_mask = 0usize;
+            let mut fixed_value = 0usize;
+            for (j, x) in t.r[idx_bits..].iter().enumerate() {
+                if *x == K8::ZERO || *x == K8::ONE {
+                    fixed_mask |= 1usize << j;
+                    if *x == K8::ONE { fixed_value |= 1usize << j; }
+                }
+            }
             for k in 0..nb {
+                if (k & fixed_mask) != fixed_value { continue; }
                 // Block k of the region covers index high bits k.
                 let hi = t.r[idx_bits..].iter().enumerate().fold(K8::ONE, |a, (jj, x)| a.mul(&eqb(x, (k >> jj) & 1)));
                 let c = coef.mul(&t.scale).mul(&hi);
                 let id = (t.region.base >> b0) + k;
-                by_block.entry((t.region.source, id)).or_default().push(BlockTerm { term: ti, c });
+                if !c.is_zero() {
+                    by_block.entry((t.region.source, id)).or_default().push(BlockTerm { term: ti, c });
+                }
             }
         }
     }
@@ -454,11 +474,11 @@ pub fn prove_with(
         let mut ids: std::collections::BTreeSet<usize> = nz.into_iter().collect();
         for &(ss, id) in by_block.keys().chain(dense.keys()) { if ss == s { ids.insert(id); } }
         for id in ids {
-            blocks.push(Block { source: s, id, chi: bit_block.contains_key(&(s, id)), c_alpha: c_alpha(id), terms: by_block.get(&(s, id)).cloned().unwrap_or_default(), qd: dense.remove(&(s, id)).map(std::sync::Arc::new) });
+            blocks.push(Block { source: s, id, chi: bit_block.contains_key(&(s, id)), c_alpha: c_alpha(id), terms: by_block.remove(&(s, id)).unwrap_or_default(), qd: dense.remove(&(s, id)).map(std::sync::Arc::new) });
         }
     }
-    // BlockTerm entries were cloned into blocks; do not retain a second copy
-    // through all sumcheck rounds. Dense payloads have been moved into Arcs.
+    // BlockTerm vectors are moved into blocks, never duplicated at assembly.
+    // Dense payloads have been moved into Arcs.
     drop(by_block);
     drop(dense);
     lap("terms + blocks");
