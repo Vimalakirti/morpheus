@@ -3300,7 +3300,7 @@ int agl_mlink2_consts(const void* d_blks, uint32_t nblk, const void* h_consts, u
 int agl_mlink2_round(const int8_t* d_raw, uint64_t src_len, int b0, int i, int d, int reduced, const void* h_consts,
                      const void* d_onehot, uint32_t n_onehot, const void* d_generic, uint32_t n_generic, const uint64_t* d_bc,
                      const uint64_t* d_e1, const uint64_t* d_e2, const uint64_t* d_e3, const uint64_t* d_ealpha,
-                     uint64_t* h_out) {
+                     int skip_range, uint64_t* h_out) {
     if (d > mlink2::MAXD) return -3;
     mlink2::Consts C; memcpy(&C, h_consts, sizeof(C));
     int sms = ma_sms();
@@ -3320,7 +3320,9 @@ int agl_mlink2_round(const int8_t* d_raw, uint64_t src_len, int b0, int i, int d
         int grid = sms * 16; if ((uint32_t)grid > n_generic) grid = (int)n_generic;
         void* part = nullptr; if (cuda_malloc(&part, (size_t)grid * mlink2::NACC * 64)) return -1;
         cudaMemset(part, 0, (size_t)grid * mlink2::NACC * 64);
-        mlink2::generic_kernel<<<grid, reduced ? 96 : 32 * (d + 1)>>>(d_raw, src_len, b0, i, d, reduced, (const mlink2::Blk*)d_generic, n_generic, C, (const mauth::K8d*)d_bc,
+        const char* gd = getenv("MORPHEUS_DBG_GEN");
+        const int dbg = (gd ? atoi(gd) : 0) | (skip_range ? 1 : 0);
+        mlink2::generic_kernel<<<grid, reduced ? 96 : 32 * (d + 1)>>>(d_raw, src_len, b0, i, d, (reduced ? 1 : 0) | (dbg << 1), (const mlink2::Blk*)d_generic, n_generic, C, (const mauth::K8d*)d_bc,
             (const mauth::K8d*)d_e1, (const mauth::K8d*)d_ealpha, (mauth::K8d*)part);
         cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
         if (e != cudaSuccess) { cuda_free(part); return -(int)e; }
@@ -3366,6 +3368,18 @@ int agl_mlink2_dense_expand(const uint64_t* d_af, int afn, const uint64_t* d_pf,
                             uint64_t ntab, uint64_t* d_out) {
     if (ntab == 0) return 0;
     mlink2::dense_expand_kernel<<<ma_sms() * 16, 256>>>((const mauth::K8d*)d_af, afn, (const mauth::K8d*)d_pf, d_pf_off, pbits, ybits, ntab, (mauth::K8d*)d_out);
+    cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
+    return (int)e;
+}
+
+int agl_mlink2_range_bin1(const int8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
+                          const void* d_blks, uint32_t nblk, const uint64_t* d_bc, const uint64_t* d_ea1, uint64_t* d_R) {
+    if (nblk == 0) return 0;
+    mlink2::Consts C; memcpy(&C, h_consts, sizeof(C));
+    const size_t sh = 4 * (size_t)(mlink2::RB1_C * 16 + 2 * mlink2::RB1_C * 8) * 8;
+    cudaFuncSetAttribute(mlink2::range_bin1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh);
+    mlink2::range_bin1_kernel<<<ma_sms() * 2, 128, sh>>>(d_raw, src_len, b0, (const mlink2::Blk*)d_blks, nblk, C,
+        (const mauth::K8d*)d_bc, (const mauth::K8d*)d_ea1, (unsigned long long*)d_R);
     cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
     return (int)e;
 }

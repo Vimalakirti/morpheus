@@ -30,7 +30,8 @@ extern "C" {
     pub fn agl_mlink_fold(d_raw: *const i8, src_len: u64, b0: c_int, d_blocks: *const c_void, nblocks: u32, d_efull: *const u64, d_out: *mut u64) -> c_int;
     pub fn agl_morpheus_coins(h_base: *const u64, purpose: c_int, coord0: u32, n: u32, mode: c_int, d_out: *mut c_void, d_flag: *mut u8) -> c_int;
     pub fn agl_mlink2_consts(d_blks: *const c_void, nblk: u32, h_consts: *const c_void, d_bc: *mut u64) -> c_int;
-    pub fn agl_mlink2_round(d_raw: *const i8, src_len: u64, b0: c_int, i: c_int, d: c_int, reduced: c_int, h_consts: *const c_void, d_onehot: *const c_void, n_onehot: u32, d_generic: *const c_void, n_generic: u32, d_bc: *const u64, d_e1: *const u64, d_e2: *const u64, d_e3: *const u64, d_ealpha: *const u64, h_out: *mut u64) -> c_int;
+    pub fn agl_mlink2_round(d_raw: *const i8, src_len: u64, b0: c_int, i: c_int, d: c_int, reduced: c_int, h_consts: *const c_void, d_onehot: *const c_void, n_onehot: u32, d_generic: *const c_void, n_generic: u32, d_bc: *const u64, d_e1: *const u64, d_e2: *const u64, d_e3: *const u64, d_ealpha: *const u64, skip_range: c_int, h_out: *mut u64) -> c_int;
+    pub fn agl_mlink2_range_bin1(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc: *const u64, d_ea1: *const u64, d_r: *mut u64) -> c_int;
     pub fn agl_mlink2_coarse_init(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_rid: *const u32, d_k: *const u32, nrb: u64, d_tfold: *const u64, d_efull: *const u64, coarse: u64, nsrc: u32, d_w: *mut u64, d_q: *mut u64, d_chi: *mut u64) -> c_int;
     pub fn agl_i64_to_i32(s: *const i64, d: *mut i32, n: u64) -> i32;
     pub fn agl_add_i32_i64(d: *mut i64, s: *const i32, n: u64) -> i32;

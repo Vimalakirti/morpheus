@@ -179,16 +179,18 @@ __global__ void __launch_bounds__(256) onehot_kernel(
 /// Reduced mode (blockDim 96): warps evaluate t = 0, 2, 3 (range) and t = 0, 2
 /// (query); the host gets t = 1 from the previous round's claims.
 constexpr int GCH = 128;
-__global__ void __launch_bounds__(160, 3) generic_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i, int d, int reduced,
+__global__ void __launch_bounds__(160, 2) generic_kernel(
+    const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i, int d, int reduced_dbg,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
     const K8d* __restrict__ e_pre, const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
 {
+    // Debug (timing only; results wrong): bit 1 skips range evaluation, bit 2 the query.
+    const int reduced = reduced_dbg & 1, dbg = reduced_dbg >> 1;
     __shared__ K8d F[2 * GCH], QF[2 * GCH];
     __shared__ uint16_t nz[GCH];
     __shared__ K8d s_ct[MAXT];
     __shared__ K8d s_cr, s_cb;
-    __shared__ int s_tcnt, s_cnt;
+    __shared__ int s_tcnt, s_cnt, s_pa;
     __shared__ uint32_t s_toff, s_qd;
     const int ny = 1 << (b0 - i), nrest = ny >> 1;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
@@ -203,6 +205,7 @@ __global__ void __launch_bounds__(160, 3) generic_kernel(
             uint32_t fl = 0; int tc = 0; uint32_t toff = 0, qdo = 0;
             if (b.region != 0xffffffffu) { const Region R = C.regions[b.region]; fl = R.flags; tc = (int)R.tcnt; toff = R.toff; qdo = R.qd_off; }
             s_tcnt = tc; s_toff = toff;
+            s_pa = tc > 0 ? (int)C.terms[toff].pa : 0;
             uint32_t qi = (fl & 4) ? C.qidx[qdo + b.k] : 0xffffffffu;
             s_qd = qi == 0xffffffffu ? 0xffffffffu : (qi << (b0 - i));   // level-i folded tables
         }
@@ -217,6 +220,14 @@ __global__ void __launch_bounds__(160, 3) generic_kernel(
         const int tcnt = s_tcnt;
         const uint32_t toff = s_toff, qd = s_qd;
         K8d b3 = kzero(), b2 = kzero();          // this lane's Σ ea(w³ − w), Σ ea(w² − w) in the block
+        // Fast query (no dense table, ≤ 2 terms, 2^pa ≤ 8): with q_t(r) =
+        // Σ_T c_T B_T[ir](A_T[0][pr] + t dA_T[pr]) and w_t = (1−t)w0 + t w1,
+        //   Σ_r q_t w_t = Σ_T c_T Σ_pr (A0 + t dA)[pr]·((1−t)S0 + t S1),
+        //   S_side[T][pr] = Σ_ir B_T[ir]·w_side(ir, pr)  (t-independent).
+        // A thread's rests are ≡ threadIdx (mod blockDim), so its pr is fixed.
+        const int pa = s_pa;
+        const bool fastq = qd == 0xffffffffu && tcnt > 0 && tcnt <= 2 && pa <= 3 && !(dbg & 2);
+        K8d S00 = kzero(), S01 = kzero(), S10 = kzero(), S11 = kzero();   // S{term}{side}
         for (int c0 = 0; c0 < nrest; c0 += GCH) {
             const int cp = nrest - c0 < GCH ? nrest - c0 : GCH, cy = 2 * cp, y0 = 2 * c0;
             if (i > 0) {
@@ -254,8 +265,33 @@ __global__ void __launch_bounds__(160, 3) generic_kernel(
             }
             __syncthreads();
             const int cnt = s_cnt;
+            if (fastq) {
+                const Term T0 = C.terms[toff];
+                const Term T1 = tcnt > 1 ? C.terms[toff + 1] : T0;
+                for (int r = threadIdx.x; r < cp; r += blockDim.x) {
+                    const int ir = (c0 + r) >> pa;
+                    if (i == 0) {
+                        const int8_t d0 = dg[y0 + 2 * r], d1 = dg[y0 + 2 * r + 1];
+                        if ((d0 | d1) == 0) continue;
+                        const K8d bb0 = C.B[T0.boff + ir];
+                        if (d0 == 1) S00 = kadd(S00, bb0); else if (d0 == -1) S00 = ksub(S00, bb0);
+                        if (d1 == 1) S01 = kadd(S01, bb0); else if (d1 == -1) S01 = ksub(S01, bb0);
+                        if (tcnt > 1) {
+                            const K8d bb1 = C.B[T1.boff + ir];
+                            if (d0 == 1) S10 = kadd(S10, bb1); else if (d0 == -1) S10 = ksub(S10, bb1);
+                            if (d1 == 1) S11 = kadd(S11, bb1); else if (d1 == -1) S11 = ksub(S11, bb1);
+                        }
+                    } else {
+                        const K8d w0 = F[2 * r], w1 = F[2 * r + 1];
+                        if (kzero_p(w0) && kzero_p(w1)) continue;
+                        const K8d bb0 = C.B[T0.boff + ir];
+                        S00 = kadd(S00, kmul(bb0, w0)); S01 = kadd(S01, kmul(bb0, w1));
+                        if (tcnt > 1) { const K8d bb1 = C.B[T1.boff + ir]; S10 = kadd(S10, kmul(bb1, w0)); S11 = kadd(S11, kmul(bb1, w1)); }
+                    }
+                }
+            }
             // Query weights of the compacted pairs at t = 0, 1.
-            if (qd != 0xffffffffu || tcnt > 0) {
+            if ((qd != 0xffffffffu || tcnt > 0) && !(dbg & 2) && !fastq) {
                 for (int j = threadIdx.x; j < cnt; j += blockDim.x) {
                     const int rest = c0 + nz[j];
                     K8d q0 = qd != 0xffffffffu ? C.qd[qd + 2 * rest] : kzero();
@@ -271,7 +307,7 @@ __global__ void __launch_bounds__(160, 3) generic_kernel(
                 }
                 __syncthreads();
             }
-            const bool hasq = (qd != 0xffffffffu || tcnt > 0) && doq;
+            const bool hasq = (qd != 0xffffffffu || tcnt > 0) && doq && !(dbg & 2) && !fastq;
             {
                 for (int j = lane; j < cnt; j += 32) {
                     const int rl = nz[j], rest = c0 + rl;
@@ -296,9 +332,11 @@ __global__ void __launch_bounds__(160, 3) generic_kernel(
                         K8d wt;
                         for (int a = 0; a < 8; a++) wt.c[a] = mauth::fadd(w0.c[a], mauth::fmul(dw.c[a], tq));
                         // ea·w, ea·w², ea·w³ by three products.
-                        const K8d ew = kmul(ea, wt), ew2 = kmul(ew, wt), ew3 = kmul(ew2, wt);
-                        b3 = kadd(b3, ksub(ew3, ew));
-                        b2 = kadd(b2, ksub(ew2, ew));
+                        if (!(dbg & 1)) {
+                            const K8d ew = kmul(ea, wt), ew2 = kmul(ew, wt), ew3 = kmul(ew2, wt);
+                            b3 = kadd(b3, ksub(ew3, ew));
+                            b2 = kadd(b2, ksub(ew2, ew));
+                        }
                         if (hasq) acc_q = kadd(acc_q, kmul(qt, wt));
                     }
                 }
@@ -308,6 +346,33 @@ __global__ void __launch_bounds__(160, 3) generic_kernel(
             __syncthreads();
         }
         if (!(kzero_p(b3) && kzero_p(b2))) acc_r = kadd(acc_r, kadd(kmul(s_cr, b3), kmul(s_cb, b2)));
+        if (fastq) {
+            // Sums per pr: within warps over lanes ≡ pr (mod 2^pa), then across
+            // warps through QF (unused by fast blocks): RED[warp][pr][4].
+            const int np = 1 << pa;
+            S00 = kcanon(S00); S01 = kcanon(S01); S10 = kcanon(S10); S11 = kcanon(S11);
+            for (int off = 16; off >= np; off >>= 1) {
+                S00 = kadd(S00, shfl_down_k(S00, off)); S01 = kadd(S01, shfl_down_k(S01, off));
+                S10 = kadd(S10, shfl_down_k(S10, off)); S11 = kadd(S11, shfl_down_k(S11, off));
+            }
+            K8d* RED = QF;
+            if (lane < np) { K8d* o = RED + ((size_t)wp * np + lane) * 4; o[0] = kcanon(S00); o[1] = kcanon(S01); o[2] = kcanon(S10); o[3] = kcanon(S11); }
+            __syncthreads();
+            if (doq && lane < np) {
+                K8d s4[4] = {kzero(), kzero(), kzero(), kzero()};
+                for (int w = 0; w < (int)(blockDim.x >> 5); w++) for (int q = 0; q < 4; q++) s4[q] = kadd(s4[q], RED[((size_t)w * np + lane) * 4 + q]);
+                for (int k = 0; k < tcnt; k++) {
+                    const Term T = C.terms[toff + k];
+                    const K8d a0 = C.A[T.aoff + lane], a1 = C.A[T.aoff + (1 << T.pa) + lane];
+                    const K8d x = kmul(s_ct[k], a0), y = kmul(s_ct[k], ksub(a1, a0));
+                    const K8d sa = s4[2 * k], dsx = ksub(s4[2 * k + 1], sa);
+                    K8d qv, sv;
+                    for (int a = 0; a < 8; a++) { qv.c[a] = mauth::fadd(x.c[a], mauth::fmul(y.c[a], tq)); sv.c[a] = mauth::fadd(sa.c[a], mauth::fmul(dsx.c[a], tq)); }
+                    acc_q = kadd(acc_q, kmul(qv, sv));
+                }
+            }
+            S00 = S01 = S10 = S11 = kzero();
+        }
         __syncthreads();
     }
     K8d vr = kcanon(acc_r), vq = kcanon(acc_q);
@@ -978,6 +1043,66 @@ __global__ void __launch_bounds__(128, 4) index_kernel(
             }
         partial[(size_t)blockIdx.x * 7 + slot] = kcanon(sacc);
     }
+}
+
+// ------------------------------------------------------------- range bins, round 1
+/// Round-1 range sums of generic blocks from digit classes. Round-1 pair r
+/// covers digits 4r..4r+3 (all in {−1, 0, 1}); its w_t depends only on the
+/// class c = Σ_j (d_j + 1)·3^j (81 classes), so
+///   R[0][c] = Σ_b cr_b Σ_{r: class c} eq(α_(1..B0), r),  R[1][c] likewise with cb_b,
+/// and the host evaluates Σ_c R·(w³ − w), R·(w² − w). Warp per block: a
+/// per-warp histogram of ea (u64 halves, shared atomics), then each lane
+/// scales its classes by cr, cb into per-warp run bins (flushed once).
+constexpr int RB1_C = 81;
+__global__ void __launch_bounds__(128) range_bin1_kernel(
+    const int8_t* __restrict__ raw, uint64_t src_len, int b0,
+    const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
+    const K8d* __restrict__ ea1, u64* __restrict__ R)
+{
+    extern __shared__ u64 rb_sh[];   // per warp: H[81][16] u64, run[2][81] K
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    u64* H = rb_sh + (size_t)warp * (RB1_C * 16 + 2 * RB1_C * 8);
+    K8d* run = reinterpret_cast<K8d*>(H + RB1_C * 16);
+    for (int j = lane; j < RB1_C * 16; j += 32) H[j] = 0;
+    for (int j = lane; j < 2 * RB1_C; j += 32) run[j] = kzero();
+    __syncwarp();
+    const uint64_t gw = blockIdx.x * 4 + warp, nw = (uint64_t)gridDim.x * 4;
+    const int npair = 1 << (b0 - 2);
+    for (uint64_t bi = gw; bi < nblk; bi += nw) {
+        const Blk b = blks[bi];
+        const uint32_t* dg = reinterpret_cast<const uint32_t*>(raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0));
+        for (int r = lane; r < npair; r += 32) {
+            const uint32_t x = __ldg(dg + r);
+            // Every digit must be ternary (checked: R[2·81] counts violations).
+            if ((__vadd4(x, 0x01010101u) & 0xfcfcfcfcu) != 0) { atomicAdd(R + 2 * RB1_C * 16, 1ULL); continue; }
+            int c = 0, m = 1;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { c += ((int)(int8_t)((x >> (8 * j)) & 0xff) + 1) * m; m *= 3; }
+            if (c == 40) continue;   // all-zero digits: w ≡ 0
+            const K8d e = ea1[r];
+            u64* h = H + (size_t)c * 16;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) { atomicAdd(h + 2 * w, e.c[w] & 0xffffffffULL); atomicAdd(h + 2 * w + 1, e.c[w] >> 32); }
+        }
+        __syncwarp();
+        const K8d* o = bc + C.bco[bi];
+        const K8d cr = o[0], cb = o[1];
+        const bool hb = !kzero_p(cb);
+        for (int c = lane; c < RB1_C; c += 32) {
+            u64* h = H + (size_t)c * 16;
+            bool nz = false;
+            #pragma unroll
+            for (int w = 0; w < 16; w++) nz |= h[w] != 0;
+            if (!nz) continue;
+            K8d v;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) { v.c[w] = mauth::fadd(h[2 * w], mauth::fmul(h[2 * w + 1], 1ULL << 32)); h[2 * w] = 0; h[2 * w + 1] = 0; }
+            run[c] = kadd(run[c], kmul(cr, v));
+            if (hb) run[RB1_C + c] = kadd(run[RB1_C + c], kmul(cb, v));
+        }
+        __syncwarp();
+    }
+    for (int j = lane; j < 2 * RB1_C; j += 32) if (!kzero_p(run[j])) kacc_atomic(R + (size_t)j * 16, kcanon(run[j]));
 }
 
 // ------------------------------------------------------------- late index rounds

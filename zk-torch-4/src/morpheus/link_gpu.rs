@@ -541,6 +541,9 @@ fn phases_v2_body<'u>(
     // Round-5 B tables of the binned terms (eq over index bits 2.., 32 entries), by compact slot.
     let mut b5 = vec![K8::ZERO; (n_ohw as usize).max(1) * 32];
     for &(k, kw) in &bin_terms { b5[kw * 32..(kw + 1) * 32].copy_from_slice(&eq_table(&terms[order[k]].r[2..7])); }
+    // Round-1 range sums of the generic blocks from digit classes (`range_bin1_kernel`).
+    let rb1 = b0 >= 3 && std::env::var("MORPHEUS_NO_RB1").is_err();
+    let mut rb1_bins: Vec<K8> = Vec::new();
     let mut rounds = Vec::new();
     let mut xi: Vec<K8> = Vec::new();
     let mut mo_prefix = K8::ZERO;
@@ -573,8 +576,8 @@ fn phases_v2_body<'u>(
         //   R_{i-1}(r) = (1 − α_i) R_i(0) + α_i R_i(1),  Q_{i-1}(r) = Q_i(0) + Q_i(1).
         let reduced = d == 4 && claims.is_some() && !alpha[i].is_zero() && !no_claim;
         let use_index = reduced && (1usize << (b0 - i)) <= 128 && i >= 4 && b0 >= 9 && std::env::var("MORPHEUS_NO_INDEX").is_err();
-        let rin = RoundIn { i, d, b0, src_len, reduced, use_index, r_prev: xi.last().copied(), full: false, b5: &b5, xi: &xi, fac_p, dense_pw: &dense_pw, a_all: &a_all, b_all: &b_all, tc: &tc, e1: &e1, e2: &e2, e3: &e3, ea: &ea };
-        let outs: Vec<(Vec<K8>, Option<OhSums>)> = std::thread::scope(|sc| {
+        let rin = RoundIn { i, d, b0, src_len, reduced, use_index, r_prev: xi.last().copied(), full: false, b5: &b5, xi: &xi, fac_p, dense_pw: &dense_pw, skip_range: rb1 && i == 1, rb1, a_all: &a_all, b_all: &b_all, tc: &tc, e1: &e1, e2: &e2, e3: &e3, ea: &ea };
+        let outs: Vec<(Vec<K8>, Option<OhSums>, Option<Vec<K8>>)> = std::thread::scope(|sc| {
             let hs: Vec<_> = shards.iter_mut().map(|sh| {
                 let (rin, regions_c, nterms) = (&rin, &regions_c, n_ohw as usize);
                 sc.spawn(move || shard_round(sh, dev_raw, rin, regions_c, alpha, nterms))
@@ -583,11 +586,13 @@ fn phases_v2_body<'u>(
         });
         let mut sum = vec![K8::ZERO; 2 * (d + 1)];
         let mut ohs: Option<OhSums> = None;
-        for (s, o) in outs {
+        for (s, o, rb) in outs {
             for (a, b) in sum.iter_mut().zip(&s) { *a = a.add(b); }
+            if let Some(rb) = rb { if rb1_bins.is_empty() { rb1_bins = rb; } else { for (a, b) in rb1_bins.iter_mut().zip(&rb) { *a = a.add(b); } } }
             if let Some(o) = o { ohs = Some(match ohs { None => o, Some(o0) => o0.add(&o) }); }
         }
         let t_gen = t.elapsed().as_secs_f64() * 1e3;
+        let sum_dev = sum.clone();
         if i == 0 && !oh.is_empty() {
             oh_sums = ohs;
             // Binned blocks' plane-round bins: G (p = 4) from GV, W from U.
@@ -642,6 +647,22 @@ fn phases_v2_body<'u>(
                 let (t2, t3) = (tk.mul(&tk), tk.mul(&tk).mul(&tk));
                 sum[t] = sum[t].add(&c[0].add(&c[1].mul(&tk)).add(&c[2].mul(&t2)).add(&c[3].mul(&t3)));
                 sum[d + 1 + t] = sum[d + 1 + t].add(&c[4].add(&c[5].mul(&tk)).add(&c[6].mul(&t2)));
+            }
+        }
+        if i == 1 && rb1 {
+            let c = range_bin1_round(&rb1_bins, &xi[0]);
+            if std::env::var("MORPHEUS_BIN_CHECK").is_ok() {
+                let rin2 = RoundIn { skip_range: false, r_prev: None, ..rin };
+                let full: Vec<K8> = shards.iter_mut().map(|sh| shard_round(sh, dev_raw, &rin2, &regions_c, alpha, n_ohw as usize).0).fold(vec![K8::ZERO; 2 * (d + 1)], |a, v| a.iter().zip(&v).map(|(x, y)| x.add(y)).collect());
+                for t in [0usize, 2, 3] {
+                    let tk = K8::from_base(t as u64);
+                    let ev = c[0].add(&c[1].mul(&tk)).add(&c[2].mul(&tk.mul(&tk))).add(&c[3].mul(&tk.mul(&tk).mul(&tk)));
+                    eprintln!("[rb1check] range t={t}: direct−rest {:?} bins {:?}", full[t].sub(&sum_dev[t]).0[0], ev.0[0]);
+                }
+            }
+            for t in 0..=d {
+                let tk = K8::from_base(t as u64);
+                sum[t] = sum[t].add(&c[0].add(&c[1].mul(&tk)).add(&c[2].mul(&tk.mul(&tk))).add(&c[3].mul(&tk.mul(&tk).mul(&tk))));
             }
         }
         if reduced {
@@ -1070,7 +1091,7 @@ impl Shard {
 /// Host tables of one plane round, shared by the shards.
 struct RoundIn<'a> {
     i: usize, d: usize, b0: usize, src_len: u64, reduced: bool, use_index: bool, r_prev: Option<K8>, full: bool, b5: &'a [K8],
-    xi: &'a [K8], fac_p: Option<usize>, dense_pw: &'a [std::sync::Arc<Vec<K8>>],
+    xi: &'a [K8], fac_p: Option<usize>, dense_pw: &'a [std::sync::Arc<Vec<K8>>], skip_range: bool, rb1: bool,
     a_all: &'a [K8], b_all: &'a [K8], tc: &'a [TermC], e1: &'a [K8], e2: &'a [K8], e3: &'a [K8], ea: &'a [K8],
 }
 
@@ -1078,7 +1099,7 @@ struct RoundIn<'a> {
 /// challenge, run its blocks; in round 0 also its one-hot bin sums.
 #[allow(clippy::type_complexity)]
 fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn, regions_c: &[RegionC], alpha: &[K8], nterms: usize)
-    -> (Vec<K8>, Option<OhSums>) {
+    -> (Vec<K8>, Option<OhSums>, Option<Vec<K8>>) {
     almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
     let (i, d, b0) = (rin.i, rin.d, rin.b0);
     if let (Some(pp), Some((at, tp))) = (rin.fac_p, sh.fac.as_ref()) {
@@ -1114,7 +1135,7 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
         let rc = unsafe {
             ffi::agl_mlink2_round(raw_ptr, rin.src_len, b0 as i32, i as i32, d as i32, rin.reduced as i32, &consts as *const ConstsC as *const c_void,
                 std::ptr::null(), 0, sh.gen_all.as_ptr() as *const c_void, n_gen as u32, sh.bc.as_ptr(),
-                dptr(&d_e1) as *const u64, dptr(&d_e2) as *const u64, dptr(&d_e3) as *const u64, dptr(&d_ea) as *const u64, out.as_mut_ptr())
+                dptr(&d_e1) as *const u64, dptr(&d_e2) as *const u64, dptr(&d_e3) as *const u64, dptr(&d_ea) as *const u64, rin.skip_range as i32, out.as_mut_ptr())
         };
         assert_eq!(rc, 0, "link v2 round {i} failed");
         kvec(&out)[..2 * (d + 1)].to_vec()
@@ -1122,5 +1143,40 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
     let ohs = if i == 0 && !sh.oh.is_empty() {
         Some(onehot_sums(raw_ptr, rin.src_len, b0, &consts, &sh.oh, &sh.bc, sh.gen_base, regions_c, alpha, nterms, rin.b5))
     } else { None };
-    (sum, ohs)
+    // Round-1 range bins over round 1's generic list.
+    let rb = if i == 0 && rin.rb1 {
+        let n1 = sh.gen_base + (sh.oh.len() - sh.oh.partition_point(|b| !in_gen(&regions_c[b.region as usize], 1)));
+        let nr = 2 * 81 * 16 + 1;
+        let d_r = DeviceBuffer::from_slice(&vec![0u64; nr]).unwrap();
+        let d_ea1 = up_k(&eq_table(&alpha[2..b0]));
+        let rc = unsafe { ffi::agl_mlink2_range_bin1(raw_ptr, rin.src_len, b0 as i32, &consts as *const ConstsC as *const c_void, sh.gen_all.as_ptr() as *const c_void, n1 as u32, sh.bc.as_ptr(), dptr(&d_ea1) as *const u64, d_r.as_ptr() as *mut u64) };
+        assert_eq!(rc, 0, "range bins");
+        let h = d_r.read_slice(0, nr).unwrap();
+        assert_eq!(h[nr - 1], 0, "non-ternary digits in generic blocks");
+        const Q: u128 = 18446744069414584289;
+        Some(h[..nr - 1].chunks(16).map(|c| K8(std::array::from_fn(|w| ((c[2 * w] as u128 + ((c[2 * w + 1] as u128 % Q) << 32)) % Q) as u64))).collect())
+    } else { None };
+    (sum, ohs, rb)
+}
+
+/// Round-1 range sum of the generic blocks as a cubic in t from the class bins
+/// (class c: digits d_j = ⌊c/3^j⌋ mod 3 − 1; w_0 = (1−r0)d0 + r0 d1, w_1 likewise).
+fn range_bin1_round(bins: &[K8], r0: &K8) -> [K8; 4] {
+    let (two, three) = (K8::from_base(2), K8::from_base(3));
+    let mut c = [K8::ZERO; 4];
+    let dig = |x: i64| -> K8 { if x >= 0 { K8::from_base(x as u64) } else { K8::from_base((-x) as u64).neg() } };
+    for cl in 0..81usize {
+        let (j3, j2) = (bins[cl], bins[81 + cl]);
+        if j3.is_zero() && j2.is_zero() { continue; }
+        let d: Vec<K8> = (0..4).map(|j| dig(((cl / 3usize.pow(j)) % 3) as i64 - 1)).collect();
+        let lin = |a: &K8, b: &K8| K8::ONE.sub(r0).mul(a).add(&r0.mul(b));
+        let a = lin(&d[0], &d[1]);
+        let dl = lin(&d[2], &d[3]).sub(&a);
+        let (a2, dl2) = (a.mul(&a), dl.mul(&dl));
+        c[0] = c[0].add(&j3.mul(&a2.mul(&a).sub(&a))).add(&j2.mul(&a2.sub(&a)));
+        c[1] = c[1].add(&j3.mul(&three.mul(&a2).mul(&dl).sub(&dl))).add(&j2.mul(&two.mul(&a).mul(&dl).sub(&dl)));
+        c[2] = c[2].add(&j3.mul(&three.mul(&a).mul(&dl2))).add(&j2.mul(&dl2));
+        c[3] = c[3].add(&j3.mul(&dl2.mul(&dl)));
+    }
+    c
 }
