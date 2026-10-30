@@ -163,3 +163,19 @@ for the changed relation. This does not retroactively authenticate old logs.
 The wire-v2 statement codec supports global `SF_LOG` from 0 through 30 and rejects
 larger scales before reading the existing signed-shift-based `SF_FLOAT` helper;
 this is an explicit supported-domain restriction, not a silent scale change.
+
+## Subsequent wire-v3 private-input/lifecycle increment
+
+The next draft closes the previously documented *expected private-input identity
+hook* at source level through mandatory `InputReg` / `RegisteredInput`, separate
+immutable input sources, and exact verifier prefix/descriptor checks. See
+PRIVATE_INPUT_REGISTRATION.md for semantics, privacy, reuse, queue provenance and
+remaining public-only verifier deployment limitations. This supersedes the earlier
+statement that the request API has no private-input hook; it does not supersede
+the outstanding normalization/compiler/causal/runtime-proof obligations.
+
+Opening IDs are now consumed once per shared Coins backend; model registration
+is once per backend and private-input registrations allocate distinct suffix
+owners. Wire and benchmark receipts change to version 3. Old/missing-version
+receipts do not become evidence for this changed relation. All Rust tests remain
+unexecuted until the real Rust/CUDA build prerequisites are available.

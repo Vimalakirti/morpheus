@@ -41,7 +41,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
     let mut req_secs = Vec::new();
     let mut verify_secs = Vec::new();
     let n = if o_defer_batches().is_some() { batch_sizes(n).iter().sum() } else { n };
-    println!("MORPHEUS_POLICY protocol=2 profile={} auth={} verify={} requests={}", o.profile.name, o.auth, o.verify, n);
+    println!("MORPHEUS_POLICY protocol={} profile={} auth={} verify={} requests={}", crate::morpheus::wire::PROTOCOL_VERSION, o.profile.name, o.auth, o.verify, n);
     let mut outs = Vec::new();
     let mut vqueue = Vec::new();
     let mut model_reg = None;
@@ -71,18 +71,20 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
     let t = Instant::now();
     let mut pc = PcsGpu::new(o.profile.clone(), o.seed);
     // Streamed requests use every device directly (no replicas).
-    let stream = o.streams(pp.req.len() + if o.defer { 1 } else { pp.model.len() });
+    let stream = o.streams(pp.input.len() + pp.req.len() + if o.defer { 1 } else { pp.model.len() });
     let mut reps = if o.auth && o.auth_gpus > 1 && !stream { Replicas::new(&o) } else { Replicas { r: Vec::new() } };
     if stream { println!("streamed sources ({} request sources)", pp.req.len()); }
     println!("key caches {:.2}s ({} GPU(s) for authentication)", t.elapsed().as_secs_f64(), 1 + reps.r.len());
     {
         let m = request::register(&pp, &o, &mut pc, &reps);
-        println!("model registration (one-time): {} sources committed in {:.2}s", m.raw.len(), m.secs);
+        println!("model registration (one-time): {} sources committed in {:.2}s", m.source_count(), m.secs);
         model_secs = m.secs;
         model_reg = Some(m);
     }
+    let input_reg = request::register_inputs(&pp, &o, &mut pc);
+    println!("private input registration (one-time): {} sources committed in {:.2}s", input_reg.source_count(), input_reg.secs);
     for j in 0..n as u64 {
-        let mut out = request::prove_request(&mut pp, &o, j, model_reg.as_ref(), &mut pc, &mut reps);
+        let mut out = request::prove_request(&mut pp, &o, j, model_reg.as_ref(), &input_reg, &mut pc, &mut reps);
         out.times.insert("prep", prep);
         let s = show(&format!("request {j} prove"), &out.times);
         println!("  {} PIOP rows, {} carries, {} PIOP messages, {} proof bytes", out.rows, out.carries, out.piop_len, out.bytes.len());
@@ -99,7 +101,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
                 let parts = crate::morpheus::wire::parts(&o.profile, &pf);
                 println!("  proof parts (bytes): {}", parts.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", "));
             }
-            let r = request::verify_request(&pp, &o, j, model_reg.as_ref().map(|m| m.public()), &pf, &pc.keys, &mut vt);
+            let r = request::verify_request(&pp, &o, j, model_reg.as_ref().map(|m| m.public()), input_reg.public(), &pf, &pc.keys, &mut vt);
             let vs = show(&format!("request {j} verify ({})", r.is_some()), &vt);
             assert!(r.is_some(), "request {j} rejected");
             verify_secs.push(vs);

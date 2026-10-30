@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """LaTeX table bodies of the S&P'27 evaluation from run_models.sh /
-run_extra.sh logs (wire format v2: proof sizes are serialized lengths).
+run_extra.sh logs (wire format v3: proof sizes are serialized lengths).
 
     python3 paper_tables.py [out_dir] [extra_dir]
 

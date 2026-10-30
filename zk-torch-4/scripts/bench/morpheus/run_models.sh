@@ -72,7 +72,7 @@ run() {   # name kind(e2e|hook:bin:cfg:units) env...
       for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do u=$(ps -o user= -p "$p" 2>/dev/null); [ -n "$u" ] && [ "$u" != "$USER" ] && echo "$(date +%T) $u $p" >> "$log.foreign"; done
       sleep 0.5; done ) &
     local sampler=$!
-    printf "MORPHEUS_EXPECT protocol=2 profile=morpheus-ternary-v1 requests=%s batches=%s\n" "$expected" "$batch_spec" > "$log"
+    printf "MORPHEUS_EXPECT protocol=3 profile=morpheus-ternary-v1 requests=%s batches=%s\n" "$expected" "$batch_spec" > "$log"
     case $kind in
       e2e) env "$@" "${m[@]}" timeout ${TMO:-14400} ./target/release/morpheus_e2e >> "$log" 2>&1 ;;
       hook:*) IFS=: read -r _ bin cfg units <<< "$kind"

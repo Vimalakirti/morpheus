@@ -18,8 +18,8 @@ def timed_ids(text, pattern):
 
 
 def admitted(text):
-    headers = re.findall(r'^MORPHEUS_EXPECT protocol=2 profile=(\S+) requests=(\d+) batches=(\S+)$', text, re.M)
-    policies = re.findall(r'^MORPHEUS_POLICY protocol=2 profile=(\S+) auth=(\S+) verify=(\S+) requests=(\d+)$', text, re.M)
+    headers = re.findall(r'^MORPHEUS_EXPECT protocol=3 profile=(\S+) requests=(\d+) batches=(\S+)$', text, re.M)
+    policies = re.findall(r'^MORPHEUS_POLICY protocol=3 profile=(\S+) auth=(\S+) verify=(\S+) requests=(\d+)$', text, re.M)
     exits = re.findall(r'^MORPHEUS_EXIT status=(\d+)$', text, re.M)
     if len(headers) != 1 or len(policies) != 1 or exits != ['0']:
         return False

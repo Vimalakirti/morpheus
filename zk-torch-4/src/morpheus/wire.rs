@@ -17,7 +17,9 @@ use super::params::Profile;
 use super::ring::{AElem, DS, N};
 use rayon::prelude::*;
 
-pub const MAGIC: &[u8; 8] = b"MRPHSv2\0";
+/// Request/finalization semantics version, also absorbed before challenges.
+pub const PROTOCOL_VERSION: u64 = 3;
+pub const MAGIC: &[u8; 8] = b"MRPHSv3\0";
 pub const Z_BITS: usize = 37;
 
 /// Offset and largest code of the response codec.
