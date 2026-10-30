@@ -16,6 +16,7 @@ pub mod llama;
 pub mod lookups;
 pub mod nanogpt;
 pub mod oneshot;
+pub mod softmax;
 pub mod partition;
 pub mod pointpillar;
 pub mod proving;
@@ -1297,6 +1298,9 @@ mod tests {
 
 #[cfg(test)]
 mod normalization_tests;
+
+#[cfg(test)]
+mod softmax_tests;
 
 #[cfg(test)]
 mod instancenorm_tests;

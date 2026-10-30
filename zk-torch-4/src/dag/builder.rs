@@ -261,54 +261,11 @@ impl DagBuilder {
         out[0]
     }
 
-    /// Create a causal attention mask and add it to scores.
-    /// scores shape must end with [..., seq_len, seq_len].
-    /// Adds a large negative value to positions where key > query (future tokens).
-    /// The mask is created with the same full shape as scores so that `add` broadcasting works.
-    pub fn causal_mask(&mut self, scores: EdgeId, seq_len: usize) -> EdgeId {
-        let scores_shape = self.init_values[scores].as_ref().unwrap().shape.clone();
-        let sf = self.init_values[scores].as_ref().unwrap().sf;
-        let padded: Vec<usize> = scores_shape.iter().map(|&s| s.next_power_of_two()).collect();
-        let total_padded: usize = padded.iter().product();
-
-        // Large negative value: exp(-100) ≈ 0
-        let big_neg = int_to_f(-100 * (1i128 << sf));
-
-        // Build mask in little-endian layout matching scores shape.
-        // Last two dims are [s, t] where s=query, t=key.
-        // s has stride = product of all padded dims before it
-        // t has stride = s_stride * s_pad
-        let ndim = scores_shape.len();
-        let s_pad = padded[ndim - 2];
-        let t_pad = padded[ndim - 1];
-        let s_stride: usize = padded[..ndim - 2].iter().product();
-        let t_stride = s_stride * s_pad;
-
-        let mut mask_data = vec![AlmostGoldilocksField(0); total_padded];
-        // For each group (batch, head, ...) replicate the same causal pattern
-        let num_groups: usize = padded[..ndim - 2].iter().product();
-        for g in 0..num_groups {
-            for t in 0..t_pad {
-                for s in 0..s_pad {
-                    let idx = g + s * s_stride + t * t_stride;
-                    if t < seq_len && s < seq_len && t > s {
-                        // Future position: large negative
-                        mask_data[idx] = big_neg;
-                    }
-                    // else: 0 (valid position or padding)
-                }
-            }
-        }
-
-        let mask = Witness::new(
-            scores_shape.clone(),
-            mask_data,
-            DataType::Float,
-            sf,
-            Role::Constant,
-        );
-        let mask_id = self.public_literal(mask);
-        self.add(scores, mask_id)[0]
+    /// Additive causal sentinels are deliberately unsupported: they do not
+    /// exclude future keys from either the max or the denominator.
+    #[deprecated(note="use causal_softmax on the unmodified scores")]
+    pub fn causal_mask(&mut self, _scores: EdgeId, _seq_len: usize) -> EdgeId {
+        panic!("additive causal_mask is unsupported; use causal_softmax")
     }
 
     pub fn add(&mut self, a: EdgeId, b: EdgeId) -> Vec<EdgeId> {
@@ -451,10 +408,7 @@ impl DagBuilder {
     }
 
     pub fn sigmoid(&mut self, a: EdgeId) -> Vec<EdgeId> {
-        let sigmoid_c = self.sigmoid_const(a)[0];
-        let scores = self.add(a, sigmoid_c)[0];
-        let scores = self.exp(scores)[0];
-        vec![scores]
+        vec![self.finite_sigmoid(a)]
     }
 
     pub fn scale(&mut self, a: EdgeId, input_sf: usize, output_sf: usize) -> Vec<EdgeId> {
@@ -1950,6 +1904,9 @@ impl DagBuilder {
         while cursor<self.nodes.len() {
             let node=self.nodes[cursor].clone();cursor+=1;
             match node.kind {
+                BasicBlockType::SoftmaxConst(_) | BasicBlockType::SigmoidConst(_)=>panic!("unconstrained log normalization advice is unsupported; use selected finite normalization"),
+                BasicBlockType::MaskedMaxSelector(_)=>crate::dag::softmax::max_selector_constraints(&mut self,node.inputs[0],node.inputs[1],node.outputs[0]),
+                BasicBlockType::NormalizedRatio(b)=>crate::dag::softmax::ratio_constraints(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],b.max_terms),
                 BasicBlockType::InstanceNorm3D(_)=>panic!("unconstrained legacy InstanceNorm advice is unsupported; use instancenorm3d"),
                 BasicBlockType::DivConst(b)=>self.division_guards(node.inputs[0],node.outputs[0],usize::try_from(b.divisor).expect("divisor too large")),
                 BasicBlockType::RMSReciprocal(b)=>{

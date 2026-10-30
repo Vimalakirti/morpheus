@@ -6,8 +6,11 @@
 //! transformer core, so a full T-token autoregressive generation is
 //! proved in ONE full-sequence circuit (`seq_len = T`, causal-masked)
 //! instead of T per-token proofs. The model's prediction at position `i`
-//! depends only on tokens `0..=i` (causal masking), so a single
-//! full-sequence forward pass reproduces every AR step; the public
+//! uses selected-support normalization that excludes future/padded keys from
+//! BOTH the canonical maximum and the denominator. Given matching finite
+//! arithmetic/layout semantics in the other layers, this yields prefix-only
+//! dependency and the full-sequence/incremental correspondence. This local
+//! repair is not an unconditional whole-model numerical-equivalence proof. The public
 //! shift constraint `argmax(logits[i]) == token[i+1]` (checked by the
 //! verifier on public data) ties each position's prediction to the next
 //! input token.

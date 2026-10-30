@@ -157,8 +157,8 @@ fn whisper_gelu(g: &mut DagBuilder, x: EdgeId) -> EdgeId {
     g.einsum(einsum_str, vec![x, h], true)[0]
 }
 
-/// Self-attention (no causal mask). Parameterized by n_head and head_dim.
-fn whisper_self_attention(
+/// Encoder self-attention is bidirectional; decoder self-attention is causal.
+pub(crate) fn whisper_self_attention(
     g: &mut DagBuilder,
     x: EdgeId,
     w_q: EdgeId,
@@ -172,6 +172,7 @@ fn whisper_self_attention(
     n_head: usize,
     head_dim: usize,
     n_state: usize,
+    causal: bool,
 ) -> EdgeId {
     // x shape: [1, seq, n_state]
     let seq = g.init_values[x].as_ref().unwrap().shape[1];
@@ -203,9 +204,7 @@ fn whisper_self_attention(
     let scores = g.einsum("bhsd,bhtd->bhst".to_string(), vec![q, k], true)[0];
     // Use 'z' for scalar to avoid overwriting 's' dimension when seq > 1
     let scores = g.einsum("bhst,z->bhst".to_string(), vec![scores, d_sqrt_recip], true)[0];
-    let softmax_c = g.softmax_const(scores)[0];
-    let scores = g.add(scores, softmax_c)[0];
-    let scores = g.exp(scores)[0];
+    let scores = if causal { g.causal_softmax(scores,seq) } else { g.softmax(scores) };
 
     let out = g.einsum("bhst,bhtd->bhsd".to_string(), vec![scores, v], true)[0];
     let out = g.change_shape(out, vec![1, seq, n_head, head_dim]);
@@ -217,7 +216,7 @@ fn whisper_self_attention(
 
 /// Cross-attention: Q from decoder, K/V from encoder output.
 /// seq_q and seq_kv may differ.
-fn whisper_cross_attention(
+pub(crate) fn whisper_cross_attention(
     g: &mut DagBuilder,
     x_dec: EdgeId,       // decoder state [1, S_dec, n_state]
     enc_out: EdgeId,     // encoder output [1, S_enc, n_state]
@@ -266,9 +265,7 @@ fn whisper_cross_attention(
     let scores = g.einsum("bhsd,bhtd->bhst".to_string(), vec![q, k], true)[0];
     // Use 'z' for scalar to avoid overwriting 's' dimension when seq > 1
     let scores = g.einsum("bhst,z->bhst".to_string(), vec![scores, d_sqrt_recip], true)[0];
-    let softmax_c = g.softmax_const(scores)[0];
-    let scores = g.add(scores, softmax_c)[0];
-    let scores = g.exp(scores)[0];
+    let scores = g.softmax(scores);
 
     let out = g.einsum("bhst,bhtd->bhsd".to_string(), vec![scores, v], true)[0];
     let out = g.change_shape(out, vec![1, seq_dec, n_head, head_dim]);
@@ -363,7 +360,7 @@ pub fn whisper_encoder(
         let ln_out = g.pipe(&[x], whisper_layer_norm(attn_ln_w, attn_ln_b));
         let attn_out = whisper_self_attention(
             g, ln_out[0], w_q, w_k, w_v, w_o, b_q, b_k, b_v, b_o,
-            n_head, head_dim, n_state,
+            n_head, head_dim, n_state, false,
         );
         let residual = g.add(attn_out, x)[0];
 
@@ -440,7 +437,7 @@ pub fn whisper_decoder(
         let ln_out = g.pipe(&[x], whisper_layer_norm(attn_ln_w, attn_ln_b));
         let attn_out = whisper_self_attention(
             g, ln_out[0], w_q, w_k, w_v, w_o, b_q, b_k, b_v, b_o,
-            n_head, head_dim, n_state,
+            n_head, head_dim, n_state, true,
         );
         let residual = g.add(attn_out, x)[0];
 

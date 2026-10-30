@@ -125,14 +125,7 @@ pub fn gpt2_attention(
         )[0];
 
         // Causal mask + normalized softmax
-        let scores = if seq_len > 1 {
-            g.causal_mask(scores, seq_len)
-        } else {
-            scores
-        };
-        let softmax_c = g.softmax_const(scores)[0];
-        let scores = g.add(scores, softmax_c)[0];
-        let scores = g.exp(scores)[0];
+        let scores = g.causal_softmax(scores, seq_len);
 
         let out =
             g.einsum("bhst,bhtd->bhsd".to_string(), vec![scores, v], true)[0];

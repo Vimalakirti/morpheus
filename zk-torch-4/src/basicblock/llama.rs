@@ -1,6 +1,7 @@
 //! LLM-specific advice ops: [`RMSReciprocal`], [`DivConst`], [`SoftmaxConst`],
-//! [`SigmoidConst`]. All produce auxiliary values whose soundness is enforced
-//! by surrounding DAG operations (Einsum identities, ProductZeroCheck, etc.).
+//! [`SigmoidConst`]. Legacy log advice is retained only for compatibility tests;
+//! compiled/registered graphs reject it. Exact normalization instead uses
+//! normalization.rs hints with mandatory defining DAG constraints.
 
 use almost_goldilocks_cuda::field::AlmostGoldilocksField;
 

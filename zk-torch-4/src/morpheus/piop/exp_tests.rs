@@ -285,6 +285,23 @@ fn nonnegative_partial_chunks_preserve_61_62_63_bit_widths() {
     }
 }
 
+#[test]
+fn selected_normalization_piop_rejects_ratio_and_selector_source_mutations() {
+    let mut b=DagBuilder::new();let q=1i128<<*crate::SF_LOG;
+    let x=b.committed_input(Witness::new(vec![1,3],vec![int_to_f(0),int_to_f(-q),int_to_f(100*q),int_to_f(0)],DataType::Float,*crate::SF_LOG,Role::Input));
+    let out=b.selected_softmax(x,vec![true,true,false,false]);let(d,mut w)=b.compile();
+    for &n in &d.topo {let nd=&d.nodes[n];let ins=nd.inputs.iter().map(|&e|&w[e][0]).collect::<Vec<_>>();let vs=nd.kind.run(&ins);for(&e,v)in nd.outputs.iter().zip(vs){w[e]=vec![v];}}
+    let g=Graph::new(&d,&w,Config{tcl:4,slots_log:12,req_planes_log:6});
+    let pd=ProverData::new(&g,&w,vec![K8::ZERO;1<<12]);assert!(replay(&g,&pd));
+    for kind in 0..2 {
+        let e=d.nodes.iter().find(|n|if kind==0 {matches!(n.kind,BasicBlockType::NormalizedRatio(_))} else {matches!(n.kind,BasicBlockType::MaskedMaxSelector(_))}).unwrap().outputs[0];
+        let mut bad=ProverData::new(&g,&w,vec![K8::ZERO;1<<12]);let mut values=bad.vals[e].as_ref().unwrap().as_ref().clone();
+        if kind==0 {values[0]=(values[0]+1)%Q;}else{values.fill(0);values[2]=1;}
+        bad.vals[e]=Some(Arc::new(values));assert!(!replay(&g,&bad));
+    }
+    assert_eq!(pd.vals[out].as_ref().unwrap()[2..],[0,0]);
+}
+
 /// Actual PIOP replay authored for InstanceNorm. Native CUDA linkage is still
 /// required by this crate; a typecheck/CPU predicate test is NOT its execution.
 #[test]
