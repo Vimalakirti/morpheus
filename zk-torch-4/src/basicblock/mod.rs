@@ -43,7 +43,7 @@ pub use exp::{ExpHelper, TwoPow};
 pub use instancenorm::{InstanceNorm3D, InstanceNormHelper};
 pub use llama::{DivConst, RMSBucket, RMSReciprocal, SigmoidConst, SoftmaxConst};
 pub use normalization::{MaskedMaxSelector,NormalizedRatio};
-pub use maxpool::{GeneralMaxPoolHelper, MaxPoolHelper, Replicate2x2};
+pub use maxpool::{GeneralMaxPoolHelper, MaxPoolHelper, MaxPoolSelector, MaskedMaxPoolHelper, Replicate2x2};
 pub use pad::{ZeroPad, ZeroPad3D, ZeroPadAsym};
 pub use permute::Permute;
 pub use pointpillar::{GatherFromGrid, PillarMaxPool, ScatterToBEV};
@@ -114,6 +114,8 @@ pub enum BasicBlockType {
     GeneralMaxPoolHelper(GeneralMaxPoolHelper),
     InstanceNorm3D(InstanceNorm3D),
     MaxPoolHelper(MaxPoolHelper),
+    MaxPoolSelector(MaxPoolSelector),
+    MaskedMaxPoolHelper(MaskedMaxPoolHelper),
     MaskedMaxSelector(MaskedMaxSelector),
     NormalizedRatio(NormalizedRatio),
     NonNegative(NonNegative),
@@ -177,7 +179,8 @@ impl BasicBlockType {
                 assert_eq!(n, 2, "Conv* expects 2 inputs (X, W), got {n}")
             }
             BasicBlockType::Einsum(_) => assert!(n >= 1, "Einsum expects at least 1 input, got {n}"),
-            BasicBlockType::MaskedMaxSelector(_) | BasicBlockType::NormalizedRatio(_) => assert_eq!(n,2,"normalization expects two inputs"),
+            BasicBlockType::MaxPoolSelector(_) => assert_eq!(n,3,"MaxPoolSelector expects three inputs"),
+            BasicBlockType::MaskedMaxPoolHelper(_) | BasicBlockType::MaskedMaxSelector(_) | BasicBlockType::NormalizedRatio(_) => assert_eq!(n,2,"normalization expects two inputs"),
             BasicBlockType::GatherFromGrid(_) => assert_eq!(n, 2, "GatherFromGrid expects 2 inputs, got {n}"),
             BasicBlockType::InstanceNorm3D(_) => assert_eq!(n, 3, "InstanceNorm3D expects 3 inputs, got {n}"),
             BasicBlockType::ProductZeroCheck(_) => {
@@ -215,6 +218,8 @@ macro_rules! dispatch_basicblock {
             BasicBlockType::GeneralMaxPoolHelper(b) => b.$method($($arg),*),
             BasicBlockType::InstanceNorm3D(b)       => b.$method($($arg),*),
             BasicBlockType::MaxPoolHelper(b)        => b.$method($($arg),*),
+            BasicBlockType::MaxPoolSelector(b)      => b.$method($($arg),*),
+            BasicBlockType::MaskedMaxPoolHelper(b)  => b.$method($($arg),*),
             BasicBlockType::MaskedMaxSelector(b)   => b.$method($($arg),*),
             BasicBlockType::NormalizedRatio(b)     => b.$method($($arg),*),
             BasicBlockType::NonNegative(b)          => b.$method($($arg),*),

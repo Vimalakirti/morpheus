@@ -1,4 +1,4 @@
-//! Proof wire format (v1). The reported proof size is the length of this
+//! Proof wire format v4: SHAKE256 typed-prefix/public-key profile. The reported proof size is the length of this
 //! encoding, not an estimate.
 //!
 //! * Field elements of F_q and ring coefficients of commitments: 8 bytes
@@ -18,8 +18,8 @@ use super::ring::{AElem, DS, N};
 use rayon::prelude::*;
 
 /// Request/finalization semantics version, also absorbed before challenges.
-pub const PROTOCOL_VERSION: u64 = 3;
-pub const MAGIC: &[u8; 8] = b"MRPHSv3\0";
+pub use super::protocol::{PROTOCOL_VERSION, MAGIC};
+use super::protocol::accepts_wire_magic;
 pub const Z_BITS: usize = 37;
 
 /// Offset and largest code of the response codec.
@@ -220,7 +220,8 @@ pub fn put_auth(w: &mut W, a: &AuthProof) {
     for t in &a.d_o { w.ring_vec(&t.c); w.a(&t.t); }
     for z in [&a.z.w, &a.z.l, &a.z.o] { w.bytes(z); }
 }
-pub fn get_auth(p: &Profile, r: &mut R) -> Option<AuthProof> {
+pub fn get_auth(p: &Profile, r: &mut R) -> Option<AuthProof> { get_auth_cols(p, r, p.source_cols()) }
+fn get_auth_cols(p: &Profile, r: &mut R, source_cols: usize) -> Option<AuthProof> {
     let attempt = r.u16()?;
     if attempt as usize >= p.attempts { return None; }
     r.exact_len(p.tau)?;
@@ -228,7 +229,7 @@ pub fn get_auth(p: &Profile, r: &mut R) -> Option<AuthProof> {
     r.exact_len(p.tau)?;
     let d_o = (0..p.tau).map(|_| Some(AuxTuple { c: r.commitment(p)?, t: r.a()? })).collect::<Option<Vec<_>>>()?;
     let z = Responses {
-        w: r.bytes_exact(response_bytes(p, p.source_cols())?)?,
+        w: r.bytes_exact(response_bytes(p, source_cols)?)?,
         l: r.bytes_exact(response_bytes(p, p.link_cols())?)?,
         o: r.bytes_exact(response_bytes(p, p.aux_cols())?)?,
     };
@@ -267,7 +268,7 @@ pub fn encode_request(p: &Profile, pf: &RequestProof) -> Vec<u8> {
 
 pub fn decode_request(p: &Profile, b: &[u8]) -> Option<RequestProof> {
     let mut r = R::new(b);
-    if r.take(8)? != MAGIC || r.bytes_exact(p.name.len())? != p.name.as_bytes() { return None; }
+    if !accepts_wire_magic(r.take(8)?) || r.bytes_exact(p.name.len())? != p.name.as_bytes() { return None; }
     let salt: [u8; 64] = r.take(64)?.try_into().ok()?;
     let piop = r.k8s()?;
     let min_commit = p.rank.checked_mul(N.checked_mul(8)?.checked_add(4)?)?.checked_add(4)?;
@@ -313,7 +314,7 @@ pub fn encode_final(p: &Profile, pf: &FinalProof) -> Vec<u8> {
 
 pub fn decode_final(p: &Profile, b: &[u8]) -> Option<FinalProof> {
     let mut r = R::new(b);
-    if r.take(8)? != MAGIC || r.bytes_exact(p.name.len())? != p.name.as_bytes() { return None; }
+    if !accepts_wire_magic(r.take(8)?) || r.bytes_exact(p.name.len())? != p.name.as_bytes() { return None; }
     let salt: [u8; 64] = r.take(64)?.try_into().ok()?;
     let link = get_link(p, &mut r)?;
     let auth = get_opt_auth(p, &mut r)?;
@@ -375,4 +376,66 @@ mod tests {
         assert!(unpack37(&pack37(&bad, z_off(&p)), z.len(), z_off(&p), z_umax(&p)).is_none());
         assert!(unpack37(&b[1..], z.len(), z_off(&p), z_umax(&p)).is_none());
     }
+}
+
+/// Transport only: this discriminator is never a semantic transcript item.
+pub const COMPACT_MAGIC:&[u8;8]=b"MCOLv001";
+fn valid_codes(p:&Profile,bytes:&[u8])->bool{
+    // One physical column at a time, bounded temporary decode storage.
+    let n=packed_len(N);bytes.len()%n==0&&bytes.chunks(n).all(|b|unpack37(b,N,z_off(p),z_umax(p)).is_some())
+}
+pub(crate) fn auth_shape_ok_cols(p:&Profile,a:&AuthProof,cols:usize)->bool{
+    (a.attempt as usize)<p.attempts&&a.d.len()==p.tau&&a.d_o.len()==p.tau
+    &&a.d.iter().all(|t|commitment_ok(p,&t.c)&&commitment_ok(p,&t.g)&&endpoint_ok(&t.a))
+    &&a.d_o.iter().all(|t|commitment_ok(p,&t.c)&&endpoint_ok(&t.t))
+    &&response_bytes(p,cols)==Some(a.z.w.len())&&response_bytes(p,p.link_cols())==Some(a.z.l.len())&&response_bytes(p,p.aux_cols())==Some(a.z.o.len())
+}
+fn compact_auth_ok(p:&Profile,s:&super::auth_compact::Support,a:&Option<AuthProof>)->bool{
+    s.matches(p)&&a.as_ref().map(|a|auth_shape_ok_cols(p,a,s.len())&&[&a.z.w,&a.z.l,&a.z.o].iter().all(|b|valid_codes(p,b))).unwrap_or(false)
+}
+fn get_compact_auth(p:&Profile,s:&super::auth_compact::Support,r:&mut R)->Option<Option<AuthProof>>{
+    // Compact transport is defined for a complete authenticated opening.
+    if r.u8()?!=1{return None}let a=get_auth_cols(p,r,s.len())?;
+    if ![&a.z.w,&a.z.l,&a.z.o].iter().all(|b|valid_codes(p,b)){return None}Some(Some(a))
+}
+pub fn encode_request_compact(p:&Profile,s:&super::auth_compact::Support,pf:&RequestProof)->Option<Vec<u8>>{
+    if !compact_auth_ok(p,s,&pf.auth){return None}let mut w=W::default();w.b.extend_from_slice(COMPACT_MAGIC);w.b.extend_from_slice(MAGIC);w.bytes(p.name.as_bytes());w.b.extend_from_slice(&pf.salt);w.k8s(&pf.piop);w.len(pf.c_src.len());for c in &pf.c_src{w.ring_vec(c)}put_link(&mut w,&pf.link);put_opt_auth(&mut w,&pf.auth);Some(w.b)
+}
+pub fn decode_request_compact(p:&Profile,s:&super::auth_compact::Support,b:&[u8])->Option<RequestProof>{
+    if !s.matches(p){return None}let mut r=R::new(b);if r.take(8)?!=COMPACT_MAGIC||!accepts_wire_magic(r.take(8)?)||r.bytes_exact(p.name.len())?!=p.name.as_bytes(){return None}
+    let salt=r.take(64)?.try_into().ok()?;let piop=r.k8s()?;let min_commit=p.rank.checked_mul(N.checked_mul(8)?.checked_add(4)?)?.checked_add(4)?;let n=r.count(p.n_max,min_commit)?;
+    let c_src=(0..n).map(|_|r.commitment(p)).collect::<Option<_>>()?;let link=get_link(p,&mut r)?;let auth=get_compact_auth(p,s,&mut r)?;
+    (r.done()&&link.g_commit.len()==n).then_some(RequestProof{salt,piop,c_src,link,auth})
+}
+pub fn encode_final_compact(p:&Profile,s:&super::auth_compact::Support,pf:&FinalProof)->Option<Vec<u8>>{
+    if !compact_auth_ok(p,s,&pf.auth){return None}let mut w=W::default();w.b.extend_from_slice(COMPACT_MAGIC);w.b.extend_from_slice(MAGIC);w.bytes(p.name.as_bytes());w.b.extend_from_slice(&pf.salt);put_link(&mut w,&pf.link);put_opt_auth(&mut w,&pf.auth);Some(w.b)
+}
+pub fn decode_final_compact(p:&Profile,s:&super::auth_compact::Support,b:&[u8])->Option<FinalProof>{
+    if !s.matches(p){return None}let mut r=R::new(b);if r.take(8)?!=COMPACT_MAGIC||!accepts_wire_magic(r.take(8)?)||r.bytes_exact(p.name.len())?!=p.name.as_bytes(){return None}
+    let salt=r.take(64)?.try_into().ok()?;let link=get_link(p,&mut r)?;let auth=get_compact_auth(p,s,&mut r)?;r.done().then_some(FinalProof{salt,link,auth})
+}
+/// Stream canonical legacy W-response bytes, including offset-binary omitted zeros.
+/// Only for semantic continuation/legacy comparison, not compact wire framing.
+pub fn visit_expanded_w(p:&Profile,s:&super::auth_compact::Support,bytes:&[u8],mut visit:impl FnMut(&[u8]))->Option<()>{
+    if !s.matches(p)||response_bytes(p,s.len())?!=bytes.len()||!valid_codes(p,bytes){return None}
+    let n=packed_len(N);let zero=pack37(&vec![0;N],z_off(p));
+    for row in 0..p.tau{let mut k=0;for c in 0..p.source_cols(){if s.columns().get(k)==Some(&c){let off=(row*s.len()+k)*n;visit(&bytes[off..off+n]);k+=1}else{visit(&zero)}}}Some(())
+}
+#[cfg(any(test,feature="cpu-replay"))] pub mod compact_tests{
+use super::*;use super::super::auth_compact::Support;
+fn fixture(p:&Profile,s:&Support)->RequestProof{
+ let c=vec![vec![0;N];p.rank];let a=AElem::zero();let z=Responses{w:pack37(&vec![0;p.tau*s.len()*N],z_off(p)),l:pack37(&vec![0;p.tau*p.link_cols()*N],z_off(p)),o:pack37(&vec![0;p.tau*p.aux_cols()*N],z_off(p))};
+ RequestProof{salt:[0;64],piop:vec![K8::ZERO],c_src:vec![c.clone()],link:LinkProof{g_commit:vec![c.clone()],c_o:c.clone(),rounds:p.degs().iter().map(|&d|vec![K8::ZERO;d+1]).collect(),a_hat:vec![a.clone()],t_o:a.clone()},auth:Some(AuthProof{attempt:0,d:vec![Tuple{c:c.clone(),g:c.clone(),a:a.clone()};p.tau],d_o:vec![AuxTuple{c,t:a};p.tau],z})}
+}
+#[cfg_attr(test,test)] pub fn compact_framing_codes_and_virtual_zero_extension(){
+ let p=Profile::toy();let s=Support::from_public_columns(&p,vec![0,2,3,4,5,6,7]).unwrap();assert!(Support::from_public_columns(&p,vec![0,2,3,4,5,6]).is_none());let mut pf=fixture(&p,&s);
+ pf.salt[..8].copy_from_slice(COMPACT_MAGIC);pf.auth.as_mut().unwrap().z.w[..8].copy_from_slice(COMPACT_MAGIC);
+ let bytes=encode_request_compact(&p,&s,&pf).unwrap();assert_eq!(decode_request_compact(&p,&s,&bytes),Some(pf.clone()));assert!(decode_request(&p,&bytes).is_none());assert!(decode_request(&p,&bytes[8..]).is_none());assert!(decode_request_compact(&p,&s,&bytes[8..]).is_none());
+ let wlen=bytes.len()-pf.auth.as_ref().unwrap().z.w.len()-pf.auth.as_ref().unwrap().z.l.len()-pf.auth.as_ref().unwrap().z.o.len()-12;let mut wronglen=bytes.clone();wronglen[wlen..wlen+4].copy_from_slice(&(pf.auth.as_ref().unwrap().z.w.len() as u32+1).to_le_bytes());assert!(decode_request_compact(&p,&s,&wronglen).is_none());
+ let mut bad=bytes.clone();bad.push(0);assert!(decode_request_compact(&p,&s,&bad).is_none());let mut bad=bytes.clone();bad[8]=b'!';assert!(decode_request_compact(&p,&s,&bad).is_none());assert!(decode_request_compact(&p,&s,&bytes[..bytes.len()-1]).is_none());
+ let mut badpf=pf.clone();badpf.auth.as_mut().unwrap().z.w[..37].fill(255);assert!(encode_request_compact(&p,&s,&badpf).is_none());let mut invalid=COMPACT_MAGIC.to_vec();invalid.extend(encode_request(&p,&badpf));assert!(decode_request_compact(&p,&s,&invalid).is_none());
+ let mut dense=vec![];visit_expanded_w(&p,&s,&pf.auth.as_ref().unwrap().z.w,|b|dense.extend_from_slice(b)).unwrap();let z=rows_of(&p,&dense,p.source_cols()).unwrap();assert!(z.iter().all(|r|r[1].iter().all(|&v|v==0)));assert_eq!(&dense[packed_len(N)..packed_len(2*N)],pack37(&vec![0;N],z_off(&p)));assert_ne!(&dense[packed_len(N)..packed_len(2*N)],vec![0;packed_len(N)]);
+ let compact=pf.auth.as_ref().unwrap();let mut legacy=pf.clone();legacy.auth.as_mut().unwrap().z.w=dense;let encoded=encode_request(&p,&legacy);assert_eq!(decode_request(&p,&encoded),Some(legacy));assert_eq!(compact.z.w.len(),response_bytes(&p,s.len()).unwrap());
+ let finalpf=FinalProof{salt:pf.salt,link:pf.link.clone(),auth:pf.auth.clone()};let fb=encode_final_compact(&p,&s,&finalpf).unwrap();assert_eq!(decode_final_compact(&p,&s,&fb),Some(finalpf));assert!(decode_final(&p,&fb).is_none());
+}
 }

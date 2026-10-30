@@ -57,24 +57,34 @@ fn rows_hold(rows: &[Row], raw: &[Vec<i8>]) -> bool {
         let mut acc=K8::ZERO;
         for t in &row.terms {
             let e=eq_table(&t.r); let mut sum=K8::ZERO;
-            for (i,q) in e.iter().enumerate() { for (b,pw) in t.pw.iter().enumerate() {
-                let digit=raw[t.region.source][t.region.base+(i<<t.region.p)+b];
-                sum=sum.add(&q.mul(pw).mul(&kb(digit as i128)));
-            } }
+            for (i,q) in e.iter().enumerate() {
+                let mut plane_sum=K8::ZERO;
+                for (b,pw) in t.pw.iter().enumerate() {
+                    let digit=raw[t.region.source][t.region.base+(i<<t.region.p)+b];
+                    plane_sum=match digit {0=>plane_sum,1=>plane_sum.add(pw),-1=>plane_sum.sub(pw),_=>plane_sum.add(&pw.mul(&kb(digit as i128)))};
+                }
+                sum=sum.add(&q.mul(&plane_sum));
+            }
             acc=acc.add(&sum.mul(&t.scale));
         }
         acc==row.y
     })
 }
 
-fn replay(g: &Graph, pd: &ProverData) -> bool {
+fn prove(g:&Graph,pd:&ProverData)->(Layout,Vec<K8>) {
+    let p=crate::morpheus::params::Profile::toy();let layout=Layout::pack(&p,&tensor_specs(g,pd));
+    let tr=MTranscript::new("batched-convolution-test",&[0;64]);
+    let mut pc=Ctx::prover(tr,&pd.bank,&layout,g.cfg.slots_log);
+    Walk::new(g,Some(pd)).run(&mut pc);
+    { let proof=std::mem::take(&mut pc.proof); drop(pc); (layout,proof) }
+}
+// Negative cases reuse an honest transcript; no prover abort is verifier rejection.
+fn verify(g:&Graph,pd:&ProverData,proof:&(Layout,Vec<K8>))->bool {
     let p=Profile::toy();
-    let layout=Layout::pack(&p,&tensor_specs(g,pd));
+    let layout=&proof.0;
     let raw=fill_sources(g,pd,&layout,p.ell());
     let tr=MTranscript::new("batched-convolution-test",&[0;64]);
-    let mut pc=Ctx::prover(tr.clone(),&pd.bank,&layout,g.cfg.slots_log);
-    Walk::new(g,Some(pd)).run(&mut pc);
-    let mut vc=Ctx::verifier(tr,pc.proof.clone(),&layout,g.cfg.slots_log);
+    let mut vc=Ctx::verifier(tr,proof.1.clone(),&layout,g.cfg.slots_log);
     Walk::new(g,None).run(&mut vc);
     vc.ok && vc.consumed() && rows_hold(&vc.rows,&raw)
 }
@@ -90,7 +100,7 @@ fn data(g: &Graph,w: &[Vec<Witness>]) -> ProverData {
     ProverData::new(g,w,(0..4096).map(|i|K8::from_base(17*i+9)).collect())
 }
 
-#[test]
+#[cfg_attr(test, test)]
 pub fn batched_conv_cpu_semantics_and_explicit_shape() {
     for b in [1,2,3,5] { for (ci,co) in [(1,1),(3,3)] {
         for (h,w,k,s,d) in [(3,5,(2,2),(1,1),(1,1)),(5,6,(2,2),(2,3),(1,1)),(5,6,(2,2),(1,2),(2,2)),(3,5,(1,1),(1,1),(1,1))] {
@@ -99,47 +109,47 @@ pub fn batched_conv_cpu_semantics_and_explicit_shape() {
     } }
 }
 
-#[test]
+#[cfg_attr(test, test)]
 pub fn batched_conv_piop_masks_padding_and_rejects_false_outputs() {
     for pp in [false,true] { for b in [1,2,3,5] {
         let (dag,wit,_,_,y)=fixture(b,3,3,3,5,(2,2),(1,1),(1,1),1<<35);
         let mut g=graph(&dag,&wit,pp); let mut pd=data(&g,&wit);
-        assert!(replay(&g,&pd),"honest B={b} pp={pp}");
+        let honest_proof=prove(&g,&pd);assert!(verify(&g,&pd,&honest_proof),"honest B={b} pp={pp}");
         // Change an active output in the last logical batch, not just b=0.
         let mut bad=pd.v(y).as_ref().clone();
         let index=(b-1)*4*2*4; bad[index]=from_i128(1234567);
         pd.vals[y]=Some(Arc::new(bad.clone())); g.outputs=vec![(y,Arc::new(bad))];
-        assert!(!replay(&g,&pd),"false last-batch output B={b} pp={pp}");
+        assert!(!verify(&g,&pd,&honest_proof),"false last-batch output B={b} pp={pp}");
     } }
 }
 
-#[test]
+#[cfg_attr(test, test)]
 pub fn batched_conv_piop_rejects_padded_output_and_full_advice() {
     for pp in [false,true] {
         let (dag,wit,_,_,y)=fixture(3,3,3,3,5,(2,2),(1,1),(1,1),-(1<<35));
         let mut g=graph(&dag,&wit,pp); let mut pd=data(&g,&wit);
-        assert!(replay(&g,&pd));
+        let honest_proof=prove(&g,&pd);assert!(verify(&g,&pd,&honest_proof));
         let mut bad=pd.v(y).as_ref().clone();
         // b=3 is outside logical B=3, but inside Bp=4.
         bad[3*4*2*4]=7;
         pd.vals[y]=Some(Arc::new(bad.clone()));g.outputs=vec![(y,Arc::new(bad))];
-        assert!(!replay(&g,&pd),"nonzero padded output pp={pp}");
+        assert!(!verify(&g,&pd,&honest_proof),"nonzero padded output pp={pp}");
         if pp {
             let g=graph(&dag,&wit,pp);let mut pd=data(&g,&wit);
             let node=dag.nodes.iter().find(|n|matches!(n.kind,BasicBlockType::Conv2D(_))).unwrap();
             let yf=node.outputs[1];let mut bad=pd.v(yf).as_ref().clone();
             let last=bad.len()-1;bad[last]=11;pd.vals[yf]=Some(Arc::new(bad));
-            assert!(!replay(&g,&pd),"nonzero padded full-convolution advice");
+            assert!(!verify(&g,&pd,&honest_proof),"nonzero padded full-convolution advice");
         }
     }
 }
 
-#[test]
+#[cfg_attr(test, test)]
 pub fn batched_conv_piop_stride_dilation_and_shared_kernel() {
     for pp in [false,true] {
         let (dag,wit,_,_,_)=fixture(3,3,3,5,6,(2,2),(2,3),(2,2),1<<35);
         let g=graph(&dag,&wit,pp);let pd=data(&g,&wit);
-        assert!(replay(&g,&pd),"non-power-of-two stride, dilation, B=C=D=3 pp={pp}");
+        let honest_proof=prove(&g,&pd);assert!(verify(&g,&pd,&honest_proof),"non-power-of-two stride, dilation, B=C=D=3 pp={pp}");
     }
     let bad=std::panic::catch_unwind(|| {
         let mut b=DagBuilder::new();
@@ -150,7 +160,7 @@ pub fn batched_conv_piop_stride_dilation_and_shared_kernel() {
     assert!(bad.is_err(),"per-batch kernels are not shared kernels");
 }
 
-#[test]
+#[cfg_attr(test, test)]
 pub fn batched_conv_actual_field_tables_match_forward() {
     use cv::{conv_patch_table,conv_pp_powers,masked_axis_fold,trip_conv,Rel};
     let lb=|x:usize|log2_ceil(x.max(1));
@@ -247,7 +257,7 @@ fn kernel_source_fixture(mode: usize) -> (Dag,Vec<Vec<Witness>>,usize) {
     (dag,wit,y)
 }
 
-#[test]
+#[cfg_attr(test, test)]
 pub fn conv_kernel_source_cpu_and_collision_guards() {
     for mode in 0..3 {kernel_source_fixture(mode);}
     let collision=crate::basicblock::conv::FlattenKernel {s_w:1,kh:2,kw:2,c_out:1,c_in:1,dilation_h:1,dilation_w:1};
@@ -256,16 +266,54 @@ pub fn conv_kernel_source_cpu_and_collision_guards() {
     assert!(std::panic::catch_unwind(||cv::flatten_kernel_rel(&overflow,2)).is_err(),"tap indices cannot wrap machine words");
 }
 
-#[test]
+#[cfg_attr(test, test)]
 pub fn conv_kernel_source_piop_preserves_nonidentity_producers() {
     for mode in 0..3 {for pp in [false,true] {
         let (dag,wit,y)=kernel_source_fixture(mode);
         let mut g=graph(&dag,&wit,pp);let mut pd=data(&g,&wit);
-        assert!(replay(&g,&pd),"actual flat kernel source mode={mode} pp={pp}");
+        let honest_proof=prove(&g,&pd);assert!(verify(&g,&pd,&honest_proof),"actual flat kernel source mode={mode} pp={pp}");
         if mode>0 {
             let mut bad=pd.v(y).as_ref().clone();bad[..6].copy_from_slice(&[11,16,21,26,31,36]);
             pd.vals[y]=Some(Arc::new(bad.clone()));g.outputs=vec![(y,Arc::new(bad))];
-            assert!(!replay(&g,&pd),"raw-kernel bypass counterfeit mode={mode} pp={pp}");
+            assert!(!verify(&g,&pd,&honest_proof),"raw-kernel bypass counterfeit mode={mode} pp={pp}");
         }
     }}
+}
+
+#[cfg_attr(test,test)]
+pub fn cpu_replay_rejects_tampered_transcript_and_zero_skip_is_exact() {
+    for i in 0..100u64 {
+        let q=K8([i+1,2,3,5,7,11,13,17]);let w=K8([19,23,i+2,29,31,37,41,43]);
+        for d in [-1i8,0,1] {
+            let dense=q.mul(&w).mul(&kb(d as i128));
+            let sparse=if d==0 {K8::ZERO}else{q.mul(&w).mul(&kb(d as i128))};
+            assert_eq!(dense,sparse);
+        }
+    }
+    // Independent dense-vs-factored dot products with full-extension points,
+    // multiple bitplanes/terms and mixed nonternary signed test digits.
+    for seed in 0..64u64 {
+        let mut dense=K8::ZERO;let mut factored=K8::ZERO;
+        for term in 0..3u64 {
+            let scale=K8([term+1,seed+2,3,5,7,11,13,17]);
+            let mut dsum=K8::ZERO;let mut fsum=K8::ZERO;
+            for i in 0..5u64 {
+                let q=K8([seed+i+1,2,3,5,7,11,13,17]);let mut plane=K8::ZERO;
+                for b in 0..17u64 {
+                    let pw=K8([b+1,term+2,seed+3,5,7,11,13,17]);let digit=((seed+term+i+b)%5) as i8-2;
+                    dsum=dsum.add(&q.mul(&pw).mul(&kb(digit as i128)));
+                    plane=match digit {0=>plane,1=>plane.add(&pw),-1=>plane.sub(&pw),_=>plane.add(&pw.mul(&kb(digit as i128)))};
+                }
+                fsum=fsum.add(&q.mul(&plane));
+            }
+            dense=dense.add(&dsum.mul(&scale));factored=factored.add(&fsum.mul(&scale));
+        }
+        assert_eq!(dense,factored,"exact row factoring seed={seed}");
+    }
+    let(d,w,_,_,_)=fixture(1,1,1,2,2,(1,1),(1,1),(1,1),0);
+    let g=graph(&d,&w,false);let pd=data(&g,&w);let proof=prove(&g,&pd);
+    assert!(verify(&g,&pd,&proof));assert!(!proof.1.is_empty());
+    for index in [0,proof.1.len()-1] {let mut bad=(proof.0.clone(),proof.1.clone());bad.1[index]=bad.1[index].add(&K8::ONE);assert!(!verify(&g,&pd,&bad));}
+    assert!(!verify(&g,&pd,&(proof.0.clone(),proof.1[..proof.1.len()-1].to_vec())));
+    let mut bad=(proof.0.clone(),proof.1.clone());bad.1.push(K8::ZERO);assert!(!verify(&g,&pd,&bad));
 }

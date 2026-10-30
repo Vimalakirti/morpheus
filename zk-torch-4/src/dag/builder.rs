@@ -713,6 +713,8 @@ impl DagBuilder {
     /// historical convention that every represented channel is logical.
     fn fold_per_channel2d_input(&mut self, x: EdgeId) -> (EdgeId, Vec<usize>, usize, usize, usize) {
         let shape = self.init_values[x].as_ref().unwrap().shape.clone();
+        assert!(shape.iter().all(|&d|d>0),"CNN extents must be positive");
+        shape.iter().try_fold(1usize,|n,&d|n.checked_mul(d.checked_next_power_of_two().expect("CNN extent overflow"))).expect("CNN size overflow");
         let (channels, _, _) = Self::per_channel_lead(&shape);
         let h = shape[shape.len()-2]; let w = shape[shape.len()-1];
         let x = if shape.len() == 4 {
@@ -746,63 +748,32 @@ impl DagBuilder {
         self.init_values.push(Some(Witness::new_wo_data(
             Self::per_channel_out(channels, h_out, w_out),
             DataType::Uint,
-            0,
+            self.init_values[x].as_ref().unwrap().sf,
             Role::Output,
         )));
         self.restore_per_channel2d_output(outs[0], &original_shape, h_out, w_out)
     }
 
-    /// 2×2 max pooling: X[C, H, W] → Y[C, H/pool_h, W/pool_w].
-    /// Composes: MaxPoolHelper → Replicate2x2 → Sub → NonNeg (dominance).
+    /// Nonoverlapping max pooling, with floor output dimensions. Only complete
+    /// logical windows participate; `compile` attaches exact attainment roots.
     pub fn maxpool2d(&mut self, x: EdgeId, pool_h: usize, pool_w: usize) -> EdgeId {
-        use crate::basicblock::maxpool::{MaxPoolHelper, Replicate2x2};
-
         let (x, original_shape, channels, input_h, input_w) = self.fold_per_channel2d_input(x);
-
-        assert_eq!(input_h % pool_h, 0, "H must be divisible by pool_h");
-        assert_eq!(input_w % pool_w, 0, "W must be divisible by pool_w");
-
-        let h_out = input_h / pool_h;
-        let w_out = input_w / pool_w;
-        let out_shape = Self::per_channel_out(channels, h_out, w_out);
-
-        // 1. MaxPoolHelper(x) → y
-        let maxpool = BasicBlockType::MaxPoolHelper(MaxPoolHelper {
-            channels, input_h, input_w, pool_h, pool_w,
-        });
-        let y_outs = self.add_gkr_node(vec![x], maxpool);
-        let y = y_outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            out_shape, DataType::Uint, 0, Role::Output,
-        )));
-
-        // 2. Replicate2x2(y) → y_rep
-        let replicate = BasicBlockType::Replicate2x2(Replicate2x2 {
-            channels, out_h: input_h, out_w: input_w,
-        });
-        let rep_outs = self.add_gkr_node(vec![y], replicate);
-        let y_rep = rep_outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            Self::per_channel_out(channels, input_h, input_w),
-            DataType::Uint,
-            0,
-            Role::Output,
-        )));
-
-        // 3. Dominance: sub(y_rep, x) → diff ≥ 0 (y ≥ every input in pool window)
-        let diff_outs = self.sub(y_rep, x);
-        let diff = diff_outs[0];
-        self.add_nonneg_node(diff);
-
-        self.restore_per_channel2d_output(y, &original_shape, h_out, w_out)
+        let p=GeneralMaxPoolHelper {channels,input_h,input_w,kernel_h:pool_h,kernel_w:pool_w,stride_h:pool_h,stride_w:pool_w};
+        let shape=p.output_shape();let sf=self.init_values[x].as_ref().unwrap().sf;
+        let y=self.add_gkr_node(vec![x],BasicBlockType::MaxPoolHelper(MaxPoolHelper {
+            channels,input_h,input_w,pool_h,pool_w,
+        }))[0];
+        self.init_values.push(Some(Witness::new_wo_data(shape.clone(),DataType::Uint,sf,Role::Output)));
+        let out=self.restore_per_channel2d_output(y,&original_shape,shape[1],shape[2]);
+        // Return a computed edge so standalone maxpool has a public root even
+        // though the helper itself is committed advice consumed by its guards.
+        let out_shape=self.init_values[out].as_ref().unwrap().shape.clone();
+        self.change_shape(out,out_shape)
     }
 
     /// Asymmetric zero-pad: X[C, H, W] → Y[C, H+pt+pb, W+pl+pr].
     pub fn pad_asym(&mut self, x: EdgeId, pad_h_top: usize, pad_h_bottom: usize, pad_w_left: usize, pad_w_right: usize) -> EdgeId {
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let channels = x_shape[0];
-        let input_h = x_shape[1];
-        let input_w = x_shape[2];
+        let (x,original_shape,channels,input_h,input_w)=self.fold_per_channel2d_input(x);
 
         let h_out = input_h + pad_h_top + pad_h_bottom;
         let w_out = input_w + pad_w_left + pad_w_right;
@@ -814,10 +785,10 @@ impl DagBuilder {
         self.init_values.push(Some(Witness::new_wo_data(
             vec![channels, h_out, w_out],
             DataType::Uint,
-            0,
+            self.init_values[x].as_ref().unwrap().sf,
             Role::Output,
         )));
-        outs[0]
+        self.restore_per_channel2d_output(outs[0],&original_shape,h_out,w_out)
     }
 
     /// SubSample2D: X[C, H, W] → SV[C, out_h, out_w] at strided+offset positions.
@@ -1041,35 +1012,42 @@ impl DagBuilder {
         outs[0]
     }
 
-    /// General max pooling: X[C, H, W] → Y[C, H_out, W_out] with arbitrary kernel and stride.
-    /// Uses GeneralMaxPoolHelper advice node + SubSample2D + Sub + NonNeg for dominance.
+    /// General max pooling over full logical windows, including overlap and
+    /// floor/truncated trailing windows. Explicit zero padding is a real value;
+    /// it is NOT implicit negative-infinity padding. Storage padding is excluded.
     pub fn maxpool_general(&mut self, x: EdgeId, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize) -> EdgeId {
         let (x, original_shape, channels, input_h, input_w) = self.fold_per_channel2d_input(x);
+        let p=GeneralMaxPoolHelper {channels,input_h,input_w,kernel_h,kernel_w,stride_h,stride_w};
+        let shape=p.output_shape();let sf=self.init_values[x].as_ref().unwrap().sf;
+        let y=self.add_gkr_node(vec![x],BasicBlockType::GeneralMaxPoolHelper(p))[0];
+        self.init_values.push(Some(Witness::new_wo_data(shape.clone(),DataType::Uint,sf,Role::Output)));
+        let out=self.restore_per_channel2d_output(y,&original_shape,shape[1],shape[2]);
+        // Return a computed edge so standalone maxpool has a public root even
+        // though the helper itself is committed advice consumed by its guards.
+        let out_shape=self.init_values[out].as_ref().unwrap().shape.clone();
+        self.change_shape(out,out_shape)
+    }
 
-        let out_h = (input_h - kernel_h) / stride_h + 1;
-        let out_w = (input_w - kernel_w) / stride_w + 1;
-        let out_shape = Self::per_channel_out(channels, out_h, out_w);
-
-        // 1. Advice node: compute Y = maxpool(X)
-        let gmp = BasicBlockType::GeneralMaxPoolHelper(GeneralMaxPoolHelper {
-            channels, input_h, input_w, kernel_h, kernel_w, stride_h, stride_w,
+    /// Symmetrically padded max pooling with implicit negative-infinity
+    /// semantics, implemented by authenticated exclusion, not a finite sentinel.
+    /// Every logical output must retain at least one real input; otherwise this
+    /// public geometry is rejected. Right/bottom partial windows are discarded.
+    pub fn maxpool_general_padded(&mut self,x:EdgeId,kernel_h:usize,kernel_w:usize,
+        stride_h:usize,stride_w:usize,pad_h:usize,pad_w:usize)->EdgeId {
+        let (x,original,channels,input_h,input_w)=self.fold_per_channel2d_input(x);
+        let ph=input_h.checked_add(pad_h.checked_mul(2).expect("pool padding overflow")).expect("pool padding overflow");
+        let pw=input_w.checked_add(pad_w.checked_mul(2).expect("pool padding overflow")).expect("pool padding overflow");
+        let p=GeneralMaxPoolHelper {channels,input_h:ph,input_w:pw,kernel_h,kernel_w,stride_h,stride_w};
+        let shape=p.output_shape();
+        let support=crate::dag::maxpool::window_support(self,&p,|oh,ow,kh,kw| {
+            let ih=oh*stride_h+kh;let iw=ow*stride_w+kw;
+            ih>=pad_h && ih-pad_h<input_h && iw>=pad_w && iw-pad_w<input_w
         });
-        let y_outs = self.add_gkr_node(vec![x], gmp);
-        let y = y_outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            out_shape, DataType::Uint, 0, Role::Output,
-        )));
-
-        // 2. Dominance: for each kernel position, prove Y >= SubSample(X, stride, offset)
-        for kh in 0..kernel_h {
-            for kw in 0..kernel_w {
-                let sv = self.subsample2d_sized(x, stride_h, stride_w, kh, kw, out_h, out_w);
-                let diff = self.sub(y, sv);
-                self.add_nonneg_node(diff[0]);
-            }
-        }
-
-        self.restore_per_channel2d_output(y, &original_shape, out_h, out_w)
+        let x=self.pad(x,pad_h,pad_w);let sf=self.init_values[x].as_ref().unwrap().sf;
+        let y=self.add_gkr_node(vec![x,support],BasicBlockType::MaskedMaxPoolHelper(MaskedMaxPoolHelper{pool:p}))[0];
+        self.init_values.push(Some(Witness::new_wo_data(shape.clone(),DataType::Uint,sf,Role::Output)));
+        let y=self.restore_per_channel2d_output(y,&original,shape[1],shape[2]);
+        let shape=self.init_values[y].as_ref().unwrap().shape.clone();self.change_shape(y,shape)
     }
 
     /// ReLU: y = max(0, x).
@@ -1907,58 +1885,35 @@ impl DagBuilder {
         self.einsum(eq, vec![mask_edge, x], false)[0]
     }
 
-    /// PillarMaxPool: X[N_pillars, max_points, D] → Y[N_pillars, D].
-    /// With dominance (Y ≥ X_t for each t).
+    /// Exact maximum over the logical point axis, with private attainment.
+    /// Storage padding is excluded; every declared point remains a real member.
     pub fn pillar_maxpool(&mut self, x: EdgeId, n_pillars: usize, max_points: usize, features: usize) -> EdgeId {
-        let out_shape = vec![n_pillars, features];
-
-        // 1. PillarMaxPool(X) → Y (advice)
-        let block = BasicBlockType::PillarMaxPool(PillarMaxPool {
-            n_pillars, max_points, features,
-        });
-        let outs = self.add_gkr_node(vec![x], block);
-        let y = outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            out_shape, DataType::Uint, 0, Role::Output,
-        )));
-
-        // 2. Dominance: Y ≥ X[:, t, :] for each t.
-        //    X has shape [N_pillars, max_points, D] — treat as [C=N, H=T, W=D].
-        //    SubSample2D(X, stride_h=1, stride_w=1, offset_h=t, offset_w=0, out_h=1, out_w=D)
-        //    gives X_t[N, 1, D]. ChangeShape to [N, D], then sub(Y, X_t) ≥ 0.
-        for t in 0..max_points {
-            let x_t = self.subsample2d_sized(x, 1, 1, t, 0, 1, features);
-            let x_t_flat = self.change_shape(x_t, vec![n_pillars, features]);
-            let diff = self.sub(y, x_t_flat);
-            self.add_nonneg_node(diff[0]);
-        }
-
-        y
+        let geometry=GeneralMaxPoolHelper {channels:n_pillars,input_h:max_points,input_w:features,
+            kernel_h:max_points,kernel_w:1,stride_h:max_points,stride_w:1};
+        geometry.output_shape();
+        let input=self.init_values[x].as_ref().unwrap();
+        assert_eq!(input.shape,vec![n_pillars,max_points,features]);
+        let sf=input.sf;
+        let y=self.add_gkr_node(vec![x],BasicBlockType::PillarMaxPool(PillarMaxPool {
+            n_pillars,max_points,features,
+        }))[0];
+        self.init_values.push(Some(Witness::new_wo_data(vec![n_pillars,features],DataType::Uint,sf,Role::Output)));
+        // A consumed committed helper is not a standalone public terminal root.
+        self.change_shape(y,vec![n_pillars,features])
     }
 
     /// ScatterToBEV: X[N_pillars, D] + coords[N_pillars, 2] → Y[D, ny, nx].
     pub fn scatter_to_bev(&mut self, x: EdgeId, coords: EdgeId, n_pillars: usize, features: usize, ny: usize, nx: usize) -> EdgeId {
-        let block = BasicBlockType::ScatterToBEV(ScatterToBEV {
-            n_pillars, features, ny, nx,
-        });
-        let outs = self.add_gkr_node(vec![x, coords], block);
-        self.init_values.push(Some(Witness::new_wo_data(
-            vec![features, ny, nx],
-            DataType::Uint, 0, Role::Output,
-        )));
-        outs[0]
+        let sf=self.init_values[x].as_ref().unwrap().sf;
+        let outs=self.add_gkr_node(vec![x,coords],BasicBlockType::ScatterToBEV(ScatterToBEV{n_pillars,features,ny,nx}));
+        self.init_values.push(Some(Witness::new_wo_data(vec![features,ny,nx],DataType::Uint,sf,Role::Output)));
+        self.change_shape(outs[0],vec![features,ny,nx])
     }
-
     pub fn gather_from_grid(&mut self, grid: EdgeId, coords: EdgeId, n_points: usize, channels: usize, grid_h: usize, grid_w: usize) -> EdgeId {
-        let block = BasicBlockType::GatherFromGrid(GatherFromGrid {
-            n_points, channels, grid_h, grid_w,
-        });
-        let outs = self.add_gkr_node(vec![grid, coords], block);
-        self.init_values.push(Some(Witness::new_wo_data(
-            vec![n_points, channels],
-            DataType::Uint, 0, Role::Output,
-        )));
-        outs[0]
+        let sf=self.init_values[grid].as_ref().unwrap().sf;
+        let outs=self.add_gkr_node(vec![grid,coords],BasicBlockType::GatherFromGrid(GatherFromGrid{n_points,channels,grid_h,grid_w}));
+        self.init_values.push(Some(Witness::new_wo_data(vec![n_points,channels],DataType::Uint,sf,Role::Output)));
+        self.change_shape(outs[0],vec![n_points,channels])
     }
 
     /// Attach canonical domain gates even for standalone raw ExpHelper nodes.
@@ -2011,6 +1966,24 @@ impl DagBuilder {
             let node=self.nodes[cursor].clone();cursor+=1;
             match node.kind {
                 BasicBlockType::SoftmaxConst(_) | BasicBlockType::SigmoidConst(_)=>panic!("unconstrained log normalization advice is unsupported; use selected finite normalization"),
+                BasicBlockType::MaxPoolHelper(p)=>{
+                    let p=GeneralMaxPoolHelper {channels:p.channels,input_h:p.input_h,input_w:p.input_w,
+                        kernel_h:p.pool_h,kernel_w:p.pool_w,stride_h:p.pool_h,stride_w:p.pool_w};
+                    crate::dag::maxpool::attach_selector(&mut self,node.inputs[0],node.outputs[0],p,None);
+                },
+                BasicBlockType::GeneralMaxPoolHelper(p)=>crate::dag::maxpool::attach_selector(&mut self,node.inputs[0],node.outputs[0],p,None),
+                BasicBlockType::MaskedMaxPoolHelper(p)=>crate::dag::maxpool::attach_selector(&mut self,node.inputs[0],node.outputs[0],p.pool,Some(node.inputs[1])),
+                BasicBlockType::ScatterToBEV(p)=>crate::dag::grid_routing::attach_scatter(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],p.n_pillars,p.features,p.ny,p.nx),
+                BasicBlockType::GatherFromGrid(p)=>crate::dag::grid_routing::attach_gather(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],p.n_points,p.channels,p.grid_h,p.grid_w),
+                BasicBlockType::PillarMaxPool(p)=>{
+                    let g=GeneralMaxPoolHelper {channels:p.n_pillars,input_h:p.max_points,input_w:p.features,
+                        kernel_h:p.max_points,kernel_w:1,stride_h:p.max_points,stride_w:1};
+                    g.output_shape();
+                    assert_eq!(self.init_values[node.outputs[0]].as_ref().unwrap().shape,vec![p.n_pillars,p.features]);
+                    let y=self.change_shape(node.outputs[0],vec![p.n_pillars,1,p.features]);
+                    crate::dag::maxpool::attach_selector(&mut self,node.inputs[0],y,g,None);
+                },
+                BasicBlockType::MaxPoolSelector(p)=>crate::dag::maxpool::selector_constraints(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],node.inputs[2],p.pool),
                 BasicBlockType::MaskedMaxSelector(_)=>crate::dag::softmax::max_selector_constraints(&mut self,node.inputs[0],node.inputs[1],node.outputs[0]),
                 BasicBlockType::NormalizedRatio(b)=>crate::dag::softmax::ratio_constraints(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],b.max_terms),
                 BasicBlockType::InstanceNorm3D(_)=>panic!("unconstrained legacy InstanceNorm advice is unsupported; use instancenorm3d"),

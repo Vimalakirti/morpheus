@@ -179,7 +179,7 @@ impl Crt {
             if d[i] != self.half_digits[i] { greater = d[i] > self.half_digits[i]; break; }
         }
         if greater {
-            if x >= self.p_mod_q { x - self.p_mod_q } else { x + Q - self.p_mod_q }
+            if x >= self.p_mod_q { x - self.p_mod_q } else { Q - (self.p_mod_q - x) }
         } else { x }
     }
 }
@@ -271,7 +271,7 @@ pub fn mul_schoolbook(a: &[u64], b: &[u64]) -> Vec<u64> {
     acc.iter().map(|&(pos, neg)| {
         let p = reduce128(pos);
         let n = reduce128(neg);
-        if p >= n { p - n } else { p + Q - n }
+        if p >= n { p - n } else { Q - (n - p) }
     }).collect()
 }
 

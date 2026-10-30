@@ -14,6 +14,10 @@ pub fn threshold() -> usize {
     *T
 }
 pub fn enabled() -> bool {
+    if !cfg!(feature = "cuda") {
+        assert!(std::env::var_os("MORPHEUS_PIOP_GPU").map(|v| v == "0").unwrap_or(true), "GPU requested in a CUDA-free build");
+        return false;
+    }
     static E: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| std::env::var("MORPHEUS_PIOP_GPU").ok().as_deref() != Some("0"));
     *E
 }

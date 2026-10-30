@@ -11,6 +11,7 @@ pub mod streaming_accumulator;
 pub mod gpt2;
 pub mod gptj;
 pub mod lenet;
+pub mod maxpool;
 pub mod instancenorm;
 pub mod llama;
 pub mod lookups;
@@ -1310,3 +1311,11 @@ mod cnn_layout_tests;
 
 #[cfg(test)]
 mod cnn_finite_activation_tests;
+
+#[cfg(test)]
+mod maxpool_tests;
+
+pub(crate) mod grid_routing;
+
+#[cfg(test)]
+mod grid_routing_tests;

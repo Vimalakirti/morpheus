@@ -263,15 +263,21 @@ fn input_registration_matches(pp: &Prepared, o: &Opts, input: RegisteredInput<'_
 /// Register every nonpublic leaf Role::Input, without registering fresh graph
 /// masks. Allocated suffix-owner addresses are irreversibly consumed on failure.
 pub fn register_inputs(pp: &Prepared, o: &Opts, pc: &mut PcsGpu) -> InputReg {
+    let r = register_inputs_with(pp, o, &|raw, owner| fill_suffixes(&o.profile, &o.coins, raw, owner), &mut |raw| if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, raw) });
+    pc.ensure_w(); r
+}
+pub fn register_inputs_cpu(pp: &Prepared, o: &Opts) -> InputReg {
+    register_inputs_with(pp, o, &|raw, owner| fill_suffixes_cpu(o, raw, owner), &mut |raw| commit_cpu(o, raw))
+}
+fn register_inputs_with(pp: &Prepared, o: &Opts, fill: &dyn Fn(&mut [Vec<i8>], &dyn Fn(usize) -> u64), commit: &mut dyn FnMut(&[Vec<i8>]) -> Vec<Vec<Vec<u64>>>) -> InputReg {
     let t = Instant::now();
     let statement = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
         .expect("invalid input registration program");
     let owners = o.coins.allocate_input_registration(pp.input.len()).expect("input registration source budget exhausted");
     let mut raw = piop::fill_sources_in(&pp.g, &pp.pd, &pp.lay, o.profile.ell(), pp.input.clone());
     assert_eq!(raw.len() as u64, owners.end - owners.start, "input suffix owner allocation mismatch");
-    fill_suffixes(&o.profile, &o.coins, &mut raw, &|e| owners.start + e as u64);
-    let c = if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, &raw) };
-    pc.ensure_w();
+    fill(&mut raw, &|e| owners.start + e as u64);
+    let c = commit(&raw);
     InputReg { raw, c, statement, layout: group_layout_words(pp, &pp.input), secs: t.elapsed().as_secs_f64() }
 }
 
@@ -279,13 +285,19 @@ pub fn register_inputs(pp: &Prepared, o: &Opts, pc: &mut PcsGpu) -> InputReg {
 /// The verifier must obtain the expected commitments from its trusted registry,
 /// not from the proof or an untrusted prover-supplied ModelReg.
 pub fn register(pp: &Prepared, o: &Opts, pc: &mut PcsGpu, reps: &Replicas) -> ModelReg {
+    let _ = reps;
+    let r = register_with(pp, o, &|raw, owner| fill_suffixes(&o.profile, &o.coins, raw, owner), &mut |raw| if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, raw) });
+    pc.ensure_w(); r
+}
+pub fn register_cpu(pp: &Prepared, o: &Opts) -> ModelReg {
+    register_with(pp, o, &|raw, owner| fill_suffixes_cpu(o, raw, owner), &mut |raw| commit_cpu(o, raw))
+}
+fn register_with(pp: &Prepared, o: &Opts, fill: &dyn Fn(&mut [Vec<i8>], &dyn Fn(usize) -> u64), commit: &mut dyn FnMut(&[Vec<i8>]) -> Vec<Vec<Vec<u64>>>) -> ModelReg {
     o.coins.claim_model_registration().expect("model registration namespace already consumed");
     let t = Instant::now();
     let mut raw = piop::fill_sources_in(&pp.g, &pp.pd, &pp.lay, o.profile.ell(), pp.model.clone());
-    fill_suffixes(&o.profile, &o.coins, &mut raw, &model_owner);
-    let _ = reps;
-    let c = if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, &raw) };
-    pc.ensure_w();
+    fill(&mut raw, &model_owner);
+    let c = commit(&raw);
     let statement = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
         .expect("invalid registered program");
     ModelReg { raw, c, secs: t.elapsed().as_secs_f64(), statement, layout: model_layout_words(pp) }
@@ -461,6 +473,7 @@ pub struct RequestOut {
     pub carry_raw: Option<Vec<i8>>,
     pub deferred: Vec<Row>,
     pub digest: K8,
+    pub literal_prefix: Vec<u8>,
     pub times: Times,
     pub rows: usize,
     pub carries: usize,
@@ -526,7 +539,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         let mut walk = Walk::new(g, Some(pd));
         walk.run(&mut ctx);
         lap(&mut times, "piop", t);
-        pd.cache.clear();
+        pd.clear_cache();
         if o.timing { for (k, v) in &ctx.stats { eprintln!("  {k:12} {:6} calls {:.3}s", v.0, v.1); } }
         println!("{}", ctx.census_line());
         let reps: Vec<AuthReplica> = if stream { std::mem::take(&mut reps.r) } else { jobs.into_iter().map(|h| h.join().expect("replica")).collect() };
@@ -586,7 +599,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     let pf = wire::RequestProof { salt, piop: std::mem::take(&mut ctx.proof), c_src, link: fast.proof, auth };
     let bytes = wire::encode_request(&o.profile, &pf);
     lap(&mut times, "serialize", t);
-    RequestOut { bytes, piop_len, c_carry, carry_raw, deferred, digest: dg, times, rows: ctx.rows.len(), carries: ncarry }
+    RequestOut { bytes, piop_len, c_carry, carry_raw, deferred, digest: dg, literal_prefix: t1.literal_prefix().to_vec(), times, rows: ctx.rows.len(), carries: ncarry }
 }
 
 /// Registry identity check, independent of prover data and GPU state.
@@ -595,8 +608,20 @@ fn registered_model_matches(n_model: usize, defer: bool, expected: Option<&[Vec<
     expected.len() == n_model && (defer || sources.get(..n_model) == Some(expected))
 }
 
-/// Verifier of request `j`; returns its deferred rows and digest.
-pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<RegisteredModel<'_>>, input: RegisteredInput<'_>, out: &wire::RequestProof, keys: &auth_gpu::Keys, times: &mut Times) -> Option<(Vec<Row>, K8)> {
+/// Verifier of request `j`; returns deferred rows, diagnostic digest, and literal public prefix.
+pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<RegisteredModel<'_>>, input: RegisteredInput<'_>, out: &wire::RequestProof, keys: &auth_gpu::Keys, times: &mut Times) -> Option<(Vec<Row>, K8, Vec<u8>)> {
+    verify_request_with(pp, o, j, model, input, out, times, o.profile.source_cols(), &|tr, pt, targets, target_o, apf| auth_gpu::verify(&o.profile, keys, tr, pt, targets, target_o, apf))
+}
+
+/// Host authentication backend; all statement, registry, graph and link gates
+/// are shared with the GPU verifier. No witness or private coins are read.
+pub fn verify_request_cpu(pp: &Prepared, o: &Opts, j: u64, model: Option<RegisteredModel<'_>>, input: RegisteredInput<'_>, out: &wire::RequestProof, times: &mut Times) -> Option<(Vec<Row>, K8, Vec<u8>)> {
+    verify_request_with(pp, o, j, model, input, out, times, o.profile.source_cols(), &|tr, pt, targets, target_o, apf| super::auth::verify(&o.profile, &o.seed, tr, pt, targets, target_o, apf))
+}
+
+fn verify_request_with(pp: &Prepared, o: &Opts, j: u64, model: Option<RegisteredModel<'_>>, input: RegisteredInput<'_>, out: &wire::RequestProof, times: &mut Times,
+    w_cols: usize, authenticate: &dyn Fn(&MTranscript, &Point, &[Tuple], &AuxTuple, &AuthProof) -> bool,
+) -> Option<(Vec<Row>, K8, Vec<u8>)> {
     if j >= (1u64 << 32) - 1 || std::env::var_os("LINK_ROWS").is_some() { return None; }
     if pp.ar.as_ref().map(|ar| !ar.validate(&pp.g)).unwrap_or(false) { return None; }
     // Diagnostic NO_AUTH proofs are never accepted by this API.
@@ -615,7 +640,7 @@ pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<RegisteredM
         || !expected_model.iter().all(|c| wire::commitment_ok(&o.profile, c))
         || !out.c_src.iter().all(|c| wire::commitment_ok(&o.profile, c))
         || !wire::link_shape_ok(&o.profile, out.c_src.len(), &out.link)
-        || !wire::auth_shape_ok(&o.profile, apf)
+        || !wire::auth_shape_ok_cols(&o.profile, apf, w_cols)
         || !out.piop.iter().all(wire::canonical_k) { return None; }
     // The expected registry commitments, not a prover-selected model identity,
     // are bound before graph challenges. Empty-model graphs still supply a
@@ -640,21 +665,21 @@ pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<RegisteredM
     let (pt, targets, target_o) = match lv { Some(x) => x, None => { eprintln!("request {j}: link rejected"); return None; } };
     if let Some(apf) = &out.auth {
         let t = Instant::now();
-        let ok = auth_gpu::verify(&o.profile, keys, &tv, &pt, &targets, &target_o, apf);
+        let ok = authenticate(&tv, &pt, &targets, &target_o, apf);
         lap(times, "verify auth", t);
         if !ok { eprintln!("request {j}: authentication rejected"); return None; }
     }
     let deferred = vctx.defer.map(|d| d.rows).unwrap_or_default();
-    Some((deferred, digest(&tv)))
+    Some((deferred, digest(&tv), tv.literal_prefix().to_vec()))
 }
 
 // ---------------------------------------------------------------- finalization
 
 /// Verifier-owned state from successful `verify_request` for the SAME pinned
 /// program/model/layout. Never deserialize an untrusted network queue into this
-/// type and pass it directly to `verify_final`; the digest is not self-authenticating.
+/// type and pass it directly to `verify_final`; neither prefix nor digest is self-authenticating.
 #[derive(Clone)]
-pub struct QueueEntry<'q> { pub j: u64, pub deferred: &'q [Row], pub c_carry: &'q [Vec<u64>], pub digest: K8 }
+pub struct QueueEntry<'q> { pub j: u64, pub deferred: &'q [Row], pub c_carry: &'q [Vec<u64>], pub digest: K8, pub literal_prefix: &'q [u8] }
 
 /// Finalization output: the serialized proof (`wire::encode_final`).
 pub struct FinalOut { pub bytes: Vec<u8>, pub times: Times, pub rows: usize }
@@ -677,13 +702,15 @@ fn final_transcript(o: &Opts, pp: &Prepared, b: u64, salt: &[u8; 64], c_model: &
     let words = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log).ok()?;
     let mut tr = MTranscript::new(o.profile.name, salt);
     tr.absorb(Item::Statement, &[wire::PROTOCOL_VERSION, 1, o.defer as u64]);
-    // Request-specific public values are already bound by each queue digest.
+    // Request-specific public values and history are bound literally below.
+    // The diagnostic digest is not a substitute for the oracle prefix.
     tr.absorb(Item::Statement, &words);
     absorb_layout(&mut tr, &pp.lay);
     absorb_model(&mut tr, c_model);
     tr.absorb(Item::Statement, &[q.len() as u64, b]);
     for e in q {
         tr.absorb(Item::Statement, &[e.j]);
+        tr.absorb_bytes(Item::Other, e.literal_prefix);
         tr.absorb_k(Item::Other, &[e.digest]);
         for x in e.c_carry { tr.absorb(Item::SourceCommitment, x); }
     }
@@ -742,6 +769,16 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
 /// this same independently pinned model/program/layout; this function does not
 /// re-run request verification. The expected model commitments are external.
 pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, model: RegisteredModel<'_>, q: &[QueueEntry], out: &wire::FinalProof, keys: &auth_gpu::Keys, times: &mut Times) -> bool {
+    verify_final_with(pp, o, b, model, q, out, times, o.profile.source_cols(), &|tr, pt, targets, target_o, apf| auth_gpu::verify(&o.profile, keys, tr, pt, targets, target_o, apf))
+}
+/// Host finalization verifier sharing every registry, queue, transcript and link
+/// check with the GPU backend. Queue entries must come from verified requests.
+pub fn verify_final_cpu(pp: &Prepared, o: &Opts, b: u64, model: RegisteredModel<'_>, q: &[QueueEntry], out: &wire::FinalProof, times: &mut Times) -> bool {
+    verify_final_with(pp, o, b, model, q, out, times, o.profile.source_cols(), &|tr, pt, targets, target_o, apf| super::auth::verify(&o.profile, &o.seed, tr, pt, targets, target_o, apf))
+}
+fn verify_final_with(pp: &Prepared, o: &Opts, b: u64, model: RegisteredModel<'_>, q: &[QueueEntry], out: &wire::FinalProof, times: &mut Times,
+    w_cols: usize, authenticate: &dyn Fn(&MTranscript, &Point, &[Tuple], &AuxTuple, &AuthProof) -> bool,
+) -> bool {
     if !registration_matches(pp, o, model) { return false; }
     let c_model = model.commitments;
     let Some(apf) = out.auth.as_ref() else { return false; };
@@ -750,7 +787,7 @@ pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, model: RegisteredModel<'_>,
         || std::env::var_os("LINK_ROWS").is_some() || q.is_empty() || !o.defer || pp.carry.len() != 1 || c_model.len() != pp.model.len()
         || n > o.profile.n_max || !c_model.iter().all(|c| wire::commitment_ok(&o.profile, c))
         || !wire::link_shape_ok(&o.profile, n, &out.link)
-        || !wire::auth_shape_ok(&o.profile, apf)
+        || !wire::auth_shape_ok_cols(&o.profile, apf, w_cols)
         || !q.iter().all(|e| wire::commitment_ok(&o.profile, e.c_carry)
             && wire::canonical_k(&e.digest)
             && e.deferred.iter().flat_map(|r| &r.terms).all(|t|
@@ -765,7 +802,7 @@ pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, model: RegisteredModel<'_>,
     let (pt, targets, target_o) = match lv { Some(x) => x, None => { eprintln!("finalization: link rejected"); return false; } };
     if let Some(apf) = &out.auth {
         let t = Instant::now();
-        let ok = auth_gpu::verify(&o.profile, keys, &tv, &pt, &targets, &target_o, apf);
+        let ok = authenticate(&tv, &pt, &targets, &target_o, apf);
         lap(times, "verify auth", t);
         return ok;
     }
@@ -871,4 +908,149 @@ mod registry_tests {
         assert!(!registered_model_matches(1, true, None, &request));
         assert!(!registered_model_matches(2, true, Some(&a), &request));
     }
+}
+
+// CPU reference orchestration. Full authentication; no diagnostic bypass.
+fn fill_suffixes_cpu(o: &Opts, raw: &mut [Vec<i8>], owner: &dyn Fn(usize) -> u64) {
+    for (e, r) in raw.iter_mut().enumerate() { link::fill_source_suffix(&o.profile, &o.coins, owner(e), r); }
+}
+fn commit_cpu(o: &Opts, raw: &[Vec<i8>]) -> Vec<Vec<Vec<u64>>> {
+    raw.iter().map(|r| {
+        // Same zero-skipping commitment optimization as commit::commit, without
+        // materializing a full-domain i64 witness. This is NOT noise support.
+        let indices: Vec<usize> = (0..o.profile.source_cols()).filter(|&c|
+            c >= o.profile.source_payload_cols || r[c * super::ring::N..(c+1)*super::ring::N].iter().any(|&v|v!=0)).collect();
+        super::auth_compact::lin_indexed(&o.profile,&o.seed,super::keys::KeyKind::Source,o.profile.source_payload_cols,&indices,&|c|super::auth_compact::raw_column(r,c))
+    }).collect()
+}
+/// Real non-deferred host proof. The eager reference backend is intended for
+/// algebra tests, not selected-profile memory/performance claims.
+pub fn prove_request_cpu(pp: &mut Prepared, o: &Opts, j: u64, model: &ModelReg, input: &InputReg) -> wire::RequestProof {
+    assert!(!o.defer, "use prove_request_cpu_deferred to retain carry witness");
+    prove_request_cpu_inner(pp, o, j, model, input, false, None).proof
+}
+/// Prover output for deferred requests. Only the proof is public; carry_raw is
+/// retained privately until finalization. Verifier queue fields are NOT supplied
+/// by this object; derive them by verifying the serialized request.
+pub struct CpuDeferredRequest { pub proof: wire::RequestProof, pub carry_raw: Option<Vec<i8>> }
+pub fn prove_request_cpu_deferred(pp: &mut Prepared, o: &Opts, j: u64, model: &ModelReg, input: &InputReg) -> CpuDeferredRequest {
+    assert!(o.defer, "deferred CPU entrypoint requires deferral");
+    assert_eq!(pp.carry.len(), 1, "exactly one carry bank per request");
+    prove_request_cpu_inner(pp, o, j, model, input, false, None)
+}
+fn prove_request_cpu_inner(pp: &mut Prepared, o: &Opts, j: u64, model: &ModelReg, input: &InputReg, compact: bool, resource_gate: Option<&dyn Fn(&Profile,&Statement,usize)>) -> CpuDeferredRequest {
+    assert!(o.auth, "CPU full proof requires authentication");
+    assert!(std::env::var_os("LINK_ROWS").is_none(), "partial link rows are not a full proof");
+    assert!(registration_matches(pp, o, model.public()), "registered model mismatch");
+    assert!(input_registration_matches(pp, o, input.public()), "registered input mismatch");
+    assert_eq!(model.raw.len(), pp.model.len()); assert_eq!(input.raw.len(), pp.input.len());
+    let opening = req_opening(j);
+    let salt = o.coins.begin_opening(opening).expect("opening already consumed");
+    pp.pd.bank = piop::sample_bank(&o.coins, opening, 1usize << o.cfg.slots_log);
+    let mut raw = piop::fill_sources_in(&pp.g, &pp.pd, &pp.lay, o.profile.ell(), pp.req.clone());
+    fill_suffixes_cpu(o, &mut raw, &|e| req_owner(j, e));
+    raw = input.raw.iter().cloned().chain(raw).collect();
+    if !o.defer { raw = model.raw.iter().cloned().chain(raw).collect(); }
+    let mut c_src = commit_cpu(o, &raw);
+    let model_prefix = if o.defer { 0 } else { pp.model.len() };
+    let input_end = model_prefix + pp.input.len();
+    if !o.defer { assert_eq!(&c_src[..model_prefix], &model.c); }
+    assert_eq!(&c_src[model_prefix..input_end], &input.c);
+    let tr = request_transcript(o, pp, j, &salt, &model.c, &input.c, &c_src[input_end..]).expect("invalid statement");
+    let mut ctx = Ctx::prover(tr, &pp.pd.bank, &pp.lay, o.cfg.slots_log);
+    if o.defer { ctx.defer = Some(Defer::new(o.carry_log)); }
+    Walk::new(&pp.g, Some(&pp.pd)).run(&mut ctx);
+    let mut tr = ctx.tr.clone();
+    let carry_raw = if let Some(d) = ctx.defer.as_ref() {
+        let mut cr = piop::fill_carry(&pp.lay, &d.carries, o.profile.ell(), pp.carry.start);
+        link::fill_source_suffix(&o.profile, &o.coins, req_owner(j, pp.req.len()), &mut cr);
+        let cc = commit_cpu(o, std::slice::from_ref(&cr)).pop().unwrap();
+        for row in &cc { tr.absorb(Item::SourceCommitment, row); }
+        c_src.push(cc);raw.push(cr.clone());Some(cr)
+    } else { None };
+    let span = if o.defer { pp.input.start..pp.carry.end } else { pp.model.start..pp.req.end };
+    let st = Statement { n: raw.len(), bits: pp.lay.bit_blocks_in(&span), rows: remap(&ctx.rows, &|s| s - span.start) };
+    if compact { super::auth_compact::check_raw_support(&o.profile,&request_support(pp,o).expect("public support"),&raw); }
+    if let Some(gate)=resource_gate {gate(&o.profile,&st,o.b0);}
+    let mut svc = link_fast::CpuServices;
+    let mut link_verifier_prefix = tr.clone();
+    let mut fast = link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut tr, &st, &raw, o.b0, &link_fast::cpu_backend, &mut svc, Some(&c_src), false);
+    assert!(link::verify(&o.profile, &mut link_verifier_prefix, &st, &c_src, &fast.proof).is_some(), "CPU link self-check before expensive authentication");
+    eprintln!("CPU_FULLPROOF graph+link complete sources={} rows={}; starting genuine Gaussian auth", raw.len(), ctx.rows.len());
+    let apf = if compact {
+        let support = request_support(pp,o).expect("invalid public support layout");
+        let links: Vec<_> = fast.sources.iter_mut().map(|s|std::mem::take(&mut s.r)).collect();
+        super::auth_compact::prove(&o.profile,&o.seed,&o.coins,opening,&tr,&fast.point,&support,&raw,&links,&fast.s_o).expect("compact CPU authentication")
+    } else {
+        for (s,r) in fast.sources.iter_mut().zip(&raw) {s.w=link::raw_to_cols(r);}
+        super::auth::prove(&o.profile, &o.seed, &o.coins, opening, &tr, &fast.point, &fast.sources, &fast.s_o).expect("CPU authentication")
+    };
+    eprintln!("CPU_FULLPROOF auth accepted attempt={}", apf.attempt);
+    CpuDeferredRequest { proof: wire::RequestProof { salt, piop: ctx.proof, c_src, link: fast.proof, auth: Some(apf) }, carry_raw }
+}
+
+/// Exact eager CPU finalization. Model registration is borrowed, never consumed
+/// or modified, including failed/duplicate-opening paths.
+pub fn finalize_cpu(pp: &Prepared, o: &Opts, b: u64, model: &ModelReg, q: &[QueueEntry], carries: &[Vec<i8>]) -> wire::FinalProof {
+    finalize_cpu_inner(pp,o,b,model,q,carries,false)
+}
+fn finalize_cpu_inner(pp: &Prepared, o: &Opts, b: u64, model: &ModelReg, q: &[QueueEntry], carries: &[Vec<i8>], compact:bool) -> wire::FinalProof {
+    assert!(o.defer && o.auth && !q.is_empty(), "full deferred finalization requires authentication and a queue");
+    assert!(std::env::var_os("LINK_ROWS").is_none(), "partial link rows are not a full proof");
+    assert!(registration_matches(pp, o, model.public()), "registered model changed");
+    assert_eq!(q.len(), carries.len(), "one private carry bank per verified request");
+    let opening = fin_opening(b);
+    let salt = o.coins.begin_opening(opening).expect("finalization opening already consumed");
+    let raw: Vec<Vec<i8>> = model.raw.iter().cloned().chain(carries.iter().cloned()).collect();
+    let mut c_src = model.c.clone();
+    let actual_carry = commit_cpu(o, carries);
+    for (entry, actual) in q.iter().zip(actual_carry) {
+        assert_eq!(entry.c_carry, &actual, "private carry does not open the verified request commitment");
+        c_src.push(actual);
+    }
+    let st = final_statement(pp, q);
+    let mut tr = final_transcript(o, pp, b, &salt, &model.c, q).expect("invalid finalization statement");
+    let mut svc = link_fast::CpuServices;
+    let mut link_verifier_prefix = tr.clone();
+    let mut fast = link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut tr, &st, &raw, o.b0, &link_fast::cpu_backend, &mut svc, Some(&c_src), false);
+    assert!(link::verify(&o.profile, &mut link_verifier_prefix, &st, &c_src, &fast.proof).is_some(), "CPU link self-check before expensive authentication");
+    eprintln!("CPU_DEFERRED final link complete sources={} rows={}; starting genuine Gaussian auth", raw.len(), st.rows.len());
+    let auth = if compact {
+        let support=final_support(pp,o).expect("invalid final public support");
+        let links:Vec<_>=fast.sources.iter_mut().map(|s|std::mem::take(&mut s.r)).collect();
+        super::auth_compact::prove(&o.profile,&o.seed,&o.coins,opening,&tr,&fast.point,&support,&raw,&links,&fast.s_o).expect("compact CPU final authentication")
+    }else{
+        for(s,r)in fast.sources.iter_mut().zip(&raw){s.w=link::raw_to_cols(r);}
+        super::auth::prove(&o.profile, &o.seed, &o.coins, opening, &tr, &fast.point, &fast.sources, &fast.s_o).expect("CPU final authentication")
+    };
+    eprintln!("CPU_DEFERRED final auth accepted attempt={}", auth.attempt);
+    wire::FinalProof { salt, link: fast.proof, auth: Some(auth) }
+}
+
+/// Public registry-derived response support for this request, before any coins.
+pub fn request_support(pp:&Prepared,o:&Opts)->Option<super::auth_compact::Support>{
+    let span=if o.defer {pp.input.start..pp.carry.end}else{pp.model.start..pp.req.end};
+    super::public_support::derive(&o.profile,&pp.lay,&[span])
+}
+pub fn prove_request_cpu_compact(pp:&mut Prepared,o:&Opts,j:u64,model:&ModelReg,input:&InputReg)->CpuDeferredRequest{
+    request_support(pp,o).expect("invalid registered public layout");
+    prove_request_cpu_inner(pp,o,j,model,input,true,None)
+}
+pub fn verify_request_cpu_compact(pp:&Prepared,o:&Opts,j:u64,model:Option<RegisteredModel<'_>>,input:RegisteredInput<'_>,out:&wire::RequestProof,times:&mut Times)->Option<(Vec<Row>,K8,Vec<u8>)>{
+    let support=request_support(pp,o)?;
+    verify_request_with(pp,o,j,model,input,out,times,support.len(),&|tr,pt,targets,target_o,apf|super::auth_compact::verify(&o.profile,&o.seed,tr,pt,&support,targets,target_o,apf))
+}
+
+pub fn final_support(pp:&Prepared,o:&Opts)->Option<super::auth_compact::Support>{super::public_support::derive(&o.profile,&pp.lay,&[pp.model.clone(),pp.carry.clone()])}
+pub fn finalize_cpu_compact(pp:&Prepared,o:&Opts,b:u64,model:&ModelReg,q:&[QueueEntry],carries:&[Vec<i8>])->wire::FinalProof{final_support(pp,o).expect("invalid final layout");finalize_cpu_inner(pp,o,b,model,q,carries,true)}
+pub fn verify_final_cpu_compact(pp:&Prepared,o:&Opts,b:u64,model:RegisteredModel<'_>,q:&[QueueEntry],out:&wire::FinalProof,times:&mut Times)->bool{
+    let Some(support)=final_support(pp,o)else{return false};
+    verify_final_with(pp,o,b,model,q,out,times,support.len(),&|tr,pt,targets,target_o,apf|super::auth_compact::verify(&o.profile,&o.seed,tr,pt,&support,targets,target_o,apf))
+}
+
+/// Local execution-budget gate, run on public PIOP/link structure before link
+/// allocations. It cannot alter the statement, witness, transcript or verifier.
+pub fn prove_request_cpu_compact_guarded(pp:&mut Prepared,o:&Opts,j:u64,model:&ModelReg,input:&InputReg,gate:&dyn Fn(&Profile,&Statement,usize))->CpuDeferredRequest{
+    request_support(pp,o).expect("invalid registered public layout");
+    prove_request_cpu_inner(pp,o,j,model,input,true,Some(gate))
 }

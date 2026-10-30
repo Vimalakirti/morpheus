@@ -32,3 +32,9 @@ pub mod wire;
 pub mod ar_statement;
 
 pub mod statement;
+
+pub mod protocol;
+
+pub mod auth_compact;
+
+pub mod public_support;

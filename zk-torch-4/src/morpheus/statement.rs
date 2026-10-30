@@ -1,4 +1,4 @@
-//! Canonical PUBLIC statement codec, version 2. This binds a verifier-trusted
+//! Canonical PUBLIC statement codec, version 3. This binds a verifier-trusted
 //! DAG; it is NOT a proof that a compiler implements the intended model.
 //! Private tensor payloads, advice, and Coins never enter this module. Fixed
 //! private model values must be identified separately by pinned commitments.
@@ -65,6 +65,11 @@ fn operator(k: &BasicBlockType) -> Result<Vec<u64>, String> {
         InstanceNorm3D(_) => return Err("unconstrained legacy InstanceNorm advice is unsupported".into()),
         MaskedMaxSelector(_) => { w.u(44); w.bytes(b"selected-canonical-max-v1")?; },
         NormalizedRatio(b) => { w.u(45); w.us(b.max_terms)?; w.bytes(b"nearest-positive-tie-normalized-ratio-v1")?; },
+        MaskedMaxPoolHelper(b) => { let b=&b.pool; w.u(47); w.bytes(b"public-supported-window-max-v1")?;
+            w.us(b.channels)?; w.us(b.input_h)?; w.us(b.input_w)?; w.us(b.kernel_h)?; w.us(b.kernel_w)?; w.us(b.stride_h)?; w.us(b.stride_w)?; },
+        MaxPoolSelector(b) => { let b=&b.pool; w.u(46); w.bytes(b"exact-window-max-private-onehot-v1")?;
+            w.us(b.channels)?; w.us(b.input_h)?; w.us(b.input_w)?; w.us(b.kernel_h)?; w.us(b.kernel_w)?; w.us(b.stride_h)?; w.us(b.stride_w)?;
+            w.u(crate::dag::maxpool::VALUE_BOUND as u64); },
         MaxPoolHelper(b) => { w.u(21); w.us(b.channels)?; w.us(b.input_h)?; w.us(b.input_w)?; w.us(b.pool_h)?; w.us(b.pool_w)?; },
         NonNegative(b) => { w.u(22); w.us(b.table_size_log)?; },
         Permute(b) => { w.u(23); w.pairs(&b.ranges)?; },
@@ -91,7 +96,7 @@ fn operator(k: &BasicBlockType) -> Result<Vec<u64>, String> {
 
 /// Public protocol setup identity (no private randomness).
 fn setup(w: &mut Words, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_log: usize) -> Result<(), String> {
-    w.bytes(b"morpheus-public-statement")?; w.u(2);
+    w.bytes(b"morpheus-public-statement")?; w.u(3);
     w.bytes(p.name.as_bytes())?;
     w.usizes(&[p.rank,p.tau,p.hiding,p.source_payload_cols,p.aux_coeffs,p.deg_old,p.deg_final])?;
     w.u(p.sigma); w.u(p.b_z); for v in p.raw_noise { w.u(v); }
@@ -101,7 +106,14 @@ fn setup(w: &mut Words, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, car
     w.u(1); w.u(1); w.u(8); w.u(super::field8::W);
     w.us(super::ring::NTT_PRIMES.len())?;
     for (p,r) in super::ring::NTT_PRIMES { w.u(p); w.u(r); }
-    w.bytes(b"chacha8-public-keys-v1")?;
+    w.bytes(b"shake256-public-keys-v2")?;
+    w.bytes(b"MORPHEUS/KEY/SHAKE256/v2\0")?;
+    w.bytes(b"MORPHEUS/FS/SHAKE256/v2\0")?;
+    w.u(super::wire::PROTOCOL_VERSION);
+    w.u(super::transcript::RAW_SLACK as u64);
+    w.bytes(b"typed-msb-prefix-modulo-v2")?;
+    w.bytes(b"MORPHEUS/COIN/v1\0")?;
+    w.bytes(b"private-tape-computational-replacement-not-statistical")?;
     for s in seed.0 { w.u(u64::from(s)); }
     w.us(b0)?; w.u(u64::from(defer)); w.us(carry_log)?;
     Ok(())

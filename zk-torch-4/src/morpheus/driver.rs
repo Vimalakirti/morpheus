@@ -105,8 +105,8 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
             let vs = show(&format!("request {j} verify ({})", r.is_some()), &vt);
             assert!(r.is_some(), "request {j} rejected");
             verify_secs.push(vs);
-            let (rows, dg) = r.unwrap();
-            vqueue.push((rows, dg, if o.defer { pf.c_src.last().cloned() } else { None }));
+            let (rows, dg, literal_prefix) = r.unwrap();
+            vqueue.push((rows, dg, if o.defer { pf.c_src.last().cloned() } else { None }, literal_prefix));
         }
         outs.push(out);
     }
@@ -122,7 +122,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
             let range = start..start + jb;
             start += jb;
             let carries: Vec<Vec<i8>> = outs[range.clone()].iter_mut().map(|o| o.carry_raw.take().unwrap()).collect();
-            let q: Vec<QueueEntry> = range.clone().map(|j| QueueEntry { j: j as u64, deferred: &outs[j].deferred, c_carry: outs[j].c_carry.as_ref().unwrap(), digest: outs[j].digest }).collect();
+            let q: Vec<QueueEntry> = range.clone().map(|j| QueueEntry { j: j as u64, deferred: &outs[j].deferred, c_carry: outs[j].c_carry.as_ref().unwrap(), digest: outs[j].digest, literal_prefix: &outs[j].literal_prefix }).collect();
             let fo = request::finalize(&pp, &o, b as u64, m, &q, carries, &mut pc, &mut reps);
             let fs = show(&format!("finalize batch {b} (J = {jb}, {} deferred rows, {} proof bytes)", fo.rows, fo.bytes.len()), &fo.times);
             let mut fv = 0.0;
@@ -132,7 +132,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
                 println!("MORPHEUS_AUTH batch={b} present={}", fpf.auth.is_some());
                 assert!(fpf.auth.is_some(), "benchmark finalization lacks authentication");
                 let dec = t.elapsed().as_secs_f64();
-                let vq: Vec<QueueEntry> = range.clone().map(|j| { let (rows, dg, cc) = &vqueue[j]; QueueEntry { j: j as u64, deferred: rows, c_carry: cc.as_ref().unwrap(), digest: *dg } }).collect();
+                let vq: Vec<QueueEntry> = range.clone().map(|j| { let (rows, dg, cc, literal_prefix) = &vqueue[j]; QueueEntry { j: j as u64, deferred: rows, c_carry: cc.as_ref().unwrap(), digest: *dg, literal_prefix } }).collect();
                 let mut vt = Times::new();
                 vt.insert("decode", dec);
                 let ok = request::verify_final(&pp, &o, b as u64, m.public(), &vq, &fpf, &pc.keys, &mut vt);

@@ -66,16 +66,16 @@ impl DagBuilder {
         let shape=w.shape.clone(); let sf=w.sf;
         assert!(start.checked_add(shape[1]).map(|end|end<=vocab).unwrap_or(false), "argmax shard out of bounds");
         let vp=shape[1].next_power_of_two();
-        let b=self.committed_input(Witness::new(vec![1],vec![AlmostGoldilocksField(bound)],DataType::Float,sf,Role::Input));
+        let b=self.public_literal(Witness::new(vec![1],vec![AlmostGoldilocksField(bound)],DataType::Float,sf,Role::Input));
         let lower=self.add(logits,b)[0];
         let upper=self.sub(b,logits)[0];
         self.add_nonneg_node_bits(lower,bound_bits);
         self.add_nonneg_node_bits(upper,bound_bits);
-        let multiplier=self.committed_input(Witness::new(vec![1],vec![AlmostGoldilocksField(vocab as u64)],DataType::Float,0,Role::Input));
+        let multiplier=self.public_literal(Witness::new(vec![1],vec![AlmostGoldilocksField(vocab as u64)],DataType::Float,0,Role::Input));
         let scaled=self.einsum("sv,z->sv".into(),vec![logits,multiplier],false)[0];
         let mut indices=vec![AlmostGoldilocksField(0);vp];
         for j in 0..shape[1] { indices[j]=AlmostGoldilocksField((start+j) as u64); }
-        let index=self.committed_input(Witness::new(vec![1,shape[1]],indices,DataType::Float,sf,Role::Input));
+        let index=self.public_literal(Witness::new(vec![1,shape[1]],indices,DataType::Float,sf,Role::Input));
         self.sub(scaled,index)[0]
     }
     /// Build a one-hot selector matrix. `S[i, indices[i]] = 1`, all others

@@ -26,14 +26,24 @@
 //! every message, the verifier replays them; both derive identical
 //! transcripts and rows.
 
+// Compile-time backend selection. The host expression is the original host
+// algorithm; no device symbols or placeholder results are substituted.
+macro_rules! backend_tables {
+    ($condition:expr, $device:expr, $host:expr) => {{
+        #[cfg(feature = "cuda")]
+        { if $condition { $device } else { $host } }
+        #[cfg(not(feature = "cuda"))]
+        { $host }
+    }};
+}
 pub mod cv;
 pub mod gpu;
 pub mod layout;
 pub mod tensor;
 #[cfg(test)]
 mod exp_tests;
-#[cfg(test)]
-mod cv_batch_tests;
+#[cfg(any(test, feature = "cpu-replay"))]
+pub mod cv_batch_tests;
 
 use crate::basicblock::BasicBlockType;
 use crate::dag::{Dag, PolyType, Role, Witness};
@@ -42,6 +52,7 @@ use crate::morpheus::link::{interpolate, Row, Term};
 use crate::morpheus::transcript::{Item, MTranscript, Stage};
 use crate::util::arith::{f_to_int, log2_ceil};
 use almost_goldilocks_cuda::field::ALMOST_GOLDILOCKS_PRIME as Q;
+#[cfg(feature = "cuda")]
 use almost_goldilocks_cuda::DeviceBuffer;
 use layout::{value_pw, Layout, TKey};
 use rayon::prelude::*;
@@ -108,7 +119,7 @@ pub struct Graph<'a> {
 }
 
 fn advice_kind(k: &BasicBlockType) -> bool {
-    matches!(k, BasicBlockType::MaskedMaxSelector(_) | BasicBlockType::NormalizedRatio(_) | BasicBlockType::DivConst(_) | BasicBlockType::SoftmaxConst(_) | BasicBlockType::SigmoidConst(_) | BasicBlockType::RMSReciprocal(_) | BasicBlockType::RMSBucket(_)
+    matches!(k, BasicBlockType::MaskedMaxPoolHelper(_) | BasicBlockType::MaxPoolSelector(_) | BasicBlockType::MaskedMaxSelector(_) | BasicBlockType::NormalizedRatio(_) | BasicBlockType::DivConst(_) | BasicBlockType::SoftmaxConst(_) | BasicBlockType::SigmoidConst(_) | BasicBlockType::RMSReciprocal(_) | BasicBlockType::RMSBucket(_)
         // Vision advice, constrained by range checks / product zero checks
         // wired by the builder (the same relation as the previous prover).
         | BasicBlockType::ReLUHelper(_) | BasicBlockType::MaxPoolHelper(_) | BasicBlockType::GeneralMaxPoolHelper(_)
@@ -139,6 +150,8 @@ pub fn witness_vals(w: &Witness) -> Arc<Vec<u64>> {
 
 impl<'a> Graph<'a> {
     pub fn new(dag: &'a Dag, wit: &[Vec<Witness>], cfg: Config) -> Self {
+        #[cfg(not(feature = "cuda"))]
+        let _ = gpu::enabled();
         assert!(dag.nodes.iter().all(|n|!matches!(n.kind,BasicBlockType::SoftmaxConst(_) | BasicBlockType::SigmoidConst(_))),"legacy log normalization advice is unsupported");
         assert!(!dag.nodes.iter().any(|n| matches!(n.kind,BasicBlockType::InstanceNorm3D(_))),
             "unconstrained legacy InstanceNorm advice cannot be registered");
@@ -289,6 +302,7 @@ pub struct ProverData {
     pub vals: Vec<Option<Arc<Vec<u64>>>>,
     pub sel: HashMap<usize, Vec<u64>>,
     pub bank: Vec<K8>,
+    #[cfg(feature = "cuda")]
     pub cache: gpu::EdgeCache,
 }
 
@@ -328,11 +342,13 @@ impl ProverData {
             }).collect();
             (node, t)
         }).collect();
-        ProverData { vals, sel, bank, cache: gpu::EdgeCache::default() }
+        ProverData { vals, sel, bank, #[cfg(feature = "cuda")] cache: gpu::EdgeCache::default() }
     }
     /// Upload every dense edge's values ahead of the PIOP (they are fixed
     /// before any challenge); the cache serves them later.
     pub fn prefetch(&self) {
+        #[cfg(feature = "cuda")]
+        {
         // Reverse topological use order is roughly reverse edge order; stop at
         // half the budget so on-demand uploads do not evict the prefetch.
         for e in (0..self.vals.len()).rev() {
@@ -344,8 +360,21 @@ impl ProverData {
             }
         }
     }
+    }
+    pub fn clear_cache(&self) {
+        #[cfg(feature = "cuda")]
+        self.cache.clear();
+    }
     fn v(&self, e: usize) -> &Arc<Vec<u64>> { self.vals[e].as_ref().unwrap_or_else(|| panic!("no dense values for edge {e}")) }
+    #[cfg(feature = "cuda")]
     fn dev(&self, e: usize) -> Arc<almost_goldilocks_cuda::DeviceBuffer<u64>> { self.cache.get(e, self.v(e)) }
+}
+
+/// Public source type rule, independent of the request values.
+pub(crate) fn request_source_is_bits(g:&Graph,e:usize)->bool {
+    g.bool_typed[e] || g.dag.producers[e].map(|n|matches!(g.dag.nodes[n].kind,
+        BasicBlockType::RMSBucket(_) |
+        BasicBlockType::MaxPoolSelector(_) | BasicBlockType::MaskedMaxSelector(_))).unwrap_or(false)
 }
 
 /// Layout specs: (key, index vars, log2 planes, bit-typed).
@@ -368,8 +397,7 @@ pub fn tensor_specs(g: &Graph, pd: &ProverData) -> Vec<(TKey, usize, usize, bool
             // type is declared by the producer (sign and selection helpers) or
             // by the input's declared Bool type; every other request tensor
             // gets 2^req_planes_log planes. The honest prover checks the fit.
-            let bits = g.bool_typed[e] || g.dag.producers[e].map(|n| matches!(g.dag.nodes[n].kind,
-                BasicBlockType::ReLUHelper(_) | BasicBlockType::RMSBucket(_) | BasicBlockType::MaskedMaxSelector(_) | BasicBlockType::PillarMaxPool(_) | BasicBlockType::ScatterToBEV(_))).unwrap_or(false);
+            let bits = request_source_is_bits(g,e);
             if bits {
                 assert!(v.par_iter().all(|&x| x <= 1), "edge {e}: declared bit tensor holds a non-bit value");
                 (0, true)
@@ -497,7 +525,7 @@ impl Defer {
 struct ScOut { x: Vec<K8>, rho: K8, v: Vec<K8>, pads: Vec<u32> }
 
 /// Prover tables of a masked sumcheck: on the host or on the device.
-pub enum Tables { Host(Vec<Vec<K8>>), Dev(Vec<gpu::KTab>) }
+pub enum Tables { Host(Vec<Vec<K8>>), #[cfg(feature = "cuda")] Dev(Vec<gpu::KTab>) }
 
 impl<'a> Ctx<'a> {
     pub fn prover(tr: MTranscript, bank: &'a [K8], lay: &'a Layout, slots_log: usize) -> Self {
@@ -637,10 +665,10 @@ impl<'a> Ctx<'a> {
             inv2p = inv2p.mul(&half);
             let d = degs[i];
             let tr0 = std::time::Instant::now();
-            let on_dev = matches!(tables.as_ref(), Some(Tables::Dev(_)));
+            let on_dev = backend_tables!(true, matches!(tables.as_ref(), Some(Tables::Dev(_))), false);
             let g = if self.prover {
                 let s: Vec<K8> = match tables.as_ref().unwrap() {
-                Tables::Dev(t) => gpu::sc_round(t, d),
+                #[cfg(feature = "cuda")] Tables::Dev(t) => gpu::sc_round(t, d),
                 Tables::Host(tabs) => {
                 let len = tabs[0].len();
                 (0..len / 2).into_par_iter().with_min_len(512).fold(|| vec![K8::ZERO; d + 1], |mut acc, k| {
@@ -675,7 +703,7 @@ impl<'a> Ctx<'a> {
                         let h = t.len() / 2;
                         *t = (0..h).into_par_iter().with_min_len(1024).map(|k| t[2 * k].add(&r.mul(&t[2 * k + 1].sub(&t[2 * k])))).collect();
                     },
-                    Tables::Dev(ts) => for t in ts.iter_mut() { *t = gpu::sc_fold(t, &r); },
+                    #[cfg(feature = "cuda")] Tables::Dev(ts) => for t in ts.iter_mut() { *t = gpu::sc_fold(t, &r); },
                 }
             }
             self.tick(if on_dev { ".r_dev_fold" } else { ".r_host_fold" }, tr2);
@@ -686,7 +714,7 @@ impl<'a> Ctx<'a> {
         inv2p = inv2p.mul(&half); // 2^-N
         let d = d_fin;
         let fin_vals: Vec<K8> = if self.prover {
-            match tables.as_ref().unwrap() { Tables::Host(ts) => ts.iter().map(|t| t[0]).collect(), Tables::Dev(ts) => ts.iter().map(|t| t.first()).collect() }
+            match tables.as_ref().unwrap() { Tables::Host(ts) => ts.iter().map(|t| t[0]).collect(), #[cfg(feature = "cuda")] Tables::Dev(ts) => ts.iter().map(|t| t.first()).collect() }
         } else { vec![] };
         let g = if self.prover {
             let pubv = if has_pub { fin_vals[0] } else { K8::ONE };
@@ -746,7 +774,7 @@ impl<'g, 'a> Walk<'g, 'a> {
 
     fn mle_e(&self, e: usize, r: &[K8]) -> K8 {
         let pd = self.pd.unwrap();
-        if gpu::enabled() && (1usize << r.len()) >= gpu::threshold() { gpu::mle(&pd.dev(e), r) } else { mle(pd.v(e), r) }
+        backend_tables!(gpu::enabled() && (1usize << r.len()) >= gpu::threshold(), { gpu::mle(&pd.dev(e), r) }, { mle(pd.v(e), r) })
     }
 
     /// A claim on edge e: a row if e is committed, else pending.
@@ -842,12 +870,12 @@ impl<'g, 'a> Walk<'g, 'a> {
             bp = bp.mul(&beta);
         }
         let tables = if ctx.prover {
-            if gpu::enabled() && (1usize << n) >= gpu::threshold() {
+            backend_tables!(gpu::enabled() && (1usize << n) >= gpu::threshold(), {
                 let mut pubt = gpu::KTab::zeroed(1 << n);
                 for (c, w) in cs.iter().zip(&weights) { gpu::axpy(&mut pubt, &gpu::eq(&c.point), w); }
                 let t = gpu::lift(&self.pd.unwrap().dev(e), 1 << n);
                 Some(Tables::Dev(vec![pubt, t]))
-            } else {
+            }, {
                 let mut pubt = vec![K8::ZERO; 1 << n];
                 for (c, w) in cs.iter().zip(&weights) {
                     let et = eq_table(&c.point);
@@ -855,7 +883,7 @@ impl<'g, 'a> Walk<'g, 'a> {
                 }
                 let t: Vec<K8> = self.pd.unwrap().v(e).par_iter().map(|&v| K8::from_base(v)).collect();
                 Some(Tables::Host(vec![pubt, t]))
-            }
+            })
         } else { None };
         let pts: Vec<Vec<K8>> = cs.iter().map(|c| c.point.clone()).collect();
         let out = ctx.masked_sc(n, 1, true, z0, &eta0, tables, &|x: &[K8]| pts.iter().zip(&weights).fold(K8::ZERO, |a, (p, w)| a.add(&w.mul(&eq_pt(p, x)))));
@@ -990,7 +1018,7 @@ impl<'g, 'a> Walk<'g, 'a> {
                         let t = &self.pd.unwrap().sel[&en];
                         let w0 = chunks[0];
                         let f0: Vec<K8> = (0..1usize << w0).map(|lo| kb(f(lo))).collect();
-                        if use_gpu {
+                        backend_tables!(use_gpu, {
                             // Selector indices once; L and the H_c built on the device.
                             let ds = DeviceBuffer::from_slice(t).expect("selector upload");
                             let mut d = vec![gpu::eq(&c.point), gpu::sel_lookup(&ds, 0, w0, &f0)];
@@ -1001,7 +1029,7 @@ impl<'g, 'a> Walk<'g, 'a> {
                                 shift += w;
                             }
                             Some(Tables::Dev(d))
-                        } else {
+                        }, {
                             let mut v = vec![eq_table(&c.point)];
                             v.push(t.par_iter().map(|&k| f0[(k & ((1 << w0) - 1)) as usize]).collect());
                             let mut shift = w0;
@@ -1010,7 +1038,7 @@ impl<'g, 'a> Walk<'g, 'a> {
                                 shift += w;
                             }
                             Some(Tables::Host(v))
-                        }
+                        })
                     } else { None };
                     let r = c.point.clone();
                     let out = ctx.masked_sc(n, np, true, c.z, &c.pad, tables, &|x: &[K8]| eq_pt(&r, x));
@@ -1068,7 +1096,7 @@ impl<'g, 'a> Walk<'g, 'a> {
         let has_pub = n_multi > 0;
         let use_gpu = gpu::enabled() && (1usize << n_sc) >= gpu::threshold();
         let t_tab = std::time::Instant::now();
-        let tables = if ctx.prover && use_gpu {
+        let tables = backend_tables!(ctx.prover && use_gpu, {
             let mut t = Vec::new();
             if has_pub { t.push(gpu::gather(&gpu::eq(&r_multi), &(0..n_multi).collect::<Vec<_>>(), n_sc)); }
             for (k, &inp) in inputs.iter().enumerate() {
@@ -1079,7 +1107,7 @@ impl<'g, 'a> Walk<'g, 'a> {
                 t.push(gpu::gather(&pe, &rest, n_sc));
             }
             Some(Tables::Dev(t))
-        } else if ctx.prover {
+        }, { if ctx.prover {
             let mut t = Vec::new();
             if has_pub {
                 let e = eq_table(&r_multi);
@@ -1098,7 +1126,7 @@ impl<'g, 'a> Walk<'g, 'a> {
                 }).collect::<Vec<_>>());
             }
             Some(Tables::Host(t))
-        } else { None };
+        } else { None } });
         ctx.tick(".es_tables", t_tab);
         let out = ctx.masked_sc(n_sc, inputs.len(), has_pub, c.z, &c.pad, tables, &|x: &[K8]| eq_pt(&r_multi, &x[..n_multi]));
         let rr = out.rho.mul(&out.rho.sub(&K8::ONE));
@@ -1125,7 +1153,10 @@ fn broadcast_point(in_shape: &[usize], out_shape: &[usize], point: &[K8]) -> Vec
 /// Honest graph-mask bank: uniform K slots from the addressed coins.
 pub fn sample_bank(coins: &crate::morpheus::coins::Coins, opening: u64, slots: usize) -> Vec<K8> {
     use crate::morpheus::coins::Purpose;
+    #[cfg(feature = "cuda")]
     let v = crate::morpheus::pcs_gpu::uniform_q_gpu(coins, Purpose::GraphMask, opening, 0, slots * 8);
+    #[cfg(not(feature = "cuda"))]
+    let v: Vec<u64> = (0..slots.checked_mul(8).expect("mask bank overflow")).map(|i| crate::morpheus::link::uniform_q_coin(coins, Purpose::GraphMask, opening, u32::try_from(i).expect("mask address overflow"))).collect();
     v.chunks(8).map(|c| K8(c.try_into().unwrap())).collect()
 }
 
@@ -1151,3 +1182,9 @@ mod wg_tests {
 
 #[cfg(test)]
 mod cnn_layout_tests;
+
+#[cfg(any(test, feature = "cpu-replay"))]
+pub mod maxpool_tests;
+
+#[cfg(any(test, feature = "cpu-replay"))]
+pub mod grid_routing_tests;

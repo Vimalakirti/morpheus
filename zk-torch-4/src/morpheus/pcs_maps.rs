@@ -68,7 +68,7 @@ pub fn act_c0_ring_q(beta: &[i8; 64], v: &[u64]) -> Vec<u64> {
     (0..N).map(|i| {
         let p = (out[i] % Q as u128) as u64;
         let n = (neg[i] % Q as u128) as u64;
-        if p >= n { p - n } else { p + Q - n }
+        if p >= n { p - n } else { Q - (n - p) }
     }).collect()
 }
 
@@ -101,7 +101,7 @@ pub fn decode_h(cols: &[Vec<i64>]) -> AElem {
             }
             let p = (acc % Q as u128) as u64;
             let n = (neg % Q as u128) as u64;
-            out[k].0[a] = if p >= n { p - n } else { p + Q - n };
+            out[k].0[a] = if p >= n { p - n } else { Q - (n - p) };
         }
     }
     AElem(out)

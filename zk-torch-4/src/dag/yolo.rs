@@ -180,6 +180,15 @@ fn c3k2_block(
     (out, wi)
 }
 
+/// The actual SPPF pooling stage, shared with its boundary regression.
+pub(crate) fn sppf_pool(g:&mut DagBuilder,h:EdgeId)->[EdgeId;3] {
+    // Zero padding changes negative SiLU borders; exclude it authentically.
+    let m1=g.maxpool_general_padded(h,5,5,1,1,2,2);
+    let m2=g.maxpool_general_padded(m1,5,5,1,1,2,2);
+    let m3=g.maxpool_general_padded(m2,5,5,1,1,2,2);
+    [m1,m2,m3]
+}
+
 /// SPPF block: cv1 → 3 cascaded MaxPool k5s1p2 → concat → cv2.
 fn sppf_block(
     g: &mut DagBuilder,
@@ -193,13 +202,7 @@ fn sppf_block(
     let h = cbs(g, x, weights[wi].0, weights[wi].1, (1, 1), (1, 1), (0, 0));
     wi += 1;
 
-    // 3 cascaded MaxPool k5, s1, p2 (maintains spatial)
-    let p1_padded = g.pad_asym(h, 2, 2, 2, 2);
-    let m1 = g.maxpool_general(p1_padded, 5, 5, 1, 1);
-    let p2_padded = g.pad_asym(m1, 2, 2, 2, 2);
-    let m2 = g.maxpool_general(p2_padded, 5, 5, 1, 1);
-    let p3_padded = g.pad_asym(m2, 2, 2, 2, 2);
-    let m3 = g.maxpool_general(p3_padded, 5, 5, 1, 1);
+    let [m1,m2,m3] = sppf_pool(g,h);
 
     // Concat: h + m1 + m2 + m3 = 4 * c_mid = 2 * c_in
     let cat = g.multi_concat(vec![h, m1, m2, m3]);
