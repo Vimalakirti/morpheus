@@ -84,6 +84,8 @@ impl Default for Config { fn default() -> Self { Config { tcl: 4, slots_log: 17,
 pub struct Graph<'a> {
     pub dag: &'a Dag,
     pub shapes: Vec<Vec<usize>>,
+    /// Full public tensor types retained for canonical statement encoding.
+    pub edge_meta: Vec<(crate::dag::DataType, crate::dag::PolyType, usize, crate::dag::Role)>,
     pub nvars: Vec<usize>,
     pub committed: Vec<bool>,
     /// Fixed model tensors (Role::Constant): shared by every request, the
@@ -98,6 +100,7 @@ pub struct Graph<'a> {
     /// Terminal outputs of the graph (public, bound by a root claim).
     pub outputs: Vec<(usize, Arc<Vec<u64>>)>,
     pub cfg: Config,
+    pub protocol_conv_pp: bool,
 }
 
 fn advice_kind(k: &BasicBlockType) -> bool {
@@ -132,8 +135,10 @@ pub fn witness_vals(w: &Witness) -> Arc<Vec<u64>> {
 
 impl<'a> Graph<'a> {
     pub fn new(dag: &'a Dag, wit: &[Vec<Witness>], cfg: Config) -> Self {
+        let protocol_conv_pp = cv::conv_pp();
         let ne = dag.num_edges();
         let shapes: Vec<Vec<usize>> = (0..ne).map(|e| wit[e][0].shape.clone()).collect();
+        let edge_meta = (0..ne).map(|e| { let w = &wit[e][0]; (w.data_type, w.poly_type, w.sf, w.role) }).collect();
         let nvars: Vec<usize> = shapes.iter().map(|s| s.iter().map(|&d| log2_ceil(d)).sum()).collect();
         let mut committed = vec![false; ne];
         let model: Vec<bool> = (0..ne).map(|e| wit[e][0].role == Role::Constant).collect();
@@ -155,7 +160,7 @@ impl<'a> Graph<'a> {
             if matches!(nd.kind, BasicBlockType::Conv1D(_) | BasicBlockType::Conv2D(_) | BasicBlockType::Conv3D(_) | BasicBlockType::DepthwiseConv2D(_)) {
                 for &o in &nd.outputs[1..] { committed[o] = false; }
                 // The polynomial-product baseline commits Y_full.
-                if cv::conv_pp() && matches!(nd.kind, BasicBlockType::Conv2D(_)) && nd.outputs.len() == 2 { committed[nd.outputs[1]] = true; }
+                if protocol_conv_pp && matches!(nd.kind, BasicBlockType::Conv2D(_)) && nd.outputs.len() == 2 { committed[nd.outputs[1]] = true; }
             }
             match &nd.kind {
                 BasicBlockType::NonNegative(nn) => { lookups.insert(nd.id, nn.table_size_log); }
@@ -173,7 +178,7 @@ impl<'a> Graph<'a> {
             dag.consumers[e].is_empty() && w.role == Role::Output && w.data.is_some() && !committed[e]
                 && dag.producers[e].map(|p| { let nd = &dag.nodes[p]; nd.outputs[0] == e && !matches!(nd.kind, BasicBlockType::ProductZeroCheck(_) | BasicBlockType::NonNegative(_)) }).unwrap_or(false)
         }).map(|e| (e, witness_vals(&wit[e][0]))).collect();
-        Graph { dag, shapes, nvars, committed, model, bool_typed, lookups, public, outputs, cfg }
+        Graph { dag, shapes, edge_meta, nvars, committed, model, bool_typed, lookups, public, outputs, cfg, protocol_conv_pp }
     }
 
     /// Stop committing tensors the PIOP never claims: non-public edges whose
@@ -184,7 +189,7 @@ impl<'a> Graph<'a> {
             if !self.committed[e] || self.public.contains_key(&e) { continue; }
             if self.dag.producers[e].map(|p| advice_kind(&self.dag.nodes[p].kind)).unwrap_or(false) { continue; }
             // The polynomial-product baseline's committed full convolution.
-            if cv::conv_pp() && self.dag.producers[e].map(|p| matches!(self.dag.nodes[p].kind, BasicBlockType::Conv2D(_))).unwrap_or(false) { continue; }
+            if self.protocol_conv_pp && self.dag.producers[e].map(|p| matches!(self.dag.nodes[p].kind, BasicBlockType::Conv2D(_))).unwrap_or(false) { continue; }
             if self.dag.consumers[e].iter().all(|&c| advice_kind(&self.dag.nodes[c].kind)) { self.committed[e] = false; }
         }
     }

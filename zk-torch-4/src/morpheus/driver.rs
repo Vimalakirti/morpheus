@@ -41,7 +41,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
     let mut req_secs = Vec::new();
     let mut verify_secs = Vec::new();
     let n = if o_defer_batches().is_some() { batch_sizes(n).iter().sum() } else { n };
-    println!("MORPHEUS_POLICY profile={} auth={} verify={} requests={}", o.profile.name, o.auth, o.verify, n);
+    println!("MORPHEUS_POLICY protocol=2 profile={} auth={} verify={} requests={}", o.profile.name, o.auth, o.verify, n);
     let mut outs = Vec::new();
     let mut vqueue = Vec::new();
     let mut model_reg = None;
@@ -71,11 +71,11 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
     let t = Instant::now();
     let mut pc = PcsGpu::new(o.profile.clone(), o.seed);
     // Streamed requests use every device directly (no replicas).
-    let stream = o.streams(pp.req.len() + o.defer as usize);
+    let stream = o.streams(pp.req.len() + if o.defer { 1 } else { pp.model.len() });
     let mut reps = if o.auth && o.auth_gpus > 1 && !stream { Replicas::new(&o) } else { Replicas { r: Vec::new() } };
     if stream { println!("streamed sources ({} request sources)", pp.req.len()); }
     println!("key caches {:.2}s ({} GPU(s) for authentication)", t.elapsed().as_secs_f64(), 1 + reps.r.len());
-    if o.defer {
+    {
         let m = request::register(&pp, &o, &mut pc, &reps);
         println!("model registration (one-time): {} sources committed in {:.2}s", m.raw.len(), m.secs);
         model_secs = m.secs;
@@ -99,7 +99,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
                 let parts = crate::morpheus::wire::parts(&o.profile, &pf);
                 println!("  proof parts (bytes): {}", parts.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", "));
             }
-            let r = request::verify_request(&pp, &o, j, model_reg.as_ref().map(|m| &m.c[..]), &pf, &pc.keys, &mut vt);
+            let r = request::verify_request(&pp, &o, j, model_reg.as_ref().map(|m| m.public()), &pf, &pc.keys, &mut vt);
             let vs = show(&format!("request {j} verify ({})", r.is_some()), &vt);
             assert!(r.is_some(), "request {j} rejected");
             verify_secs.push(vs);
@@ -133,7 +133,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
                 let vq: Vec<QueueEntry> = range.clone().map(|j| { let (rows, dg, cc) = &vqueue[j]; QueueEntry { j: j as u64, deferred: rows, c_carry: cc.as_ref().unwrap(), digest: *dg } }).collect();
                 let mut vt = Times::new();
                 vt.insert("decode", dec);
-                let ok = request::verify_final(&pp, &o, b as u64, &m.c, &vq, &fpf, &pc.keys, &mut vt);
+                let ok = request::verify_final(&pp, &o, b as u64, m.public(), &vq, &fpf, &pc.keys, &mut vt);
                 fv = show(&format!("finalize batch {b} verify ({ok})"), &vt);
                 assert!(ok, "finalization rejected");
                 if std::env::var("TAMPER").is_ok() {
@@ -143,10 +143,10 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
                     bad_rows[0].y = bad_rows[0].y.add(&crate::morpheus::field8::K8::ONE);
                     let mut bq = vq.clone();
                     bq[0].deferred = &bad_rows;
-                    let r1 = request::verify_final(&pp, &o, b as u64, &m.c, &bq, &fpf, &pc.keys, &mut Times::new());
+                    let r1 = request::verify_final(&pp, &o, b as u64, m.public(), &bq, &fpf, &pc.keys, &mut Times::new());
                     let mut rq = vq.clone();
                     rq.reverse();
-                    let r2 = jb < 2 || request::verify_final(&pp, &o, b as u64, &m.c, &rq, &fpf, &pc.keys, &mut Times::new());
+                    let r2 = jb < 2 || request::verify_final(&pp, &o, b as u64, m.public(), &rq, &fpf, &pc.keys, &mut Times::new());
                     println!("tampered finalization rejected: false weight claim {}, reordered queue {}", !r1, !r2);
                 }
             }

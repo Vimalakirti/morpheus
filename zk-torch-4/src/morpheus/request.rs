@@ -96,8 +96,8 @@ impl Opts {
 }
 
 /// Opening identifiers (coins, salts): request j and finalization batch b.
-pub fn req_opening(j: u64) -> u64 { 1 + j }
-pub fn fin_opening(b: u64) -> u64 { (1u64 << 32) + b }
+pub fn req_opening(j: u64) -> u64 { assert!(j < (1u64 << 32) - 1, "request identifier out of range"); 1 + j }
+pub fn fin_opening(b: u64) -> u64 { assert!(b < 1u64 << 32, "batch identifier out of range"); (1u64 << 32) + b }
 /// Hiding-suffix coin owners of model and request sources: disjoint ranges
 /// (model sources set bit 63; request j < 2^39 and source e < 2^24 never do).
 fn model_owner(e: usize) -> u64 { (1u64 << 63) | e as u64 }
@@ -136,15 +136,17 @@ pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &
     g.prune_unclaimed();
     let pd = ProverData::new(&g, wit, Vec::new());
     let specs = piop::tensor_specs(&g, &pd);
+    // Immutable model sources are isolated in BOTH modes. Request sources
+    // include fresh proof-local graph masks and must never be registered.
+    let (mut m, mut r) = (Vec::new(), Vec::new());
+    for &s in &specs { match s.0 { TKey::Edge(e) if g.model[e] => m.push(s), _ => r.push(s) } }
     let (lay, model, req, carry) = if o.defer {
-        let (mut m, mut r) = (Vec::new(), Vec::new());
-        for &s in &specs { match s.0 { TKey::Edge(e) if g.model[e] => m.push(s), _ => r.push(s) } }
         let (lay, rg) = Layout::pack_groups(&o.profile, &[m, r, vec![(TKey::Carry, o.carry_log, 9, true)]], o.b0);
         (lay, rg[0].clone(), rg[1].clone(), rg[2].clone())
     } else {
-        let lay = Layout::pack_min(&o.profile, &specs, o.b0);
-        let n = lay.n_sources;
-        (lay, 0..0, 0..n, n..n)
+        let (lay, rg) = Layout::pack_groups(&o.profile, &[m, r], o.b0);
+        let end = lay.n_sources;
+        (lay, rg[0].clone(), rg[1].clone(), end..end)
     };
     if o.timing { eprintln!("[prep] graph + prover data + layout {:.2}s: model sources {:?}, request {:?}, carry {:?}", t.elapsed().as_secs_f64(), model, req, carry); }
     Prepared { g, pd, lay, model, req, carry, specs, ar: None }
@@ -174,17 +176,62 @@ pub struct ModelReg {
     pub raw: Vec<Vec<i8>>,
     pub c: Vec<Vec<Vec<u64>>>,
     pub secs: f64,
+    /// Canonical immutable program/type identity; contains no private weights.
+    pub statement: Vec<u64>,
+    pub layout: Vec<u64>,
 }
 
-/// One-time commitment to the model sources (deferral only).
+/// Public registration descriptor from an independently trusted registry.
+/// This contains no model payload or hiding suffix. Do not source it from proof bytes.
+#[derive(Clone, Copy)]
+pub struct RegisteredModel<'a> {
+    pub commitments: &'a [Vec<Vec<u64>>],
+    pub statement: &'a [u64],
+    pub layout: &'a [u64],
+}
+impl ModelReg {
+    pub fn public(&self) -> RegisteredModel<'_> {
+        RegisteredModel { commitments: &self.c, statement: &self.statement, layout: &self.layout }
+    }
+}
+fn registered_descriptor_matches(model: RegisteredModel<'_>, statement: &[u64], layout: &[u64]) -> bool {
+    model.statement == statement && model.layout == layout
+}
+fn registration_matches(pp: &Prepared, o: &Opts, model: RegisteredModel<'_>) -> bool {
+    let Ok(statement) = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log) else { return false; };
+    registered_descriptor_matches(model, &statement, &model_layout_words(pp))
+        && model.commitments.len() == pp.model.len()
+        && model.commitments.iter().all(|c| wire::commitment_ok(&o.profile, c))
+}
+
+/// One-time commitment to the model sources, reused verbatim in both modes.
+/// The verifier must obtain the expected commitments from its trusted registry,
+/// not from the proof or an untrusted prover-supplied ModelReg.
 pub fn register(pp: &Prepared, o: &Opts, pc: &mut PcsGpu, reps: &Replicas) -> ModelReg {
     let t = Instant::now();
     let mut raw = piop::fill_sources_in(&pp.g, &pp.pd, &pp.lay, o.profile.ell(), pp.model.clone());
     fill_suffixes(&o.profile, &o.coins, &mut raw, &model_owner);
     let _ = reps;
-    let c = commit_streamed(o, pc, &raw);
+    let c = if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, &raw) };
     pc.ensure_w();
-    ModelReg { raw, c, secs: t.elapsed().as_secs_f64() }
+    let statement = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
+        .expect("invalid registered program");
+    ModelReg { raw, c, secs: t.elapsed().as_secs_f64(), statement, layout: model_layout_words(pp) }
+}
+
+/// Stable registered model layout, excluding request-value-derived widths.
+fn model_layout_words(pp: &Prepared) -> Vec<u64> {
+    let tensors: Vec<_> = pp.lay.tensors.iter().filter(|t| matches!(t.key, TKey::Edge(e) if pp.g.model[e])).collect();
+    let mut w = vec![pp.model.start as u64, pp.model.end as u64, pp.lay.ell as u64, pp.lay.min_lg as u64, tensors.len() as u64];
+    for t in tensors {
+        let TKey::Edge(e) = t.key else { unreachable!() };
+        w.extend([e as u64, t.n as u64, t.p as u64, t.bits as u64, t.pieces.len() as u64]);
+        for pc in &t.pieces {
+            let r = &pc.region;
+            w.extend([r.source as u64, r.base as u64, r.m as u64, r.p as u64, pc.plane0 as u64, pc.hb as u64, pc.hbits as u64]);
+        }
+    }
+    w
 }
 
 fn absorb_model(tr: &mut MTranscript, c_model: &[Vec<Vec<u64>>]) {
@@ -213,8 +260,11 @@ fn absorb_layout(tr: &mut MTranscript, lay: &Layout) {
     tr.absorb(Item::Layout, &w);
 }
 
-fn request_transcript(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model: Option<&[Vec<Vec<u64>>]>, c_req: &[Vec<Vec<u64>>]) -> MTranscript {
+fn request_transcript(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model: Option<&[Vec<Vec<u64>>]>, c_req: &[Vec<Vec<u64>>]) -> Option<MTranscript> {
+    let words = super::statement::words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log).ok()?;
     let mut tr = MTranscript::new(o.profile.name, salt);
+    tr.absorb(Item::Statement, &[2, 0, o.defer as u64]);
+    tr.absorb(Item::Statement, &words);
     absorb_layout(&mut tr, &pp.lay);
     if let Some(ar) = &pp.ar {
         assert!(ar.validate(&pp.g), "invalid public AR statement");
@@ -232,7 +282,7 @@ fn request_transcript(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model:
         tr.absorb(Item::Statement, &[pp.lay.n_sources as u64, j]);
     }
     for c in c_req { for x in c { tr.absorb(Item::SourceCommitment, x); } }
-    tr
+    Some(tr)
 }
 
 /// Request digest bound by the finalization transcript.
@@ -347,6 +397,12 @@ pub struct RequestOut {
 
 /// Prove request `j` (its witness is the one `pp` was prepared with).
 pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelReg>, pc: &mut PcsGpu, reps: &mut Replicas) -> RequestOut {
+    let model = model.expect("a registered model is required in both modes");
+    assert_eq!(model.statement, super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
+        .expect("invalid request program"), "registered program identity changed");
+    assert_eq!(model.layout, model_layout_words(pp), "registered model layout changed");
+    assert_eq!(model.raw.len(), pp.model.len(), "registered model source count");
+    assert_eq!(model.c.len(), pp.model.len(), "registered model commitment count");
     let mut times = Times::new();
     let ell = o.profile.ell();
     let opening = req_opening(j);
@@ -362,6 +418,11 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         let t = Instant::now();
         let mut raw = piop::fill_sources_in(g, pd, lay, ell, req.clone());
         fill_suffixes(&o.profile, &o.coins, &mut raw, &|e| req_owner(j, e));
+        if !defer {
+            // Preserve the registered model's payload AND hiding suffix. Only
+            // request sources above receive fresh masks/suffixes.
+            raw = model.raw.iter().cloned().chain(raw).collect();
+        }
         lap(&mut times, "fill", t);
         let raw = std::sync::Arc::new(raw);
         let stream = o.streams(raw.len() + defer as usize);
@@ -380,7 +441,11 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         };
         lap(&mut times, "commit", t);
         // PIOP.
-        let tr = request_transcript(o, pp, j, &salt, model.map(|m| &m.c[..]), &c_req);
+        let request_commitments = if defer { &c_req[..] } else {
+            assert_eq!(&c_req[..pp.model.len()], &model.c[..], "registered model commitment changed");
+            &c_req[pp.model.len()..]
+        };
+        let tr = request_transcript(o, pp, j, &salt, Some(&model.c), request_commitments).expect("invalid request statement");
         let t = Instant::now();
         let mut ctx = Ctx::prover(tr, &pd.bank, lay, o.cfg.slots_log);
         if defer { ctx.defer = Some(Defer::new(o.carry_log)); }
@@ -424,8 +489,8 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         lap(&mut times, "carry", t);
     }
     // Π_link over the request sources (+ carry bank).
-    let base = req.start;
-    let span = req.start..if defer { carry.end } else { req.end };
+    let base = if defer { req.start } else { pp.model.start };
+    let span = base..if defer { carry.end } else { req.end };
     let st = Statement { n: raw.len(), bits: lay.bit_blocks_in(&span), rows: remap(&ctx.rows, &|s| s - base) };
     let t = Instant::now();
     let fast = match std::env::var("LINK_IMPL").ok().as_deref() {
@@ -450,26 +515,36 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     RequestOut { bytes, piop_len, c_carry, carry_raw, deferred, digest: dg, times, rows: ctx.rows.len(), carries: ncarry }
 }
 
+/// Registry identity check, independent of prover data and GPU state.
+fn registered_model_matches(n_model: usize, defer: bool, expected: Option<&[Vec<Vec<u64>>]>, sources: &[Vec<Vec<u64>>]) -> bool {
+    let Some(expected) = expected else { return false; };
+    expected.len() == n_model && (defer || sources.get(..n_model) == Some(expected))
+}
+
 /// Verifier of request `j`; returns its deferred rows and digest.
-pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<&[Vec<Vec<u64>>]>, out: &wire::RequestProof, keys: &auth_gpu::Keys, times: &mut Times) -> Option<(Vec<Row>, K8)> {
+pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<RegisteredModel<'_>>, out: &wire::RequestProof, keys: &auth_gpu::Keys, times: &mut Times) -> Option<(Vec<Row>, K8)> {
+    if j >= (1u64 << 32) - 1 || std::env::var_os("LINK_ROWS").is_some() { return None; }
     if pp.ar.as_ref().map(|ar| !ar.validate(&pp.g)).unwrap_or(false) { return None; }
     // Diagnostic NO_AUTH proofs are never accepted by this API.
     let apf = out.auth.as_ref()?;
     let defer = o.defer;
+    let registered = model?;
+    if !registration_matches(pp, o, registered) { return None; }
+    let expected_model = registered.commitments;
     let nreq = out.c_src.len().checked_sub(defer as usize)?;
-    if nreq != pp.req.len() || out.c_src.len() > o.profile.n_max
+    let model_prefix = if defer { 0 } else { pp.model.len() };
+    let expected_sources = pp.req.len().checked_add(model_prefix)?;
+    if nreq != expected_sources || out.c_src.len() > o.profile.n_max
+        || !registered_model_matches(pp.model.len(), defer, Some(expected_model), &out.c_src)
+        || !expected_model.iter().all(|c| wire::commitment_ok(&o.profile, c))
         || !out.c_src.iter().all(|c| wire::commitment_ok(&o.profile, c))
         || !wire::link_shape_ok(&o.profile, out.c_src.len(), &out.link)
         || !wire::auth_shape_ok(&o.profile, apf)
         || !out.piop.iter().all(wire::canonical_k) { return None; }
-    match (defer, model) {
-        (true, Some(cs)) if cs.len() == pp.model.len() && cs.iter().all(|c| wire::commitment_ok(&o.profile, c)) => {},
-        (false, None) => {},
-        _ => return None,
-    }
-    // The salt is disclosed with the proof; the verifier never sees the
-    // prover's private tape.
-    let tr = request_transcript(o, pp, j, &out.salt, model, &out.c_src[..nreq]);
+    // The expected registry commitments, not a prover-selected model identity,
+    // are bound before graph challenges. Empty-model graphs still supply a
+    // RegisteredModel descriptor, with an empty commitments slice.
+    let tr = request_transcript(o, pp, j, &out.salt, Some(expected_model), &out.c_src[model_prefix..nreq])?;
     let t = Instant::now();
     let mut vctx = Ctx::verifier(tr, out.piop.clone(), &pp.lay, o.cfg.slots_log);
     if defer { vctx.defer = Some(Defer::new(o.carry_log)); }
@@ -480,8 +555,8 @@ pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<&[Vec<Vec<u
     if !vctx.consumed() { eprintln!("request {j}: PIOP proof has unread messages"); return None; }
     let mut tv = vctx.tr.clone();
     if defer { for x in &out.c_src[nreq] { tv.absorb(Item::SourceCommitment, x); } }
-    let base = pp.req.start;
-    let span = pp.req.start..if defer { pp.carry.end } else { pp.req.end };
+    let base = if defer { pp.req.start } else { pp.model.start };
+    let span = base..if defer { pp.carry.end } else { pp.req.end };
     let st = Statement { n: out.c_src.len(), bits: pp.lay.bit_blocks_in(&span), rows: remap(&vctx.rows, &|s| s - base) };
     let t = Instant::now();
     let lv = link::verify(&o.profile, &mut tv, &st, &out.c_src, &out.link);
@@ -499,6 +574,9 @@ pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<&[Vec<Vec<u
 
 // ---------------------------------------------------------------- finalization
 
+/// Verifier-owned state from successful `verify_request` for the SAME pinned
+/// program/model/layout. Never deserialize an untrusted network queue into this
+/// type and pass it directly to `verify_final`; the digest is not self-authenticating.
 #[derive(Clone)]
 pub struct QueueEntry<'q> { pub j: u64, pub deferred: &'q [Row], pub c_carry: &'q [Vec<u64>], pub digest: K8 }
 
@@ -519,9 +597,13 @@ fn final_statement(pp: &Prepared, q: &[QueueEntry]) -> Statement {
     Statement { n: nm + q.len(), bits, rows }
 }
 
-fn final_transcript(o: &Opts, lay: &Layout, b: u64, salt: &[u8; 64], c_model: &[Vec<Vec<u64>>], q: &[QueueEntry]) -> MTranscript {
+fn final_transcript(o: &Opts, pp: &Prepared, b: u64, salt: &[u8; 64], c_model: &[Vec<Vec<u64>>], q: &[QueueEntry]) -> Option<MTranscript> {
+    let words = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log).ok()?;
     let mut tr = MTranscript::new(o.profile.name, salt);
-    absorb_layout(&mut tr, lay);
+    tr.absorb(Item::Statement, &[2, 1, o.defer as u64]);
+    // Request-specific public values are already bound by each queue digest.
+    tr.absorb(Item::Statement, &words);
+    absorb_layout(&mut tr, &pp.lay);
     absorb_model(&mut tr, c_model);
     tr.absorb(Item::Statement, &[q.len() as u64, b]);
     for e in q {
@@ -529,12 +611,16 @@ fn final_transcript(o: &Opts, lay: &Layout, b: u64, salt: &[u8; 64], c_model: &[
         tr.absorb_k(Item::Other, &[e.digest]);
         for x in e.c_carry { tr.absorb(Item::SourceCommitment, x); }
     }
-    tr
+    Some(tr)
 }
 
 /// Finalize batch `b`: open the model sources and the queued carry banks
 /// against every deferred row.
 pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[QueueEntry], carries: Vec<Vec<i8>>, pc: &mut PcsGpu, reps: &mut Replicas) -> FinalOut {
+    assert!(o.defer && !q.is_empty(), "finalization needs a nonempty deferred queue");
+    assert_eq!(model.layout, model_layout_words(pp), "registered model layout changed");
+    assert_eq!(model.statement, super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
+        .expect("invalid finalization program"), "registered program identity changed");
     let mut times = Times::new();
     let opening = fin_opening(b);
     let t = Instant::now();
@@ -546,7 +632,7 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
     let mut c_src = model.c.clone();
     for e in q { c_src.push(e.c_carry.to_vec()); }
     let salt = o.coins.begin_opening(fin_opening(b));
-    let mut tr = final_transcript(o, &pp.lay, b, &salt, &model.c, q);
+    let mut tr = final_transcript(o, pp, b, &salt, &model.c, q).expect("invalid finalization statement");
     let stream = o.streams(raw.len());
     pc.streamed = stream;
     let (mut rep_vec, raw) = std::thread::scope(|sc| {
@@ -574,10 +660,16 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
     FinalOut { bytes, times, rows: st.rows.len() }
 }
 
-pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, c_model: &[Vec<Vec<u64>>], q: &[QueueEntry], out: &wire::FinalProof, keys: &auth_gpu::Keys, times: &mut Times) -> bool {
+/// `q` must contain only verifier-produced entries from accepted requests under
+/// this same independently pinned model/program/layout; this function does not
+/// re-run request verification. The expected model commitments are external.
+pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, model: RegisteredModel<'_>, q: &[QueueEntry], out: &wire::FinalProof, keys: &auth_gpu::Keys, times: &mut Times) -> bool {
+    if !registration_matches(pp, o, model) { return false; }
+    let c_model = model.commitments;
     let Some(apf) = out.auth.as_ref() else { return false; };
     let Some(n) = c_model.len().checked_add(q.len()) else { return false; };
-    if !o.defer || pp.carry.len() != 1 || c_model.len() != pp.model.len()
+    if b >= 1u64 << 32 || q.iter().any(|e| e.j >= (1u64 << 32) - 1)
+        || std::env::var_os("LINK_ROWS").is_some() || q.is_empty() || !o.defer || pp.carry.len() != 1 || c_model.len() != pp.model.len()
         || n > o.profile.n_max || !c_model.iter().all(|c| wire::commitment_ok(&o.profile, c))
         || !wire::link_shape_ok(&o.profile, n, &out.link)
         || !wire::auth_shape_ok(&o.profile, apf)
@@ -588,7 +680,7 @@ pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, c_model: &[Vec<Vec<u64>>], 
     let st = final_statement(pp, q);
     let mut c_src = c_model.to_vec();
     for e in q { c_src.push(e.c_carry.to_vec()); }
-    let mut tv = final_transcript(o, &pp.lay, b, &out.salt, c_model, q);
+    let Some(mut tv) = final_transcript(o, pp, b, &out.salt, c_model, q) else { return false; };
     let t = Instant::now();
     let lv = link::verify(&o.profile, &mut tv, &st, &c_src, &out.link);
     lap(times, "verify link", t);
@@ -605,3 +697,53 @@ pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, c_model: &[Vec<Vec<u64>>], 
 
 #[allow(dead_code)]
 fn _types(_: &Point, _: &Tuple, _: &AuxTuple) {}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::{registered_model_matches, registered_descriptor_matches, RegisteredModel};
+
+    #[test]
+    fn registered_program_and_each_layout_word_are_immutable() {
+        let commitments = vec![vec![vec![2u64]]];
+        let statement = vec![2u64, 1, 9, 4];
+        // Representative serialized model range and piece fields.
+        let layout = vec![0u64, 1, 12, 4, 1, 3, 8, 4, 0, 1, 0, 0, 8, 4, 0, 0, 0];
+        let model = RegisteredModel { commitments: &commitments, statement: &statement, layout: &layout };
+        assert!(registered_descriptor_matches(model, &statement, &layout));
+        for i in 0..layout.len() {
+            let mut changed = layout.clone(); changed[i] += 1;
+            assert!(!registered_descriptor_matches(model, &statement, &changed));
+        }
+        for i in 0..statement.len() {
+            let mut changed = statement.clone(); changed[i] += 1;
+            assert!(!registered_descriptor_matches(model, &changed, &layout));
+        }
+        assert!(!registered_descriptor_matches(model, &statement, &layout[..layout.len()-1]));
+    }
+
+
+    #[test]
+    fn monolithic_registry_rejects_replacement_missing_and_wrong_count() {
+        let a = vec![vec![vec![2u64]]];
+        let b = vec![vec![vec![3u64]]];
+        let request = vec![vec![9u64]];
+        let mut sources = a.clone(); sources.push(request);
+        assert!(registered_model_matches(1, false, Some(&a), &sources));
+        assert!(!registered_model_matches(1, false, Some(&b), &sources));
+        assert!(!registered_model_matches(1, false, None, &sources));
+        assert!(!registered_model_matches(2, false, Some(&a), &sources));
+        assert!(!registered_model_matches(1, false, Some(&a), &[]));
+        // An empty model is explicit, not a missing registration.
+        assert!(registered_model_matches(0, false, Some(&[]), &sources[1..]));
+        assert!(!registered_model_matches(0, false, None, &sources[1..]));
+    }
+
+    #[test]
+    fn deferred_registry_identity_is_external_not_a_request_prefix() {
+        let a = vec![vec![vec![2u64]]];
+        let request = vec![vec![vec![9u64]]];
+        assert!(registered_model_matches(1, true, Some(&a), &request));
+        assert!(!registered_model_matches(1, true, None, &request));
+        assert!(!registered_model_matches(2, true, Some(&a), &request));
+    }
+}

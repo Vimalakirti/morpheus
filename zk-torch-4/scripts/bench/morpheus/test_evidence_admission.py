@@ -5,8 +5,8 @@ from evidence_admission import admitted
 
 def fixture(n=3, batches=()):
     b = ','.join(map(str, batches)) or '-'
-    s = f'MORPHEUS_EXPECT profile=morpheus-ternary-v1 requests={n} batches={b}\n'
-    s += f'MORPHEUS_POLICY profile=morpheus-ternary-v1 auth=true verify=true requests={n}\n'
+    s = f'MORPHEUS_EXPECT protocol=2 profile=morpheus-ternary-v1 requests={n} batches={b}\n'
+    s += f'MORPHEUS_POLICY protocol=2 profile=morpheus-ternary-v1 auth=true verify=true requests={n}\n'
     for i in range(n):
         s += f'request {i} prove: 1.00s\nMORPHEUS_AUTH request={i} present=true\nrequest {i} verify (true): 2.00s\n'
     for i, j in enumerate(batches):
@@ -15,6 +15,10 @@ def fixture(n=3, batches=()):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_legacy_or_wrong_protocol_is_not_v2_evidence(self):
+        self.assertFalse(admitted(fixture().replace('protocol=2 ', '')))
+        self.assertFalse(admitted(fixture().replace('protocol=2', 'protocol=1')))
+
     def test_oversized_integer_tokens(self):
         huge = '1' * 5000
         self.assertFalse(admitted(fixture().replace('requests=3', 'requests=' + huge)))

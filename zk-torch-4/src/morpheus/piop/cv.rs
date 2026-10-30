@@ -269,7 +269,7 @@ impl<'g, 'a> Walk<'g, 'a> {
                 self.conv(ctx, x, w, &[cv.c_out, cv.c_in, cv.kernel_size], vec![rel(0)], WKind::Normal, lb(cv.c_in), lb(cv.c_out), c);
                 Some("conv")
             }
-            BasicBlockType::Conv2D(cv) if conv_pp() && nd.outputs.len() > 1 => {
+            BasicBlockType::Conv2D(cv) if self.g.protocol_conv_pp && nd.outputs.len() > 1 => {
                 assert_eq!(cv.batch.max(1), 1, "Morpheus conv: batch 1");
                 self.conv2d_pp(ctx, &nd, cv, c);
                 Some("conv")

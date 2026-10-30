@@ -105,3 +105,61 @@ production binaries still reject missing explicitly requested config files.
 After supplying the real build dependencies, the focused check is:
 `cd zk-torch-4 && cargo test --lib exp_zero_is_one_at_output_scale_cpu_forward`.
 This command has NOT run in the current environment.
+
+## Subsequent wire-v2 registered-model and statement repair
+
+Base for this increment: published commit `7e16a0cdc74f3d8e03914a45a29529e543062f03`.
+Wire magic changes to `MRPHSv2`; v1 proofs are intentionally incompatible. This is
+one protocol-version change, not an additional parameter/security profile.
+
+Both modes now isolate model sources from request sources and require a trusted
+external `RegisteredModel` descriptor: commitments, canonical program identity,
+and exact model-only source layout. Even model-free graphs need the descriptor,
+with an empty commitments list.
+The prover reuses the exact registered model payload **and hiding suffix**;
+monolithic proof sources have a model prefix checked against that external list.
+Fresh graph masks and request hiding suffixes are not registered or reused.
+The local benchmark constructs its own registration only to demonstrate the API;
+it does not authenticate the identity of an external model owner.
+
+The request transcript now absorbs a typed, length-delimited full public
+statement: operator kinds/parameters, topology/wiring, shape and padding metadata,
+roles/types/scales, setup/key/profile/configuration, and public input/claimed
+output arrays. Every encoded u64 is split into 32-bit limbs before field absorption.
+No digest substitutes for that full prefix and no private tensor payload is
+exported. Finalization binds the immutable program/type portion and verified
+request queue digests. The convolution protocol choice is snapshotted in Graph,
+not reread from a mutable environment during reduction. Diagnostic LINK_ROWS
+proofs cannot be accepted by request/final verifiers. Empty final queues reject.
+Opening IDs are bounded so request/final domains do not overlap.
+
+**Still required:** the verifier must independently pin the intended DAG,
+registered model commitments and public inputs/claimed outputs, and own its
+verified deferred queue. This does not prove that a compiler is correct or fix
+unconstrained numerical advice. Private Role::Input values omitted from public
+still lack an independently expected private-input registration hook. Existing
+model digit widths are witness-derived public registration metadata: their
+leakage is explicit here, not a claim of fixed-bound zero knowledge. Replacing
+that with public declared per-edge bounds remains separate work.
+
+Rust registry-identity helper tests and Rust statement-codec tests are
+added but UNEXECUTED. Full mono/deferred verifier tests must mutate expected model
+identity, payload/suffix, missing/reordered prefix, graph/config/public values,
+and queue identity; test an empty-model descriptor and stable model/fresh request
+sources across requests. No successful proof, Rust build, CUDA run or new timing
+measurement is claimed.
+
+The registration fixes graph/configuration/shapes and public input/output edge
+identities, but excludes request-specific public input/output/AR token values.
+Those values are fully bound separately by each request transcript. New requests
+of the same shape can reuse registration; dynamic shapes require a new registered
+descriptor. Model source layout is separately compared by both verifier APIs.
+Per-seed request/batch IDs must remain unique across calls; numeric domain bounds
+do not by themselves prevent callers from deliberately reusing addressed coins.
+
+Benchmark expectations/policy receipts now explicitly require `protocol=2`;
+legacy/missing-version receipts are rejected rather than admitted as evidence
+for the changed relation. This does not retroactively authenticate old logs.
+The wire-v2 statement codec supports global `SF_LOG` from 0 through 30 and rejects
+larger scales before reading the existing signed-shift-based `SF_FLOAT` helper;
+this is an explicit supported-domain restriction, not a silent scale change.

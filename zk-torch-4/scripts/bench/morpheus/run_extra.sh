@@ -40,7 +40,7 @@ one() {   # tag kind env...
   # memory failure with such a process present is retried (RETRIES, 2).
   ( while true; do for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do u=$(ps -o user= -p "$p" 2>/dev/null); [ -n "$u" ] && [ "$u" != "$USER" ] && echo "$(date +%T) $u $p" >> "$log.foreign"; done; sleep 1; done ) &
   local watch=$!
-  printf "MORPHEUS_EXPECT profile=morpheus-ternary-v1 requests=%s batches=%s\n" "$N_REQUESTS" "$N_REQUESTS" > "$log"
+  printf "MORPHEUS_EXPECT protocol=2 profile=morpheus-ternary-v1 requests=%s batches=%s\n" "$N_REQUESTS" "$N_REQUESTS" > "$log"
   case $kind in
     e2e) env "$@" timeout ${TMO:-14400} ./target/release/morpheus_e2e >> "$log" 2>&1 ;;
     hook:*) IFS=: read -r _ bin cfg units <<< "$kind"

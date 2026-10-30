@@ -17,7 +17,7 @@ use super::params::Profile;
 use super::ring::{AElem, DS, N};
 use rayon::prelude::*;
 
-pub const MAGIC: &[u8; 8] = b"MRPHSv1\0";
+pub const MAGIC: &[u8; 8] = b"MRPHSv2\0";
 pub const Z_BITS: usize = 37;
 
 /// Offset and largest code of the response codec.
