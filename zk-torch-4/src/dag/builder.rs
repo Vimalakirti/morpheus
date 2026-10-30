@@ -211,6 +211,54 @@ impl DagBuilder {
         outs[0]
     }
 
+    /// Compact the logical entries of a row-major tensor into a vector.
+    /// `change_shape` only reinterprets/truncates padded storage and is NOT a
+    /// logical flatten. Each public factor selects one mixed-radix coordinate;
+    /// their product selects exactly one logical input, and none for output
+    /// padding. All maps are immutable program literals, authenticated by the
+    /// existing Einsum reduction (no private preprocessing or advice).
+    pub fn flatten_row_major(&mut self, a: EdgeId) -> EdgeId {
+        let shape = self.init_values[a].as_ref().unwrap().shape.clone();
+        assert!(!shape.is_empty() && shape.len() <= 16 && shape.iter().all(|&d| d > 0),
+            "logical flatten requires 1..16 nonzero axes");
+        let count = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+            .expect("logical flatten size overflow");
+        if shape.iter().all(|d| d.is_power_of_two()) {
+            return self.change_shape(a, vec![count]);
+        }
+        let out_pad = count.checked_next_power_of_two().expect("logical flatten padding overflow");
+        let reversed: Vec<_> = shape.iter().rev().copied().collect();
+        // Reversing shape metadata makes the same raw row-major buffer a
+        // column-major Einsum operand. No data transpose is performed.
+        let mut view = self.change_shape(a, reversed.clone());
+        let mut input_term = letters(reversed.len());
+        let mut stride = 1usize;
+        for (axis, &dim) in reversed.iter().enumerate() {
+            let size = out_pad.checked_mul(dim.checked_next_power_of_two().unwrap())
+                .expect("logical flatten map size overflow");
+            let mut values = vec![AlmostGoldilocksField(0); size];
+            for i in 0..count {
+                let coordinate = (i / stride) % dim;
+                values[i + out_pad * coordinate] = AlmostGoldilocksField(1);
+            }
+            let map = self.public_literal(Witness::new(vec![count, dim], values,
+                DataType::Bool, 0, Role::Input));
+            let axis_char = (b'a' + axis as u8) as char;
+            let remaining = ((axis+1)..reversed.len())
+                .map(|j| (b'a'+j as u8) as char).collect::<String>();
+            let output_term = format!("z{remaining}");
+            // One binary gather per axis avoids expanding all public factors
+            // over the full joint sumcheck cube. Intermediate tensors are
+            // derived, not committed advice. Missing axes are free-once and
+            // are partially evaluated before the binary Einsum sumcheck.
+            view = self.einsum(format!("{input_term},z{axis_char}->{output_term}"),
+                vec![view, map], false)[0];
+            input_term = output_term;
+            stride = stride.checked_mul(dim).unwrap();
+        }
+        view
+    }
+
     pub fn reshape(&mut self, a: EdgeId, shape: Vec<usize>) -> Vec<EdgeId> {
         let witness = self.init_values[a].as_ref().unwrap().clone();
         let original_shape = witness.shape.clone();
@@ -616,12 +664,79 @@ impl DagBuilder {
         vec![channels, h, w]
     }
 
+    /// Add a channel bias to a row-major CNN tensor. Generic Add broadcasts
+    /// column-major axes, so applying [C,1,1] directly to [C,H,W] incorrectly
+    /// varies the bias over low spatial bits. The same raw buffers are viewed
+    /// as [W,H,(D),C,B] here; no data-dependent transpose or private map exists.
+    /// Accepts [C], [C,1,..], a full single-image row-major bias, or a full
+    /// tensor bias matching x. Explicit batch padding is retained and masked.
+    pub fn add_channel_bias_row_major(
+        &mut self, x: EdgeId, bias: EdgeId, channels: usize, spatial_axes: usize,
+    ) -> EdgeId {
+        assert!((1..=3).contains(&spatial_axes) && channels > 0);
+        let shape = self.init_values[x].as_ref().unwrap().shape.clone();
+        let bs = self.init_values[bias].as_ref().unwrap().shape.clone();
+        assert!(shape.len() == spatial_axes + 1 || shape.len() == spatial_axes + 2);
+        assert!(shape.iter().all(|&d| d > 0));
+        let cp = channels.next_power_of_two();
+        let batch = if shape.len() == spatial_axes + 2 {
+            assert_eq!(shape[1], channels); shape[0]
+        } else if shape[0] == channels { 1 } else {
+            assert_eq!(shape[0] % cp, 0, "invalid folded CNN channel extent");
+            shape[0] / cp
+        };
+        let spatial = shape[shape.len()-spatial_axes..].to_vec();
+        let mut view_shape = spatial.iter().rev().copied().collect::<Vec<_>>();
+        view_shape.extend([channels, batch]);
+        let view = self.change_shape(x, view_shape.clone());
+        let mut vector_shape = vec![channels]; vector_shape.extend(vec![1; spatial_axes]);
+        let mut image_shape = vec![channels]; image_shape.extend(spatial);
+        let bias_view = if bs == shape {
+            self.change_shape(bias, view_shape.clone())
+        } else if bs == vec![channels] || bs == vector_shape {
+            let mut target = vec![1; spatial_axes]; target.extend([channels, 1]);
+            self.change_shape(bias, target)
+        } else if bs == image_shape {
+            let mut target = view_shape.clone(); *target.last_mut().unwrap() = 1;
+            self.change_shape(bias, target)
+        } else {
+            panic!("unsupported row-major CNN bias {:?} for input {:?} and C={channels}", bs, shape)
+        };
+        let sum = self.add(view, bias_view)[0];
+        let masked = self.mask(sum, view_shape);
+        self.change_shape(masked, shape)
+    }
+
+    /// Per-channel kernels use folded raw storage. Preserve an explicit
+    /// logical batch with registered views and mask its padding before any
+    /// advice/range predicate can observe it. A folded 3D caller retains the
+    /// historical convention that every represented channel is logical.
+    fn fold_per_channel2d_input(&mut self, x: EdgeId) -> (EdgeId, Vec<usize>, usize, usize, usize) {
+        let shape = self.init_values[x].as_ref().unwrap().shape.clone();
+        let (channels, _, _) = Self::per_channel_lead(&shape);
+        let h = shape[shape.len()-2]; let w = shape[shape.len()-1];
+        let x = if shape.len() == 4 {
+            let reversed = shape.iter().rev().copied().collect::<Vec<_>>();
+            let view = self.change_shape(x, reversed.clone());
+            let masked = self.mask(view, reversed);
+            self.change_shape(masked, vec![channels,h,w])
+        } else { x };
+        (x, shape, channels, h, w)
+    }
+
+    fn restore_per_channel2d_output(&mut self, y: EdgeId, original: &[usize], h: usize, w: usize) -> EdgeId {
+        if original.len() == 4 {
+            // Advice such as maxpool is not intrinsically zero on padded B/C.
+            // Bind output padding to zero explicitly, not just by honest run.
+            let reversed = vec![w,h,original[1],original[0]];
+            let view = self.change_shape(y, reversed.clone());
+            let masked = self.mask(view, reversed);
+            self.change_shape(masked, vec![original[0],original[1],h,w])
+        } else { y }
+    }
+
     pub fn pad(&mut self, x: EdgeId, pad_h: usize, pad_w: usize) -> EdgeId {
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let (channels, _batch, _logical_c) = Self::per_channel_lead(x_shape);
-        let off = x_shape.len() - 3;
-        let input_h = x_shape[off + 1];
-        let input_w = x_shape[off + 2];
+        let (x, original_shape, channels, input_h, input_w) = self.fold_per_channel2d_input(x);
 
         let h_out = input_h + 2 * pad_h;
         let w_out = input_w + 2 * pad_w;
@@ -634,7 +749,7 @@ impl DagBuilder {
             0,
             Role::Output,
         )));
-        outs[0]
+        self.restore_per_channel2d_output(outs[0], &original_shape, h_out, w_out)
     }
 
     /// 2×2 max pooling: X[C, H, W] → Y[C, H/pool_h, W/pool_w].
@@ -642,11 +757,7 @@ impl DagBuilder {
     pub fn maxpool2d(&mut self, x: EdgeId, pool_h: usize, pool_w: usize) -> EdgeId {
         use crate::basicblock::maxpool::{MaxPoolHelper, Replicate2x2};
 
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let (channels, _batch, _logical_c) = Self::per_channel_lead(x_shape);
-        let off = x_shape.len() - 3;
-        let input_h = x_shape[off + 1];
-        let input_w = x_shape[off + 2];
+        let (x, original_shape, channels, input_h, input_w) = self.fold_per_channel2d_input(x);
 
         assert_eq!(input_h % pool_h, 0, "H must be divisible by pool_h");
         assert_eq!(input_w % pool_w, 0, "W must be divisible by pool_w");
@@ -683,7 +794,7 @@ impl DagBuilder {
         let diff = diff_outs[0];
         self.add_nonneg_node(diff);
 
-        y
+        self.restore_per_channel2d_output(y, &original_shape, h_out, w_out)
     }
 
     /// Asymmetric zero-pad: X[C, H, W] → Y[C, H+pt+pb, W+pl+pr].
@@ -737,26 +848,20 @@ impl DagBuilder {
         let x_shape = &self.init_values[x].as_ref().unwrap().shape;
         let w_shape = &self.init_values[w].as_ref().unwrap().shape;
 
-        // C_in comes from the WEIGHT, which is unambiguous, and the batch is
-        // whatever leading extent is left over. A folded input
-        // [b_pad*c_in_pad, H, W] and an explicit [B, C_in, H, W] both work, and
-        // neither depends on a convention the caller has to remember.
+        assert_eq!(w_shape.len(), 4, "Conv2D requires one shared [D,C,KH,KW] kernel");
+        assert!(x_shape.len() == 3 || x_shape.len() == 4, "Conv2D input must be [C,H,W], [B,C,H,W], or folded [Bp*Cp,H,W]");
+        let explicit_batch = x_shape.len() == 4;
         let c_in = w_shape[1];
-        let lead: usize = x_shape[..x_shape.len() - 2].iter().product();
-        let c_in_pad = c_in.next_power_of_two();
-        // An unbatched tensor carries the LOGICAL channel count (RGB is 3, not
-        // 4), so `lead == c_in` is the single-image case and need not divide
-        // c_in_pad. Only a folded batch uses padded channel strides.
-        let batch = if lead == c_in {
-            1
-        } else {
-            assert!(
-                lead % c_in_pad == 0,
-                "conv2d: leading extent {} is neither C_in {} nor a multiple of \
-                 padded C_in {} (X {:?}, W {:?})",
-                lead, c_in, c_in_pad, x_shape, w_shape
-            );
-            lead / c_in_pad
+        let batch = if explicit_batch {
+            assert_eq!(x_shape[1], c_in, "Conv2D explicit input channel count");
+            assert!(x_shape[0] > 0, "Conv2D logical batch must be positive");
+            x_shape[0]
+        } else if x_shape[0] == c_in { 1 } else {
+            // A folded extent cannot recover a hidden non-power-of-two B.
+            // Preserve explicit [B,C,H,W] to carry that logical metadata.
+            let cp = c_in.next_power_of_two();
+            assert!(x_shape[0] > 0 && x_shape[0] % cp == 0, "Conv2D folded channel/batch extent");
+            x_shape[0] / cp
         };
         let input_h = x_shape[x_shape.len() - 2];
         let input_w = x_shape[x_shape.len() - 1];
@@ -821,7 +926,9 @@ impl DagBuilder {
         }
 
         self.self_claim_edges.push(y_edge);
-        vec![y_edge]
+        if explicit_batch {
+            vec![self.change_shape(y_edge, vec![batch, c_out, h_out, w_out])]
+        } else { vec![y_edge] }
     }
 
     /// Conv2D with stride and dilation: FlattenKernel(W) → W_flat, Conv2D(X, W_flat) → Y.
@@ -830,26 +937,20 @@ impl DagBuilder {
         let x_shape = &self.init_values[x].as_ref().unwrap().shape;
         let w_shape = &self.init_values[w].as_ref().unwrap().shape;
 
-        // C_in comes from the WEIGHT, which is unambiguous, and the batch is
-        // whatever leading extent is left over. A folded input
-        // [b_pad*c_in_pad, H, W] and an explicit [B, C_in, H, W] both work, and
-        // neither depends on a convention the caller has to remember.
+        assert_eq!(w_shape.len(), 4, "Conv2D requires one shared [D,C,KH,KW] kernel");
+        assert!(x_shape.len() == 3 || x_shape.len() == 4, "Conv2D input must be [C,H,W], [B,C,H,W], or folded [Bp*Cp,H,W]");
+        let explicit_batch = x_shape.len() == 4;
         let c_in = w_shape[1];
-        let lead: usize = x_shape[..x_shape.len() - 2].iter().product();
-        let c_in_pad = c_in.next_power_of_two();
-        // An unbatched tensor carries the LOGICAL channel count (RGB is 3, not
-        // 4), so `lead == c_in` is the single-image case and need not divide
-        // c_in_pad. Only a folded batch uses padded channel strides.
-        let batch = if lead == c_in {
-            1
-        } else {
-            assert!(
-                lead % c_in_pad == 0,
-                "conv2d: leading extent {} is neither C_in {} nor a multiple of \
-                 padded C_in {} (X {:?}, W {:?})",
-                lead, c_in, c_in_pad, x_shape, w_shape
-            );
-            lead / c_in_pad
+        let batch = if explicit_batch {
+            assert_eq!(x_shape[1], c_in, "Conv2D explicit input channel count");
+            assert!(x_shape[0] > 0, "Conv2D logical batch must be positive");
+            x_shape[0]
+        } else if x_shape[0] == c_in { 1 } else {
+            // A folded extent cannot recover a hidden non-power-of-two B.
+            // Preserve explicit [B,C,H,W] to carry that logical metadata.
+            let cp = c_in.next_power_of_two();
+            assert!(x_shape[0] > 0 && x_shape[0] % cp == 0, "Conv2D folded channel/batch extent");
+            x_shape[0] / cp
         };
         let input_h = x_shape[x_shape.len() - 2];
         let input_w = x_shape[x_shape.len() - 1];
@@ -916,7 +1017,9 @@ impl DagBuilder {
         }
 
         self.self_claim_edges.push(y_edge);
-        vec![y_edge]
+        if explicit_batch {
+            vec![self.change_shape(y_edge, vec![batch, c_out, h_out, w_out])]
+        } else { vec![y_edge] }
     }
 
     /// SubSample2D with explicit output size.
@@ -941,11 +1044,7 @@ impl DagBuilder {
     /// General max pooling: X[C, H, W] → Y[C, H_out, W_out] with arbitrary kernel and stride.
     /// Uses GeneralMaxPoolHelper advice node + SubSample2D + Sub + NonNeg for dominance.
     pub fn maxpool_general(&mut self, x: EdgeId, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize) -> EdgeId {
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let (channels, _batch, _logical_c) = Self::per_channel_lead(x_shape);
-        let off = x_shape.len() - 3;
-        let input_h = x_shape[off + 1];
-        let input_w = x_shape[off + 2];
+        let (x, original_shape, channels, input_h, input_w) = self.fold_per_channel2d_input(x);
 
         let out_h = (input_h - kernel_h) / stride_h + 1;
         let out_w = (input_w - kernel_w) / stride_w + 1;
@@ -970,7 +1069,7 @@ impl DagBuilder {
             }
         }
 
-        y
+        self.restore_per_channel2d_output(y, &original_shape, out_h, out_w)
     }
 
     /// ReLU: y = max(0, x).
@@ -1156,26 +1255,20 @@ impl DagBuilder {
         let x_shape = &self.init_values[x].as_ref().unwrap().shape;
         let w_shape = &self.init_values[w].as_ref().unwrap().shape;
 
-        // C_in comes from the WEIGHT, which is unambiguous, and the batch is
-        // whatever leading extent is left over. A folded input
-        // [b_pad*c_in_pad, H, W] and an explicit [B, C_in, H, W] both work, and
-        // neither depends on a convention the caller has to remember.
+        assert_eq!(w_shape.len(), 4, "Conv2D requires one shared [D,C,KH,KW] kernel");
+        assert!(x_shape.len() == 3 || x_shape.len() == 4, "Conv2D input must be [C,H,W], [B,C,H,W], or folded [Bp*Cp,H,W]");
+        let explicit_batch = x_shape.len() == 4;
         let c_in = w_shape[1];
-        let lead: usize = x_shape[..x_shape.len() - 2].iter().product();
-        let c_in_pad = c_in.next_power_of_two();
-        // An unbatched tensor carries the LOGICAL channel count (RGB is 3, not
-        // 4), so `lead == c_in` is the single-image case and need not divide
-        // c_in_pad. Only a folded batch uses padded channel strides.
-        let batch = if lead == c_in {
-            1
-        } else {
-            assert!(
-                lead % c_in_pad == 0,
-                "conv2d: leading extent {} is neither C_in {} nor a multiple of \
-                 padded C_in {} (X {:?}, W {:?})",
-                lead, c_in, c_in_pad, x_shape, w_shape
-            );
-            lead / c_in_pad
+        let batch = if explicit_batch {
+            assert_eq!(x_shape[1], c_in, "Conv2D explicit input channel count");
+            assert!(x_shape[0] > 0, "Conv2D logical batch must be positive");
+            x_shape[0]
+        } else if x_shape[0] == c_in { 1 } else {
+            // A folded extent cannot recover a hidden non-power-of-two B.
+            // Preserve explicit [B,C,H,W] to carry that logical metadata.
+            let cp = c_in.next_power_of_two();
+            assert!(x_shape[0] > 0 && x_shape[0] % cp == 0, "Conv2D folded channel/batch extent");
+            x_shape[0] / cp
         };
         let input_h = x_shape[x_shape.len() - 2];
         let input_w = x_shape[x_shape.len() - 1];
@@ -1256,7 +1349,9 @@ impl DagBuilder {
         // Track Conv2D output as self-claim edge
         self.self_claim_edges.push(y_edge);
 
-        vec![y_edge]
+        if explicit_batch {
+            vec![self.change_shape(y_edge, vec![batch, c_out, h_out, w_out])]
+        } else { vec![y_edge] }
     }
 
     /// Create a conv3d subgraph: FlattenKernel3D(W) → W_flat, Conv3D(X, W_flat) → Y.
@@ -1743,6 +1838,17 @@ impl DagBuilder {
         let letters: String = (0..x_shape.len()).map(|i| (b'a' + i as u8) as char).collect();
         let equation = format!("{},{}->{}", letters, letters, letters);
         self.einsum(equation, vec![x, sig], true)[0]
+    }
+
+    /// CNN SiLU with row-major logical padding. The generic sigmoid/exp
+    /// profile uses column-major axes; reverse metadata on entry and restore
+    /// it on exit so those public masks address the same logical coordinates.
+    pub fn silu_row_major(&mut self, x: EdgeId) -> EdgeId {
+        let shape = self.init_values[x].as_ref().unwrap().shape.clone();
+        assert!(!shape.is_empty());
+        let view = self.change_shape(x, shape.iter().rev().copied().collect());
+        let out = self.silu(view);
+        self.change_shape(out, shape)
     }
 
     /// Nearest-neighbor 2x upsample: X[C, H, W] → Y[C, 2H, 2W].

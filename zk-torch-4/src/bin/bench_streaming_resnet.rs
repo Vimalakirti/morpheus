@@ -105,12 +105,13 @@ fn main() {
     let fc_bias = gen_fc_bias(num_classes, batch_size);
 
     let mut g = DagBuilder::new();
-    // ONE folded input [b_pad*4, H, W] (RGB pads to 4 channels) rather than
+    // ONE explicit [B,3,H,W] input retains logical B (including nonpowers
+    // of two); its raw padded buffer is still [b_pad*4,H,W]. Rather than
     // `batch` separate inputs: the batch is bound inside conv, so the graph
     // stays the size of a single image.
     let xs: Vec<EdgeId> = if batch_size > 1 {
         vec![g.input(
-            vec![batch_size.next_power_of_two() * 4, input_size, input_size],
+            vec![batch_size, 3, input_size, input_size],
             DataType::Uint,
         )]
     } else {
@@ -162,16 +163,14 @@ fn main() {
             if batch_size > 1 {
                 let lead = batch_size.next_power_of_two() * 4;
                 let mut d = rand_field_vec(lead * sp * sp);
-                // Channel 3 of every image is PADDING (RGB -> 4) and must be
-                // zero. Unbatched, ZeroPad sanitized it because it knew
-                // channels == 3; folded, nothing downstream can tell padding
-                // from data, and conv would fold over 3 channels while the
-                // opening integrates over 4.
+                // Keep this historical host sanitization, but correctness
+                // no longer depends on it: the registered model masks the
+                // explicit B/C/spatial padding before folding the tensor.
                 for b in 0..batch_size.next_power_of_two() {
                     let base = (b * 4 + 3) * sp * sp;
                     for v in &mut d[base..base + sp * sp] { *v = AlmostGoldilocksField(0); }
                 }
-                (x, Witness::new(vec![lead, input_size, input_size], d,
+                (x, Witness::new(vec![batch_size, 3, input_size, input_size], d,
                                  DataType::Uint, *SF_LOG, Role::Input))
             } else {
                 (x, Witness::new(vec![3, input_size, input_size],

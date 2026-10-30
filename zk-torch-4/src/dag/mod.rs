@@ -1304,3 +1304,9 @@ mod softmax_tests;
 
 #[cfg(test)]
 mod instancenorm_tests;
+
+#[cfg(test)]
+mod cnn_layout_tests;
+
+#[cfg(test)]
+mod cnn_finite_activation_tests;

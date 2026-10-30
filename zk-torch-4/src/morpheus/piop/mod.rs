@@ -1146,3 +1146,6 @@ mod wg_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod cnn_layout_tests;

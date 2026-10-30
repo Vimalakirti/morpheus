@@ -35,8 +35,9 @@ fn cbs(
     };
     let h = g.conv2d_strided(h, w, kernel, stride)[0];
     let h = rescale_conv(g, h, w);
-    let h = g.add(h, bias)[0];
-    g.silu(h)
+    let c = g.init_values[h].as_ref().unwrap().shape[0];
+    let h = g.add_channel_bias_row_major(h, bias, c, 2);
+    g.silu_row_major(h)
 }
 
 /// CBS with depthwise conv: DWConv + bias + SiLU.
@@ -56,8 +57,9 @@ fn cbs_dw(
     };
     let h = g.depthwise_conv2d_strided(h, w, kernel, stride)[0];
     let h = rescale_conv(g, h, w);
-    let h = g.add(h, bias)[0];
-    g.silu(h)
+    let c = g.init_values[h].as_ref().unwrap().shape[0];
+    let h = g.add_channel_bias_row_major(h, bias, c, 2);
+    g.silu_row_major(h)
 }
 
 /// Plain conv + bias (no activation).
@@ -77,7 +79,8 @@ fn conv_bias(
     };
     let h = g.conv2d_strided(h, w, kernel, stride)[0];
     let h = rescale_conv(g, h, w);
-    g.add(h, bias)[0]
+    let c = g.init_values[h].as_ref().unwrap().shape[0];
+    g.add_channel_bias_row_major(h, bias, c, 2)
 }
 
 /// C3k block (1 bottleneck): cv1 → split → bottleneck(half) → concat → cv2.

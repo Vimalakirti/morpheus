@@ -78,8 +78,11 @@ pub(crate) fn avg_pool2x2(g: &mut DagBuilder, x: EdgeId, channels: usize) -> Edg
 }
 
 /// EZKL's LeNet-5. `conv_w` is `[conv1 (6,1,5,5), conv2 (16,6,5,5)]`, `fc_w` is
-/// `[400x120, 120x84, 84x10]`, and the biases follow ONNX shapes. The graph is
-/// built to match the exported ONNX operator for operator.
+/// column-major `[120,400]`, `[84,120]`, `[10,84]` (out,in): entry (o,i)
+/// is stored at `o + out.next_power_of_two()*i`. Raw ONNX row-major weight
+/// bytes must be encoded into this layout, not merely relabelled. FC biases
+/// are vectors; convolution biases may be [C], [C,1,1] or full row-major
+/// [C,H,W]. This is the stated operator graph, not an ONNX-loader validation.
 pub fn lenet5(
     conv_w: Vec<Witness>,
     conv_b: Vec<Witness>,
@@ -97,7 +100,7 @@ pub fn lenet5(
         h = g.conv2d(h, w0, (5, 5))[0];
         if *SF_LOG > 0 { h = g.scale(h, 2 * *SF_LOG, *SF_LOG)[0]; }
         let b0 = g.param(conv_b[0].clone());
-        h = g.add(h, b0)[0];
+        h = g.add_channel_bias_row_major(h, b0, 6, 2);
         h = quadratic_activation(g, h, "chw,chw->chw");
         h = avg_pool2x2(g, h, 6);
         g.layer_boundaries.push(h);
@@ -107,7 +110,7 @@ pub fn lenet5(
         h = g.conv2d(h, w1, (5, 5))[0];
         if *SF_LOG > 0 { h = g.scale(h, 2 * *SF_LOG, *SF_LOG)[0]; }
         let b1 = g.param(conv_b[1].clone());
-        h = g.add(h, b1)[0];
+        h = g.add_channel_bias_row_major(h, b1, 16, 2);
         h = quadratic_activation(g, h, "chw,chw->chw");
         h = avg_pool2x2(g, h, 16);
         g.layer_boundaries.push(h);
@@ -115,16 +118,39 @@ pub fn lenet5(
         // Flatten to 400 and run the classifier. ONNX Gemm has transB=1, so the
         // stored weight is [out, in] and the contraction is over `out`'s second
         // axis; einsum states that directly rather than transposing first.
-        h = g.change_shape(h, vec![16 * 5 * 5]);
-        for i in 0..3 {
-            let w_e = g.param(fc_w[i].clone());
-            h = g.einsum("i,oi->o".to_string(), vec![h, w_e], false)[0];
-            if *SF_LOG > 0 { h = g.scale(h, 2 * *SF_LOG, *SF_LOG)[0]; }
-            let b_e = g.param(fc_b[i].clone());
-            h = g.add(h, b_e)[0];
-            g.layer_boundaries.push(h);
-        }
+        assert_eq!(g.init_values[h].as_ref().unwrap().shape, vec![16, 5, 5]);
+        h = g.flatten_row_major(h);
+        h = classifier(g, h, &fc_w, &fc_b);
         vec![h]
     }
 }
 
+
+/// Exact logical FC chain after compact flatten. Weights use column-major
+/// [out,in] storage, not ONNX's unencoded row-major bytes.
+pub(crate) fn classifier(g: &mut DagBuilder, mut h: EdgeId, fc_w: &[Witness], fc_b: &[Witness]) -> EdgeId {
+    assert_eq!(fc_w.len(), 3);
+    assert_eq!(fc_b.len(), 3);
+    for i in 0..3 {
+            let w_e = g.param(fc_w[i].clone());
+            // Einsum is column-major: [out,in] means offset o + out_pad*i.
+            // A compact ONNX row-major buffer must be encoded before becoming
+            // a Witness; the shape alone does not transpose its storage.
+            let input_shape = g.init_values[h].as_ref().unwrap().shape.clone();
+            assert_eq!(input_shape.len(), 1);
+            let weight_shape = g.init_values[w_e].as_ref().unwrap().shape.clone();
+            assert_eq!(weight_shape.len(), 2);
+            assert_eq!(weight_shape[1], input_shape[0]);
+            h = g.mask(h, input_shape);
+            h = g.einsum("i,oi->o".to_string(), vec![h, w_e], false)[0];
+            if *SF_LOG > 0 { h = g.scale(h, 2 * *SF_LOG, *SF_LOG)[0]; }
+            let b_e = g.param(fc_b[i].clone());
+            assert_eq!(g.init_values[b_e].as_ref().unwrap().shape, vec![weight_shape[0]]);
+            h = g.add(h, b_e)[0];
+            // Bias/weight padding is not logical data and must not enter the
+            // next contraction (120 and 84 both have padded coordinates).
+            h = g.mask(h, vec![weight_shape[0]]);
+            g.layer_boundaries.push(h);
+    }
+    h
+}
