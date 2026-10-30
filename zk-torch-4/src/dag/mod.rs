@@ -1293,3 +1293,6 @@ mod tests {
         assert_eq!(downloaded, vec![0u64, 1, 2, 3]);
     }
 }
+
+#[cfg(test)]
+mod normalization_tests;

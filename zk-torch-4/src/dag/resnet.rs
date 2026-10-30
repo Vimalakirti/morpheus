@@ -208,13 +208,10 @@ pub fn resnet50_with_biases(
             }
             // Head: GAP → FC.
             //
-            // reduce_mean over [1, 2] is H and W, which is correct under the
-            // folded layout: axis 0 is the combined b*c, so this is global
-            // average pooling per image per channel and needs no axis shift.
-            // It leaves [b_pad*c_pad], with c in the LOW bits and b in the
-            // HIGH bits -- so the FC head reshapes to [c_pad, B], matching
-            // einsum's convention that the first shape dimension is lowest.
-            h = g.reduce_mean(h, &[1, 2]);
+            // CNN raw buffers are row-major. Reinterpret [foldedC,H,W]
+            // as [W,H,foldedC] before column-major Einsum reduction.
+            // Result keeps c in low bits and b in high bits for the FC view.
+            h = global_mean_row_major(g,h);
             if batch > 1 {
                 let feat = g.init_values[h].as_ref().unwrap().shape[0] / batch;
                 h = g.change_shape(h, vec![feat, batch]);
@@ -230,6 +227,21 @@ pub fn resnet50_with_biases(
         }
         outs
     }
+}
+
+/// CNN storage is row-major (W is fastest), whereas Einsum is column-major.
+/// Reinterpret the SAME raw buffer as [W,H,C,(B)] before spatial reduction.
+/// This is not a transpose and requires no private layout-dependent choice.
+pub(crate) fn global_mean_row_major(g:&mut DagBuilder,x:EdgeId)->EdgeId {
+    let shape=g.init_values[x].as_ref().unwrap().shape.clone();
+    assert!(shape.len()==3 || shape.len()==4);
+    let reversed=shape.iter().rev().copied().collect::<Vec<_>>();
+    let view=g.change_shape(x,reversed);
+    let mean=g.reduce_mean(view,&[0,1]);
+    if shape.len()==4 {
+        let size=shape[0].next_power_of_two()*shape[1].next_power_of_two();
+        g.change_shape(mean,vec![size])
+    } else {mean}
 }
 
 /// Compute the output spatial size after running ResNet stem + N stages.

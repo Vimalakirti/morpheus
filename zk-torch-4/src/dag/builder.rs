@@ -78,15 +78,15 @@ impl DagBuilder {
     }
 
     /// Dense full-padded literal used for integer range constraints.
-    fn integer_literal(&mut self, shape: Vec<usize>, value: i128, sf: usize) -> EdgeId {
+    pub(crate) fn integer_literal(&mut self, shape: Vec<usize>, value: i128, sf: usize) -> EdgeId {
         let n = shape.iter().map(|s| s.next_power_of_two()).product();
         self.public_literal(Witness::new(shape, vec![int_to_f(value); n], DataType::Float, sf, Role::Input))
     }
 
     /// Integer interval certificate. Both sides are lookup roots, with a
     /// common authenticated small sum; the field relation therefore lifts.
-    fn integer_interval(&mut self, a: EdgeId, lo: i128, hi: i128) {
-        assert!(lo <= hi && hi-lo < (1i128<<40), "unsupported interval budget");
+    pub(crate) fn integer_interval(&mut self, a: EdgeId, lo: i128, hi: i128) {
+        assert!(lo <= hi && hi-lo < (1i128<<62), "unsupported interval budget");
         let w=self.init_values[a].as_ref().unwrap();
         let shape=w.shape.clone(); let sf=w.sf;
         let low=self.integer_literal(shape.clone(),lo,sf);
@@ -96,6 +96,10 @@ impl DagBuilder {
         self.init_values[above].as_mut().unwrap().role=Role::Output;
         self.init_values[below].as_mut().unwrap().role=Role::Output;
         let bits=(128-((hi-lo) as u128).leading_zeros() as usize).max(1);
+        let row_bits=crate::util::arith::get_n(&self.init_values[a].as_ref().unwrap().shape);
+        assert!(bits+row_bits < usize::BITS as usize ||
+            (std::env::var("NO_SPARSE_SPLIT").is_err() && bits>*crate::TABLE_COMMIT_LOG),
+            "wide normalization ranges require split sparse representation");
         self.add_nonneg_node_bits(above,bits);
         self.add_nonneg_node_bits(below,bits);
     }
@@ -141,7 +145,35 @@ impl DagBuilder {
         let data_type = inp.data_type;
         let out = Witness::new_wo_data(shape, data_type, sf, Role::Output);
         self.init_values.push(Some(out));
-        self.add_gkr_node(vec![a], block)
+        let y = self.add_gkr_node(vec![a], block)[0];
+        vec![y]
+    }
+
+    fn division_guards(&mut self,a: EdgeId,y: EdgeId,c: usize) {
+        let input=self.init_values[a].as_ref().unwrap();
+        let output=self.init_values[y].as_ref().unwrap();
+        assert_eq!(input.shape,output.shape,"division advice shape mismatch");
+        assert_eq!(input.sf,output.sf,"division advice scale mismatch");
+        assert!(input.shape.iter().all(|&d| d>0),"invalid division shape");
+        let sf=self.init_values[a].as_ref().unwrap().sf;
+        // Exact integer division on a public bounded domain. The registered
+        // DAG includes these roots; advice alone is never the specification.
+        assert!((1..=(1 << 20)).contains(&c), "unsupported divisor");
+        const B: i128 = (1i128 << 54) - 1;
+        self.integer_interval(a, -B, B);
+        self.integer_interval(y, -((B / c as i128) + 1), (B / c as i128) + 1);
+        let shape=self.init_values[a].as_ref().unwrap().shape.clone();
+        let n=shape.iter().map(|x| x.next_power_of_two()).product();
+        let af=self.change_shape(a,vec![n]);
+        let yf=self.change_shape(y,vec![n]);
+        let divisor=self.integer_literal(vec![n],c as i128,0);
+        let cy=self.einsum("i,i->i".into(),vec![yf,divisor],false)[0];
+        let rem=self.sub(af,cy)[0];
+        // rho = a-c*y+floor(c/2) lies in [0,c-1]. Unlike the old
+        // symmetric interval this has exactly one allowed half-tie answer.
+        let half=self.integer_literal(vec![n],(c/2) as i128,sf);
+        let rho=self.add(rem,half)[0];
+        self.integer_interval(rho,0,c as i128-1);
     }
 
     pub fn add_nonneg_node(&mut self, a: EdgeId) {
@@ -934,7 +966,7 @@ impl DagBuilder {
     }
 
     /// SubSample2D with explicit output size.
-    fn subsample2d_sized(&mut self, x: EdgeId, stride_h: usize, stride_w: usize, offset_h: usize, offset_w: usize, out_h: usize, out_w: usize) -> EdgeId {
+    pub(crate) fn subsample2d_sized(&mut self, x: EdgeId, stride_h: usize, stride_w: usize, offset_h: usize, offset_w: usize, out_h: usize, out_w: usize) -> EdgeId {
         let x_shape = &self.init_values[x].as_ref().unwrap().shape;
         let (channels, _batch, _logical_c) = Self::per_channel_lead(x_shape);
         let off = x_shape.len() - 3;
@@ -1023,6 +1055,16 @@ impl DagBuilder {
         y
     }
 
+    /// Logical reduction inputs have explicit signed lifts before summation.
+    /// Padding is authenticated and excluded before, rather than after, a mean.
+    pub(crate) fn mean_input(&mut self, x: EdgeId, count: usize) -> EdgeId {
+        assert!((1..=(1<<20)).contains(&count), "unsupported mean reduction size");
+        let shape=self.init_values[x].as_ref().unwrap().shape.clone();
+        let x=self.mask(x,shape);
+        self.integer_interval(x,-((1i128<<30)-1),(1i128<<30)-1);
+        x
+    }
+
     /// ReduceMean over one or more axes.
     /// E.g. reduce_mean(x, &[1, 2]) on shape [B, S, D] computes mean over axes 1,2 → shape [B].
     pub fn reduce_mean(&mut self, x: EdgeId, axes: &[usize]) -> EdgeId {
@@ -1033,7 +1075,9 @@ impl DagBuilder {
             assert!(ax < ndim, "axis {ax} out of bounds for {ndim}-dim tensor");
         }
 
-        let n: usize = axes.iter().map(|&ax| shape[ax]).product();
+        assert!(axes.iter().collect::<std::collections::HashSet<_>>().len()==axes.len(), "duplicate mean axis");
+        let n=axes.iter().try_fold(1usize,|n,&ax|n.checked_mul(shape[ax])).expect("mean reduction size overflow");
+        let x=self.mean_input(x,n);
 
         let in_chars: String = (0..ndim).map(|i| (b'a' + i as u8) as char).collect();
         let out_chars: String = (0..ndim)
@@ -1945,6 +1989,23 @@ impl DagBuilder {
 
     /// Compile: build consumers/producers, ports, and topological order.
     pub fn compile(mut self) -> (Dag, Vec<Vec<Witness>>) {
+        // Every division/RMS advice primitive receives defining constraints, including raw
+        // add_gkr_node users. Legacy row-f64 reciprocal advice is unsupported.
+        // The queue is intentionally live: RMS guards themselves create an
+        // exact quarter division and a private bucket advice node.
+        let mut cursor=0;
+        while cursor<self.nodes.len() {
+            let node=self.nodes[cursor].clone();cursor+=1;
+            match node.kind {
+                BasicBlockType::DivConst(b)=>self.division_guards(node.inputs[0],node.outputs[0],usize::try_from(b.divisor).expect("divisor too large")),
+                BasicBlockType::RMSReciprocal(b)=>{
+                    assert_eq!(b.dim,0,"legacy unconstrained RMS advice is unsupported; use the exact mean gate");
+                    crate::dag::llama::rms_reciprocal_constraints(&mut self,node.inputs[0],node.outputs[0]);
+                },
+                BasicBlockType::RMSBucket(_)=>crate::dag::llama::rms_bucket_constraints(&mut self,node.inputs[0],node.outputs[0]),
+                _=>{},
+            }
+        }
         let helpers: Vec<_> = self.nodes.iter().filter_map(|n| {
             if let BasicBlockType::ExpHelper(h) = &n.kind {
                 Some((n.id, n.inputs[0], n.outputs[0], h.num_bits))

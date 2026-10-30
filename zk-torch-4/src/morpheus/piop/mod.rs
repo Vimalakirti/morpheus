@@ -106,7 +106,7 @@ pub struct Graph<'a> {
 }
 
 fn advice_kind(k: &BasicBlockType) -> bool {
-    matches!(k, BasicBlockType::DivConst(_) | BasicBlockType::SoftmaxConst(_) | BasicBlockType::SigmoidConst(_) | BasicBlockType::RMSReciprocal(_)
+    matches!(k, BasicBlockType::DivConst(_) | BasicBlockType::SoftmaxConst(_) | BasicBlockType::SigmoidConst(_) | BasicBlockType::RMSReciprocal(_) | BasicBlockType::RMSBucket(_)
         // Vision advice, constrained by range checks / product zero checks
         // wired by the builder (the same relation as the previous prover).
         | BasicBlockType::ReLUHelper(_) | BasicBlockType::MaxPoolHelper(_) | BasicBlockType::GeneralMaxPoolHelper(_)
@@ -363,7 +363,7 @@ pub fn tensor_specs(g: &Graph, pd: &ProverData) -> Vec<(TKey, usize, usize, bool
             // by the input's declared Bool type; every other request tensor
             // gets 2^req_planes_log planes. The honest prover checks the fit.
             let bits = g.bool_typed[e] || g.dag.producers[e].map(|n| matches!(g.dag.nodes[n].kind,
-                BasicBlockType::ReLUHelper(_) | BasicBlockType::PillarMaxPool(_) | BasicBlockType::ScatterToBEV(_))).unwrap_or(false);
+                BasicBlockType::ReLUHelper(_) | BasicBlockType::RMSBucket(_) | BasicBlockType::PillarMaxPool(_) | BasicBlockType::ScatterToBEV(_))).unwrap_or(false);
             if bits {
                 assert!(v.par_iter().all(|&x| x <= 1), "edge {e}: declared bit tensor holds a non-bit value");
                 (0, true)

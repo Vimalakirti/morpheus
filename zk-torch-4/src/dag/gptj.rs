@@ -14,6 +14,8 @@ pub fn gptj_layer_norm(
     move |g, x| {
         assert!(x.len() == 1, "This custom LayerNorm layer expects 1 input");
         let x = x[0];
+        let shape=g.init_values[x].as_ref().unwrap().shape.clone();
+        let x=g.mean_input(x,*shape.last().unwrap());
         let x_sum = g.einsum("bsi->bs".to_string(), vec![x], false)[0];
         let x_shape = g.init_values[x].as_ref().unwrap().shape.clone();
         let n = x_shape[x_shape.len() - 1];
@@ -21,30 +23,7 @@ pub fn gptj_layer_norm(
         let x_mean = g.div_const(x_sum, n)[0];
         let x_mean = g.change_shape(x_mean, vec![1, seq, 1]);
 
-        let n_param: usize = g.param(Witness::new(
-            vec![1],
-            vec![AlmostGoldilocksField(n as u64)],
-            DataType::Float,
-            0,
-            Role::Constant,
-        ));
-        let mean_tolerance = g.param(Witness::new(
-            vec![1],
-            vec![AlmostGoldilocksField((n / 2) as u64)],
-            DataType::Float,
-            *SF_LOG,
-            Role::Constant,
-        ));
-        let x_mean_mul_n =
-            g.einsum("bsi,i->bsi".to_string(), vec![x_mean, n_param], false)[0];
-
-        // x_sum reshape so the sub stays element-wise per row, not outer-product.
-        let x_sum_reshaped = g.change_shape(x_sum, vec![1, seq, 1]);
-        let x_sum_sub_x_mean_mul_n = g.sub(x_sum_reshaped, x_mean_mul_n)[0];
-        let positive_1 = g.add(x_sum_sub_x_mean_mul_n, mean_tolerance)[0];
-        let positive_2 = g.sub(mean_tolerance, x_sum_sub_x_mean_mul_n)[0];
-        g.add_nonneg_node(positive_1);
-        g.add_nonneg_node(positive_2);
+        // div_const emits exact deterministic rounding roots.
 
         let x_minus_mean = g.sub(x, x_mean)[0];
         let x_minus_mean = g.mask(x_minus_mean, vec![1, seq, n]);

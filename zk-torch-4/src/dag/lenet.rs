@@ -17,10 +17,9 @@
 //! `x^2 + x`, not tanh or ReLU: in the ONNX it appears as `Mul(y, y)` followed
 //! by `Add(., y)`. That is a degree-2 polynomial, so it needs no range check and
 //! no lookup, which is why this model is cheap for us. And pooling is AVERAGE,
-//! not max; average pooling is linear and is expressed here as a depthwise
-//! convolution; average pooling is linear and is built here from four strided
-//! gathers plus a divide, so it costs no comparison chain and no lookup, unlike
-//! the maxpool every other CNN in this table uses.
+//! not max. Its finite mean uses four explicit-size strided gathers plus
+//! exact integer division with authenticated range roots; its repaired cost
+//! must not be read from historical no-lookup timings.
 
 use almost_goldilocks_cuda::field::AlmostGoldilocksField;
 
@@ -41,39 +40,41 @@ fn quadratic_activation(g: &mut DagBuilder, x: EdgeId, eq: &str) -> EdgeId {
     g.add(sq, x)[0]
 }
 
-/// Average pooling, `2x2` stride `2`, as a strided convolution against a
-/// block-diagonal `1/4` kernel: `w[co][ci][kh][kw] = 1/4` when `co == ci`.
-///
-/// Average pooling is linear, so it needs no comparison and no lookup, unlike
-/// the maxpool the other CNNs here use. Two earlier attempts are worth
-/// recording. A depthwise conv with a `[C,1,2,2]` kernel failed its
-/// FlattenKernel check because the constant was written column-major, the
-/// einsum operand convention, rather than the padded row-major a conv weight
-/// expects. Composing `subsample2d` gathers instead failed differently:
-/// `subsample2d` truncates the final window, so offset 1 on a width-28 input
-/// returns 13 columns rather than 14 and the four gathers no longer broadcast
-/// against each other. The layout used here was verified against a hand
-/// computed average before being wired in.
-fn avg_pool2x2(g: &mut DagBuilder, x: EdgeId, channels: usize) -> EdgeId {
-    let cp = channels.next_power_of_two();
-    let kp = 2usize.next_power_of_two();
-    let mut data = crate::zero_witness_vec(cp * cp * kp * kp);
-    let quarter = AlmostGoldilocksField(1u64 << (*SF_LOG - 2));
-    for c in 0..channels {
-        for kh in 0..2 {
-            for kw in 0..2 {
-                data[((c * cp + c) * kp + kh) * kp + kw] = quarter;
-            }
-        }
+/// Exact 2x2 mean, using four explicit-size row-major gathers and DivConst.
+/// The explicit output extent avoids the old offset-one truncation bug. The
+/// authenticated row-major mask excludes spatial/channel padding BEFORE sums.
+pub(crate) fn avg_pool2x2(g: &mut DagBuilder, x: EdgeId, channels: usize) -> EdgeId {
+    let shape=g.init_values[x].as_ref().unwrap().shape.clone();
+    let sf=g.init_values[x].as_ref().unwrap().sf;
+    assert!(shape.len()==3 || shape.len()==4);
+    let h=shape[shape.len()-2];let w=shape[shape.len()-1];
+    assert!(h>0 && w>0 && h%2==0 && w%2==0);
+    let cp=channels.next_power_of_two();
+    let (batch,rows)=if shape.len()==4 {
+        assert_eq!(shape[1],channels);(shape[0],shape[0].next_power_of_two()*cp)
+    } else if shape[0]==channels {(1,channels)} else {
+        assert_eq!(shape[0]%cp,0);(shape[0]/cp,shape[0])
+    };
+    let hp=h.next_power_of_two();let wp=w.next_power_of_two();
+    let len=rows.next_power_of_two()*hp*wp;
+    let mut mask=vec![AlmostGoldilocksField(0);len];
+    for c in 0..rows {
+        if c/cp>=batch || c%cp>=channels {continue;}
+        for ih in 0..h {for iw in 0..w {mask[iw+wp*(ih+hp*c)]=AlmostGoldilocksField(1);}}
     }
-    let w = Witness::new(vec![channels, channels, 2, 2], data,
-                         DataType::Uint, *SF_LOG, Role::Constant);
-    let w_e = g.param(w);
-    let out = g.conv2d_strided(x, w_e, (2, 2), (2, 2))[0];
-    // Convolution multiplies two fixed-point tensors without rescaling, so the
-    // product sits at 2*sf and is brought back explicitly, as after every other
-    // convolution here.
-    if *SF_LOG > 0 { g.scale(out, 2 * *SF_LOG, *SF_LOG)[0] } else { out }
+    let mask=g.public_literal(Witness::new(vec![len],mask,DataType::Bool,0,Role::Input));
+    let xf=g.change_shape(x,vec![len]);
+    let masked=g.einsum("i,i->i".into(),vec![xf,mask],false)[0];
+    let x=g.change_shape(masked,shape);
+    let bound=(1i128<<30)-1;g.integer_interval(x,-bound,bound);
+    let mut parts=Vec::new();
+    for oh in 0..2 {for ow in 0..2 {
+        let part=g.subsample2d_sized(x,2,2,oh,ow,h/2,w/2);
+        g.init_values[part].as_mut().unwrap().sf=sf;
+        parts.push(part);
+    }}
+    let a=g.add(parts[0],parts[1])[0];let b=g.add(parts[2],parts[3])[0];
+    let sum=g.add(a,b)[0];g.div_const(sum,4)[0]
 }
 
 /// EZKL's LeNet-5. `conv_w` is `[conv1 (6,1,5,5), conv2 (16,6,5,5)]`, `fc_w` is

@@ -72,6 +72,7 @@ fn operator(k: &BasicBlockType) -> Result<Vec<u64>, String> {
         ReLUHelper(_) => { w.u(27); },
         Replicate2x2(b) => { w.u(28); w.us(b.channels)?; w.us(b.out_h)?; w.us(b.out_w)?; },
         RMSReciprocal(b) => { w.u(29); w.us(b.dim)?; },
+        RMSBucket(_) => { w.u(40); w.bytes(b"private-dyadic-rms-bucket-v1")?; },
         ScaleDown(b) => { w.u(30); w.us(b.output_sf)?; },
         ScaleUp(b) => { w.u(31); w.us(b.output_sf)?; },
         ScatterToBEV(b) => { w.u(32); w.us(b.n_pillars)?; w.us(b.features)?; w.us(b.ny)?; w.us(b.nx)?; },

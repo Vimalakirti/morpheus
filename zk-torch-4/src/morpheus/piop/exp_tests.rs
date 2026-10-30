@@ -184,3 +184,103 @@ fn padded_exp_verifier_rejects_nonzero_claimed_padding() {
     let bad=Arc::new(bad); pd.vals[out]=Some(bad.clone()); g.outputs=vec![(out,bad)];
     assert!(!replay(&g,&pd));
 }
+
+/// Real PIOP replay coverage for the next numerical repair. These tests are
+/// authored/typechecked even when missing CUDA linkage blocks execution.
+fn normalization_case(is_rms:bool, input:i128, override_advice:Option<i128>) -> bool {
+    normalization_case_with_bucket(is_rms,input,override_advice,None)
+}
+fn normalization_case_with_bucket(is_rms:bool,input:i128,override_advice:Option<i128>,bucket_override:Option<usize>)->bool {
+    let mut b=DagBuilder::new();
+    let x=b.committed_input(Witness::new(vec![1],vec![int_to_f(input)],DataType::Float,10,Role::Input));
+    let y=if is_rms {b.rms_reciprocal_from_mean(x)} else {b.div_const(x,2)[0]};
+    let (d,mut w)=b.compile();
+    let forward=|w:&mut Vec<Vec<Witness>>,bad:Option<i128>,bad_bucket:Option<usize>| {
+        for &n in &d.topo {
+            let nd=&d.nodes[n];
+            let ins=nd.inputs.iter().map(|&e|&w[e][0]).collect::<Vec<_>>();
+            let outs=nd.kind.run(&ins);
+            for (&e,mut v) in nd.outputs.iter().zip(outs) {
+                if e==y {if let Some(bad)=bad {v=Witness::new(vec![1],vec![int_to_f(bad)],v.data_type,v.sf,v.role);}}
+                if matches!(nd.kind,BasicBlockType::RMSBucket(_)) {
+                    if let Some(index)=bad_bucket {
+                        let mut vals=vec![int_to_f(0);32];vals[index]=int_to_f(1);
+                        v=Witness::new(vec![1,32],vals,v.data_type,v.sf,v.role);
+                    }
+                }
+                if bad.is_some() && matches!(nd.kind,BasicBlockType::ReLUHelper(_)) {
+                    // Malicious source remains well-typed: a negative r would
+                    // make the honest helper emit >1, but that must not turn
+                    // this verifier test into a source-fit constructor panic.
+                    let bit=if v.data.as_ref().unwrap().index(0).reduce().0==0 {0} else {1};
+                    v=Witness::new(vec![1],vec![int_to_f(bit)],v.data_type,v.sf,v.role);
+                }
+                w[e]=vec![v];
+            }
+        }
+    };
+    forward(&mut w,None,None);
+    let g=Graph::new(&d,&w,Config{tcl:4,slots_log:10,req_planes_log:5});
+    let mut pd=ProverData::new(&g,&w,vec![K8::ZERO;1<<10]);
+    if override_advice.is_some() || bucket_override.is_some() {
+        forward(&mut w,override_advice,bucket_override);
+        // Mutate AFTER honest prover preparation. A constructor panic is not
+        // verifier rejection: supply legal selectors even for negative roots.
+        for (e,ws) in w.iter().enumerate() {
+            if ws[0].poly_type==crate::dag::PolyType::Dense {
+                pd.vals[e]=Some(Arc::new(ws[0].data.as_ref().unwrap().evaluations_ref().iter().map(|v|v.reduce().0).collect()));
+            }
+        }
+        for (&node,&bits) in &g.lookups {
+            if matches!(d.nodes[node].kind,BasicBlockType::NonNegative(_)) {
+                let vals=pd.v(d.nodes[node].inputs[0]);
+                pd.sel.insert(node,vals.iter().map(|&v|if v<(1u64<<bits) {v} else {0}).collect());
+            }
+        }
+    }
+    replay(&g,&pd)
+}
+
+#[test]
+fn exact_mean_piop_rejects_both_old_half_tie_counterexamples() {
+    for (input,correct,wrong) in [(1,1,0),(-1,0,-1)] {
+        assert!(normalization_case(false,input,None));
+        assert!(normalization_case(false,input,Some(correct)));
+        assert!(!normalization_case(false,input,Some(wrong)));
+    }
+}
+
+#[test]
+fn exact_rms_piop_rejects_sign_zero_and_neighbor_counterexamples() {
+    assert!(normalization_case(true,1024,None));
+    for bad in [-1024,0,1023,1025] {assert!(!normalization_case(true,1024,Some(bad)));}
+    assert!(normalization_case(true,0,None));
+    assert!(!normalization_case(true,0,Some(1)));
+}
+
+#[test]
+fn exact_rms_piop_rejects_wrong_private_bucket_and_forbidden_padding() {
+    assert!(normalization_case_with_bucket(true,1024,None,None));
+    for wrong in [0,1,10,12,29,31] {
+        assert!(!normalization_case_with_bucket(true,1024,None,Some(wrong)));
+    }
+}
+
+#[test]
+fn nonnegative_partial_chunks_preserve_61_62_63_bit_widths() {
+    for bits in [61,62,63] {
+        let mut b=DagBuilder::new();
+        let x=b.committed_input(Witness::new(vec![1],vec![int_to_f(0)],DataType::Int,0,Role::Input));
+        let node=b.nodes.len();b.add_nonneg_node_bits(x,bits);
+        let (d,w)=b.compile();let g=Graph::new(&d,&w,Config{tcl:4,slots_log:10,req_planes_log:5});
+        let chunks=g.chunks(node);
+        assert_eq!(chunks.iter().sum::<usize>(),bits);
+        assert_eq!(chunks.last(),Some(&(bits%4)));
+        assert!(chunks[..chunks.len()-1].iter().all(|&w|w==4));
+        // Actual selector table maxima reconstruct exactly2^bits−1, never
+        // the rounded-up2^64−1 domain that would invalidate signed lifting.
+        let mut shift=0;let mut max=0u128;
+        for w in chunks {max+=((1u128<<w)-1)<<shift;shift+=w;}
+        assert_eq!(max,(1u128<<bits)-1);
+    }
+}

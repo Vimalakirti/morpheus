@@ -40,7 +40,7 @@ pub use conv::{
 pub use einsum::Einsum;
 pub use exp::{ExpHelper, TwoPow};
 pub use instancenorm::{InstanceNorm3D, InstanceNormHelper};
-pub use llama::{DivConst, RMSReciprocal, SigmoidConst, SoftmaxConst};
+pub use llama::{DivConst, RMSBucket, RMSReciprocal, SigmoidConst, SoftmaxConst};
 pub use maxpool::{GeneralMaxPoolHelper, MaxPoolHelper, Replicate2x2};
 pub use pad::{ZeroPad, ZeroPad3D, ZeroPadAsym};
 pub use permute::Permute;
@@ -120,6 +120,7 @@ pub enum BasicBlockType {
     ReLUHelper(ReLUHelper),
     Replicate2x2(Replicate2x2),
     RMSReciprocal(RMSReciprocal),
+    RMSBucket(RMSBucket),
     ScaleDown(ScaleDown),
     ScaleUp(ScaleUp),
     ScatterToBEV(ScatterToBEV),
@@ -217,6 +218,7 @@ macro_rules! dispatch_basicblock {
             BasicBlockType::ReLUHelper(b)           => b.$method($($arg),*),
             BasicBlockType::Replicate2x2(b)         => b.$method($($arg),*),
             BasicBlockType::RMSReciprocal(b)        => b.$method($($arg),*),
+            BasicBlockType::RMSBucket(b)            => b.$method($($arg),*),
             BasicBlockType::ScaleDown(b)            => b.$method($($arg),*),
             BasicBlockType::ScaleUp(b)              => b.$method($($arg),*),
             BasicBlockType::ScatterToBEV(b)         => b.$method($($arg),*),

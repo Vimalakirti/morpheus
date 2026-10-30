@@ -1,29 +1,10 @@
 use almost_goldilocks_cuda::field::AlmostGoldilocksField;
 use ndarray::ArrayD;
-use std::sync::OnceLock;
 
 use crate::dag::{DagBuilder, DataType, EdgeId, Role, Witness};
 use crate::util::shape::pad_to_pow_of_two;
 use crate::SF_FLOAT;
 use crate::SF_LOG;
-
-/// Width (in SF=10 units) of the LayerNorm reciprocity gate
-/// `r² · mean(x²) ≈ sf`. `whisper_rms_norm` checks
-/// `|z - sf| <= recip_tolerance`. Default 2 keeps the original ±0.002
-/// float-band soundness margin; smoke-test bins that drive the LN with
-/// low-variance synthetic inputs (where integer rounding in
-/// `r² · mean(x²) / sf` exceeds ±2) can widen it via
-/// `WHISPER_RECIP_TOL`. The same env knob lifts the gate's strictness
-/// uniformly across all whisper LN instances.
-fn whisper_recip_tolerance() -> u64 {
-    static VAL: OnceLock<u64> = OnceLock::new();
-    *VAL.get_or_init(|| {
-        std::env::var("WHISPER_RECIP_TOL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2)
-    })
-}
 
 // ============================================================================
 // Whisper-specific LayerNorm (handles arbitrary seq_len)
@@ -31,13 +12,15 @@ fn whisper_recip_tolerance() -> u64 {
 
 /// LayerNorm for Whisper: works with any sequence length.
 /// Input shape: [1, S, D] (batch=1, seq=S, hidden=D).
-fn whisper_layer_norm(
+pub(crate) fn whisper_layer_norm(
     w_e: EdgeId,
     b_e: EdgeId,
 ) -> impl FnOnce(&mut DagBuilder, &[EdgeId]) -> Vec<EdgeId> {
     move |g, x| {
         assert!(x.len() == 1, "LayerNorm expects 1 input");
         let x = x[0];
+        let shape=g.init_values[x].as_ref().unwrap().shape.clone();
+        let x=g.mean_input(x,*shape.last().unwrap());
         let x_shape = g.init_values[x].as_ref().unwrap().shape.clone();
         let seq = x_shape[1];
         let n = x_shape[x_shape.len() - 1];
@@ -47,34 +30,7 @@ fn whisper_layer_norm(
         let x_mean = g.div_const(x_sum, n)[0];
         let x_mean = g.change_shape(x_mean, vec![1, seq, 1]);
 
-        let n_param: usize = g.param(Witness::new(
-            vec![1],
-            vec![AlmostGoldilocksField(n as u64)],
-            DataType::Float,
-            0,
-            Role::Constant,
-        ));
-        let mean_tolerance = g.param(Witness::new(
-            vec![1],
-            vec![AlmostGoldilocksField((n / 2) as u64)],
-            DataType::Float,
-            *SF_LOG,
-            Role::Constant,
-        ));
-        let x_mean_mul_n =
-            g.einsum("bsi,i->bsi".to_string(), vec![x_mean, n_param], false)[0];
-
-        // Reshape x_sum [1, seq] → [1, seq, 1] so the sub against
-        // x_mean_mul_n (shape [1, seq, 1]) stays element-wise per row
-        // instead of broadcasting to an outer-product [1, seq, seq].
-        // (NumPy-style left-pad would otherwise produce [1, 1, seq] vs
-        // [1, seq, 1] → [1, seq, seq], mixing rows.)
-        let x_sum_reshaped = g.change_shape(x_sum, vec![1, seq, 1]);
-        let x_sum_sub_x_mean_mul_n = g.sub(x_sum_reshaped, x_mean_mul_n)[0];
-        let positive_1 = g.add(x_sum_sub_x_mean_mul_n, mean_tolerance)[0];
-        let positive_2 = g.sub(mean_tolerance, x_sum_sub_x_mean_mul_n)[0];
-        g.add_nonneg_node(positive_1);
-        g.add_nonneg_node(positive_2);
+        // div_const emits exact deterministic rounding roots.
 
         let x_minus_mean = g.sub(x, x_mean)[0];
         let x_minus_mean = g.mask(x_minus_mean, vec![1, seq, n]);
@@ -96,60 +52,22 @@ fn whisper_rms_norm(
     move |g, x| {
         assert!(x.len() == 1, "RMSNorm expects 1 input");
         let x = x[0];
+        let shape=g.init_values[x].as_ref().unwrap().shape.clone();
+        let x=g.mean_input(x,*shape.last().unwrap());
         let x_shape = g.init_values[x].as_ref().unwrap().shape.clone();
         let n = x_shape[x_shape.len() - 1];
-        let r_old = if crate::dag::llama::exact_rms() { None } else { Some(g.rms_reciprocal(x)[0]) };
 
-        let sf = g.param(Witness::new(
-            vec![1],
-            vec![AlmostGoldilocksField(*SF_FLOAT as u64)],
-            DataType::Float,
-            *SF_LOG,
-            Role::Constant,
-        ));
-        let tolerance = g.param(Witness::new(
-            vec![1],
-            vec![AlmostGoldilocksField(whisper_recip_tolerance())],
-            DataType::Float,
-            *SF_LOG,
-            Role::Constant,
-        ));
-        let x_sq = g.einsum("bsi,bsi->bsi".to_string(), vec![x, x], true)[0];
+        let x_sq = crate::dag::llama::rms_square(g,x);
         let x_sum = g.einsum("bsi->bs".to_string(), vec![x_sq], false)[0];
         let x_mean = g.div_const(x_sum, n)[0];
         let x_mean = g.change_shape(x_mean, vec![1, seq, 1]);
-        let n_param: usize = g.param(Witness::new(
-            vec![1],
-            vec![AlmostGoldilocksField(n as u64)],
-            DataType::Float,
-            0,
-            Role::Constant,
-        ));
-        let mean_tolerance = g.param(Witness::new(
-            vec![1],
-            vec![AlmostGoldilocksField((n / 2) as u64)],
-            DataType::Float,
-            *SF_LOG,
-            Role::Constant,
-        ));
-        let x_mean_mul_n =
-            g.einsum("bsi,i->bsi".to_string(), vec![x_mean, n_param], false)[0];
+        // div_const emits exact deterministic rounding roots.
 
-        // See note in `whisper_layer_norm`: reshape x_sum so the sub is
-        // element-wise per row rather than an outer-product broadcast.
-        let x_sum_reshaped = g.change_shape(x_sum, vec![1, seq, 1]);
-        let x_sum_sub_x_mean_mul_n = g.sub(x_sum_reshaped, x_mean_mul_n)[0];
-        let positive_1 = g.add(x_sum_sub_x_mean_mul_n, mean_tolerance)[0];
-        let positive_2 = g.sub(mean_tolerance, x_sum_sub_x_mean_mul_n)[0];
-        g.add_nonneg_node(positive_1);
-        g.add_nonneg_node(positive_2);
-
-        let r = crate::dag::llama::rms_reciprocal_gate(g, r_old, x_mean, seq, sf, tolerance);
+        let r = crate::dag::llama::rms_reciprocal_gate(g, x_mean);
 
         // Key fix: change_shape to [1, seq] instead of [1, 1]
         let r = g.change_shape(r, vec![1, seq]);
-        let h = g.einsum("bsi,bs->bsi".to_string(), vec![x, r], true)[0];
-        let out = g.einsum("bsi,i->bsi".to_string(), vec![h, w_e], true)[0];
+        let out = crate::dag::llama::rms_apply(g,x,r,w_e);
         vec![out]
     }
 }
