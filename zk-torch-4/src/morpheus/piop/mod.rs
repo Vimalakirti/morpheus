@@ -137,6 +137,8 @@ pub fn witness_vals(w: &Witness) -> Arc<Vec<u64>> {
 
 impl<'a> Graph<'a> {
     pub fn new(dag: &'a Dag, wit: &[Vec<Witness>], cfg: Config) -> Self {
+        assert!(!dag.nodes.iter().any(|n| matches!(n.kind,BasicBlockType::InstanceNorm3D(_))),
+            "unconstrained legacy InstanceNorm advice cannot be registered");
         let protocol_conv_pp = cv::conv_pp();
         let ne = dag.num_edges();
         let shapes: Vec<Vec<usize>> = (0..ne).map(|e| wit[e][0].shape.clone()).collect();
@@ -248,8 +250,9 @@ impl<'a> Graph<'a> {
     }
 
     /// Stop committing tensors the PIOP never claims: non-public edges whose
-    /// every consumer is an advice node (e.g. InstanceNorm γ/β feeding only
-    /// the statistics advice). Call after `public` is set.
+    /// every consumer is an advice node. The supported InstanceNorm builder
+    /// binds γ/β through arithmetic consumers, so they are not pruned.
+    /// Call after `public` is set.
     pub fn prune_unclaimed(&mut self) {
         for e in 0..self.dag.num_edges() {
             if !self.committed[e] || self.public.contains_key(&e) { continue; }

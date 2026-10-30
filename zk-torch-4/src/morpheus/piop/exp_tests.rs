@@ -284,3 +284,77 @@ fn nonnegative_partial_chunks_preserve_61_62_63_bit_widths() {
         assert_eq!(max,(1u128<<bits)-1);
     }
 }
+
+/// Actual PIOP replay authored for InstanceNorm. Native CUDA linkage is still
+/// required by this crate; a typecheck/CPU predicate test is NOT its execution.
+#[test]
+fn instance_norm_piop_defines_statistics_affine_parameters_and_epsilon() {
+    let sf=10;let mut b=DagBuilder::new();
+    let x=b.committed_input(Witness::new(vec![1,1,1,2],vec![int_to_f(-1024),int_to_f(1024)],DataType::Float,sf,Role::Input));
+    let gamma=b.param(Witness::new(vec![1],vec![int_to_f(1024)],DataType::Float,sf,Role::Constant));
+    let beta=b.param(Witness::new(vec![1],vec![int_to_f(3)],DataType::Float,sf,Role::Constant));
+    let out=b.instancenorm3d_units(x,gamma,beta,1);let (d,mut w)=b.compile();
+    let run=|w:&mut Vec<Vec<Witness>>,mutation:Option<usize>| {
+        for &n in &d.topo {
+            let nd=&d.nodes[n];let ins=nd.inputs.iter().map(|&e|&w[e][0]).collect::<Vec<_>>();
+            let outs=nd.kind.run(&ins);
+            for (&e,mut v) in nd.outputs.iter().zip(outs) {
+                if mutation==Some(e) {
+                    let values=v.data.as_ref().unwrap().evaluations_ref().iter().map(|x|int_to_f(crate::util::arith::f_to_int(*x)+1)).collect();
+                    v=Witness::new(v.shape,values,v.data_type,v.sf,v.role);
+                }
+                w[e]=vec![v];
+            }
+        }
+    };
+    run(&mut w,None);
+    let mut g=Graph::new(&d,&w,Config{tcl:4,slots_log:12,req_planes_log:5});
+    g.prune_unclaimed();assert!(g.committed[gamma]&&g.committed[beta]);
+    let honest=||ProverData::new(&g,&w,vec![K8::ZERO;1<<12]);
+    assert!(replay(&g,&honest()));
+    for edge in [gamma,beta] {
+        let mut pd=honest();let old=pd.vals[edge].as_ref().unwrap()[0];
+        pd.vals[edge]=Some(Arc::new(vec![old-1]));
+        assert!(!replay(&g,&pd),"detached affine parameter edge={edge}");
+    }
+    let mutations=d.nodes.iter().filter(|n|matches!(n.kind,BasicBlockType::DivConst(_) | BasicBlockType::RMSReciprocal(_) | BasicBlockType::ScaleDown(_)))
+        .map(|n|n.outputs[0]).collect::<Vec<_>>();
+    for target in mutations {
+        let mut changed=w.clone();run(&mut changed,Some(target));
+        let mut pd=honest();
+        for e in 0..d.num_edges() {if changed[e][0].poly_type==PolyType::Dense && changed[e][0].data.is_some() {
+            pd.vals[e]=Some(witness_vals(&changed[e][0]));
+        }}
+        let iv=|e:usize,i:usize| {let x=pd.vals[e].as_ref().unwrap()[i];if x>Q/2 {x as i128-Q as i128}else{x as i128}};
+        let mut selectors=HashMap::new();
+        for (&node,&bits) in &g.lookups {
+            let nd=&d.nodes[node];let size=1usize<<g.nvars[nd.inputs[0]];let q=1i128<<bits;
+            let values=(0..size).map(|i| {
+                let v=match &nd.kind {
+                    BasicBlockType::NonNegative(_)=>iv(nd.inputs[0],i),
+                    BasicBlockType::ScaleDown(_)=>iv(nd.inputs[0],i)-q*iv(nd.outputs[0],i)+q/2,
+                    BasicBlockType::ScaleUp(_)=>q*iv(nd.inputs[0],i)-iv(nd.outputs[0],i)+q/2,
+                    _=>panic!("unexpected InstanceNorm lookup"),
+                };
+                // Legal selectors supplied even when the defining root is
+                // false; rejection must occur in verifier equations, not in
+                // the honest ProverData constructor's range assertion.
+                if 0<=v&&v<q {v as u64}else{0}
+            }).collect();selectors.insert(node,values);
+        }
+        pd.sel=selectors;
+        let mut attack_graph=Graph::new(&d,&w,Config{tcl:4,slots_log:12,req_planes_log:5});
+        attack_graph.prune_unclaimed();
+        attack_graph.outputs=vec![(out,pd.vals[out].as_ref().unwrap().clone())];
+        assert!(!replay(&attack_graph,&pd),"mutated normalization source edge={target}");
+    }
+    let mut pd=honest();
+    // Locate the actual epsilon literal, not an unrelated unit/range bound.
+    let recip=d.nodes.iter().find(|n|matches!(n.kind,BasicBlockType::RMSReciprocal(_))).unwrap();
+    let mask=&d.nodes[d.producers[recip.inputs[0]].unwrap()];
+    let add=&d.nodes[d.producers[mask.inputs[0]].unwrap()];
+    assert!(matches!(add.kind,BasicBlockType::Add(_)));
+    let e=add.inputs[1];let values=&d.program_literals[&e];assert_eq!(values[0],1);
+    pd.vals[e]=Some(Arc::new(vec![values[0]+1]));
+    assert!(!replay(&g,&pd));
+}

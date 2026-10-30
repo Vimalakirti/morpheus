@@ -62,7 +62,7 @@ fn operator(k: &BasicBlockType) -> Result<Vec<u64>, String> {
         },
         GatherFromGrid(b) => { w.u(18); w.us(b.n_points)?; w.us(b.channels)?; w.us(b.grid_h)?; w.us(b.grid_w)?; },
         GeneralMaxPoolHelper(b) => { w.u(19); w.us(b.channels)?; w.us(b.input_h)?; w.us(b.input_w)?; w.us(b.kernel_h)?; w.us(b.kernel_w)?; w.us(b.stride_h)?; w.us(b.stride_w)?; },
-        InstanceNorm3D(b) => { w.u(20); w.us(b.channels)?; w.us(b.depth)?; w.us(b.height)?; w.us(b.width)?; if !b.eps.is_finite() { return Err("nonfinite InstanceNorm3D.eps".into()); } w.u(b.eps.to_bits()); },
+        InstanceNorm3D(_) => return Err("unconstrained legacy InstanceNorm advice is unsupported".into()),
         MaxPoolHelper(b) => { w.u(21); w.us(b.channels)?; w.us(b.input_h)?; w.us(b.input_w)?; w.us(b.pool_h)?; w.us(b.pool_w)?; },
         NonNegative(b) => { w.u(22); w.us(b.table_size_log)?; },
         Permute(b) => { w.u(23); w.pairs(&b.ranges)?; },
@@ -338,9 +338,11 @@ mod tests {
         assert!(words(&g,&Profile::toy(),&KeySeed([1;8]),11,false,4).is_err());
     }
     #[test]
-    fn reject_nonfinite_public_parameter() {
+    fn reject_legacy_instancenorm_public_parameter() {
         use crate::basicblock::InstanceNorm3D;
         let k=BasicBlockType::InstanceNorm3D(InstanceNorm3D { channels:1,depth:1,height:1,width:1,eps:f64::NAN });
         assert!(operator(&k).is_err());
+        let finite=BasicBlockType::InstanceNorm3D(InstanceNorm3D { channels:1,depth:1,height:1,width:1,eps:1e-5 });
+        assert!(operator(&finite).is_err());
     }
 }

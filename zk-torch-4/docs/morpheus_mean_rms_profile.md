@@ -62,7 +62,7 @@ k=max(1,bit_length(h-l)). Require h-l<2^62. Their integer sum is at most
 2(2^k-1)<2^63<p, hence equals h-l, proving the interval non-circularly.
 All constants use `program_literals`, not mutable `Role::Constant` weights.
 
-Division: 1<=c<=2^20, |a|<=B=2^54-1, |y|<=floor(B/c)+1.
+Division: 1<=c<=2^24 (extended by the InstanceNorm increment), |a|<=B=2^54-1, |y|<=floor(B/c)+1.
 Mean inputs: |x|<=2^30-1 and reduction count<=2^20; padded coordinates are
 masked before summation. Hence every sum has magnitude<2^50<p/2. Checked
 axis-count multiplication rejects overflow and duplicate ReduceMean axes.

@@ -158,7 +158,7 @@ impl DagBuilder {
         let sf=self.init_values[a].as_ref().unwrap().sf;
         // Exact integer division on a public bounded domain. The registered
         // DAG includes these roots; advice alone is never the specification.
-        assert!((1..=(1 << 20)).contains(&c), "unsupported divisor");
+        assert!((1..=(1 << 24)).contains(&c), "unsupported divisor");
         const B: i128 = (1i128 << 54) - 1;
         self.integer_interval(a, -B, B);
         self.integer_interval(y, -((B / c as i128) + 1), (B / c as i128) + 1);
@@ -1812,53 +1812,6 @@ impl DagBuilder {
         outs[0]
     }
 
-    /// InstanceNorm3D: X[C,D,H,W], gamma[C], beta[C] → Y[C,D,H,W].
-    /// Decomposed: InstanceNormHelper (advice) → packed[2,C] (scale+offset),
-    /// then Y = Einsum("c,cdhw->cdhw", scale, X) + offset (proven).
-    pub fn instancenorm3d(&mut self, x: EdgeId, gamma: EdgeId, beta: EdgeId, eps: f64) -> EdgeId {
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let channels = x_shape[0];
-        let depth = x_shape[1];
-        let height = x_shape[2];
-        let width = x_shape[3];
-        let sf = self.init_values[x].as_ref().unwrap().sf;
-        let data_type = self.init_values[x].as_ref().unwrap().data_type;
-
-        // 1. InstanceNormHelper(X, gamma, beta) → packed[2, C] (advice, single output)
-        //    Group 0 = scale, Group 1 = offset
-        let norm = BasicBlockType::InstanceNorm3D(InstanceNormHelper {
-            channels, depth, height, width, eps,
-        });
-        let helper_outs = self.add_gkr_node(vec![x, gamma, beta], norm);
-        let packed = helper_outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            vec![2, channels], data_type, sf, Role::Output,
-        )));
-
-        // 2. Unpack via ChannelSlice: packed[2, C] → scale_1c[1, C] → scale[C]
-        let scale_1c = self.channel_slice(packed, 0, 1);
-        let scale = self.change_shape(scale_1c, vec![channels]);
-
-        // 3. Unpack via ChannelSlice: packed[2, C] → offset_1c[1, C] → offset[C]
-        let offset_1c = self.channel_slice(packed, 1, 1);
-        let offset = self.change_shape(offset_1c, vec![channels]);
-
-        // 4. z = Einsum("a,abcd->abcd", scale, X) — proven multiply
-        let z = self.einsum("a,abcd->abcd".to_string(), vec![scale, x], true)[0];
-
-        // 5. Y = Add(z, offset_4d) — proven broadcast add
-        //    offset has shape [C], but broadcast_shape right-aligns to [1,1,1,C].
-        //    We need left-alignment [C,1,1,1] so channel dim broadcasts correctly.
-        let offset_4d = self.change_shape(offset, vec![channels, 1, 1, 1]);
-        let y = self.add(z, offset_4d)[0];
-
-        // 6. Mask padding channels if non-power-of-2 channel count.
-        //    Add broadcasting may introduce non-zero values in padding region.
-        let y = self.mask_channels(y, 4);
-
-        y
-    }
-
     /// Mask non-power-of-2 channel dimensions by multiplying with a binary mask.
     /// mask[c] = 1 for c < actual_channels, mask[c] = 0 for c >= actual_channels.
     /// This ensures the MLE padding region is exactly zero, which is required for
@@ -1997,6 +1950,7 @@ impl DagBuilder {
         while cursor<self.nodes.len() {
             let node=self.nodes[cursor].clone();cursor+=1;
             match node.kind {
+                BasicBlockType::InstanceNorm3D(_)=>panic!("unconstrained legacy InstanceNorm advice is unsupported; use instancenorm3d"),
                 BasicBlockType::DivConst(b)=>self.division_guards(node.inputs[0],node.outputs[0],usize::try_from(b.divisor).expect("divisor too large")),
                 BasicBlockType::RMSReciprocal(b)=>{
                     assert_eq!(b.dim,0,"legacy unconstrained RMS advice is unsupported; use the exact mean gate");

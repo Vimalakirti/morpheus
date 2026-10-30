@@ -11,6 +11,7 @@ pub mod streaming_accumulator;
 pub mod gpt2;
 pub mod gptj;
 pub mod lenet;
+pub mod instancenorm;
 pub mod llama;
 pub mod lookups;
 pub mod nanogpt;
@@ -1296,3 +1297,6 @@ mod tests {
 
 #[cfg(test)]
 mod normalization_tests;
+
+#[cfg(test)]
+mod instancenorm_tests;
