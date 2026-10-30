@@ -419,7 +419,12 @@ fn key_devs<'k>(pc: &'k PcsGpu, reps: &'k [AuthReplica]) -> Vec<(i32, &'k auth_g
 fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::LinkOutput, t1: &MTranscript, times: &mut Times) -> AuthProof {
     let t = Instant::now();
     pc.kept_to_phys();
-    pc.ensure_w();
+    // Rebuild the resident source key cache if it fits next to the kept
+    // shards; otherwise the authentication generates it in column chunks.
+    almost_goldilocks_cuda::set_device(0).unwrap();
+    let w_bytes = 5 * (o.profile.source_cols() - o.profile.rank) * o.profile.rank * super::ring::N * 4;
+    let fits = almost_goldilocks_cuda::mem_get_info().map(|(free, _)| free > w_bytes + (6usize << 30)).unwrap_or(false);
+    if fits { pc.ensure_w(); }
     let k = pc.kept.lock().unwrap();
     let shards: Vec<auth_gpu::ShardSrc> = k.iter().map(|sh| {
         almost_goldilocks_cuda::set_device(sh.dev).unwrap();
@@ -429,7 +434,7 @@ fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::L
     almost_goldilocks_cuda::set_device(0).unwrap();
     let s_o = DeviceBuffer::from_slice(&fast.s_o.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
     let mut tm = AuthTiming::default();
-    let (apf, _) = auth_gpu::prove_sharded(&o.profile, &pc.keys, &shards, &s_o, fast.sources.len(), &o.coins, opening, t1, &fast.point, true, &mut tm).expect("authentication");
+    let (apf, _) = auth_gpu::prove_sharded(&o.profile, &pc.keys, if pc.keys.w.buf.len() > 1 { None } else { Some(&o.seed) }, &shards, &s_o, fast.sources.len(), &o.coins, opening, t1, &fast.point, true, &mut tm).expect("authentication");
     drop(k);
     let secs = lap(times, "auth", t);
     if o.timing { eprintln!("[auth, sharded] {:.2}s, attempt {} {:?}", secs, apf.attempt, tm); }
@@ -518,8 +523,10 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         let c_req = if stream {
             pc.streamed = true;
             let c = commit_streamed(o, pc, &raw);
-            // The source key cache is rebuilt for the authentication.
-            if !extra_devs().is_empty() { pc.drop_w(); }
+            // The source key cache (43 GB at the ternary profile) is freed
+            // for the link's resident sources and rebuilt for the
+            // authentication, also on a single GPU.
+            pc.drop_w();
             c
         } else {
             pc.streamed = false;

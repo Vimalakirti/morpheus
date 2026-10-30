@@ -101,6 +101,9 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
                 let parts = crate::morpheus::wire::parts(&o.profile, &pf);
                 println!("  proof parts (bytes): {}", parts.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", "));
             }
+            // The verifier's source key cache (setup, untimed): the prover
+            // may have freed it for the link.
+            pc.ensure_w();
             let r = request::verify_request(&pp, &o, j, model_reg.as_ref().map(|m| m.public()), input_reg.public(), &pf, &pc.keys, &mut vt);
             let vs = show(&format!("request {j} verify ({})", r.is_some()), &vt);
             assert!(r.is_some(), "request {j} rejected");
@@ -135,6 +138,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
                 let vq: Vec<QueueEntry> = range.clone().map(|j| { let (rows, dg, cc, literal_prefix) = &vqueue[j]; QueueEntry { j: j as u64, deferred: rows, c_carry: cc.as_ref().unwrap(), digest: *dg, literal_prefix } }).collect();
                 let mut vt = Times::new();
                 vt.insert("decode", dec);
+                pc.ensure_w();
                 let ok = request::verify_final(&pp, &o, b as u64, m.public(), &vq, &fpf, &pc.keys, &mut vt);
                 fv = show(&format!("finalize batch {b} verify ({ok})"), &vt);
                 assert!(ok, "finalization rejected");

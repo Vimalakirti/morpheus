@@ -195,6 +195,9 @@ impl<'a> Graph<'a> {
                 "program literal must be a public input leaf");
             (e, Arc::new(v.clone()))
         }).collect();
+        // Program literals are public program data: the verifier evaluates
+        // them itself (Walk::push), so they are not committed.
+        for &e in dag.program_literals.keys() { committed[e] = false; }
         // Terminal outputs: unconsumed first outputs of compute nodes (not the
         // zero certificate of a product check, not lookup gates).
         let outputs: Vec<(usize, Arc<Vec<u64>>)> = (0..ne).filter(|&e| {
@@ -777,14 +780,28 @@ impl<'g, 'a> Walk<'g, 'a> {
         backend_tables!(gpu::enabled() && (1usize << r.len()) >= gpu::threshold(), { gpu::mle(&pd.dev(e), r) }, { mle(pd.v(e), r) })
     }
 
-    /// A claim on edge e: a row if e is committed, else pending.
+    /// MLE of a public program literal. A constant table (the interval
+    /// bounds) evaluates to its constant at every point.
+    fn literal_eval(&self, e: usize, r: &[K8]) -> K8 {
+        let v = &self.g.public[&e];
+        if v.len() == 1usize << r.len() && v.iter().all(|&x| x == v[0]) { K8::from_base(v[0]) } else { mle(v, r) }
+    }
+
+    /// A claim on edge e: a row if e is committed, a direct check if e is a
+    /// public program literal, else pending.
     fn push(&mut self, ctx: &mut Ctx, e: usize, c: AClaim) {
         ctx.check_pad_row(&c.pad);
         if ctx.prover && selfcheck() {
             let truth = self.mle_e(e, &c.point).add(&ctx.lin_val(&c.pad));
             assert!(truth == c.z, "prover produced a false claim on edge {e}");
         }
-        if self.g.committed[e] {
+        if !self.g.committed[e] && self.g.dag.program_literals.contains_key(&e) {
+            // Public program literal: both parties evaluate it, and only the
+            // pad part of the claim remains for the link.
+            let y = self.literal_eval(e, &c.point);
+            if c.pad.values().all(|v| v.is_zero()) { ctx.check(c.z == y, "public literal claim"); }
+            else { ctx.row(Vec::new(), &c.pad, c.z.sub(&y)); }
+        } else if self.g.committed[e] {
             let t0 = std::time::Instant::now();
             let p = ctx.lay.get(&TKey::Edge(e)).p;
             let terms = ctx.lay.terms(&TKey::Edge(e), &c.point, &value_pw(p), K8::ONE);
@@ -843,6 +860,7 @@ impl<'g, 'a> Walk<'g, 'a> {
         let mut pubs: Vec<usize> = self.g.public.keys().copied().collect();
         pubs.sort();
         for e in pubs {
+            if !self.g.committed[e] { continue; }
             let r = ctx.chals(self.g.nvars[e]);
             let y = mle(&self.g.public[&e], &r);
             let p = ctx.lay.get(&TKey::Edge(e)).p;

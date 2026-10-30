@@ -132,7 +132,7 @@ fn run_attempt(
         }
         timing.sample_ms += t0.elapsed().as_secs_f64() * 1e3;
         let t0 = Instant::now();
-        let (d, d_o) = first_message(p, keys, &dp, &uw, &ul, &uo);
+        let (d, d_o) = first_message(p, keys, None, &dp, &uw, &ul, &uo);
         let _ = &dp.degs;
         timing.first_msg_ms += t0.elapsed().as_secs_f64() * 1e3;
         let t0 = Instant::now();
@@ -194,7 +194,7 @@ unsafe impl Sync for ShardSrc {}
 /// share of the responses, summed on the host. Same output as `run_attempt`.
 #[allow(clippy::too_many_arguments)]
 fn run_attempt_sharded(
-    p: &Profile, keys: &Keys, shards: &[ShardSrc], s_o: &DeviceBuffer<i8>, n: usize, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, attempt: u16, timing: &mut AuthTiming,
+    p: &Profile, keys: &Keys, seed: Option<&KeySeed>, shards: &[ShardSrc], s_o: &DeviceBuffer<i8>, n: usize, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, attempt: u16, timing: &mut AuthTiming,
 ) -> Result<AttemptOut, AuthError> {
     almost_goldilocks_cuda::set_device(0).expect("set device");
     let fs = FastSigma::new(p.sigma);
@@ -216,7 +216,7 @@ fn run_attempt_sharded(
     }
     timing.sample_ms += t0.elapsed().as_secs_f64() * 1e3;
     let t0 = Instant::now();
-    let (d, d_o) = first_message(p, keys, &dp, &uw, &ul, &uo);
+    let (d, d_o) = first_message(p, keys, seed, &dp, &uw, &ul, &uo);
     timing.first_msg_ms += t0.elapsed().as_secs_f64() * 1e3;
     let t0 = Instant::now();
     let beta = super::auth::challenges_pub(tr, &d, &d_o, attempt, n);
@@ -306,10 +306,10 @@ fn run_attempt_sharded(
 /// `prove` on the same inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_sharded(
-    p: &Profile, keys: &Keys, shards: &[ShardSrc], s_o: &DeviceBuffer<i8>, n: usize, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, keep_z: bool, timing: &mut AuthTiming,
+    p: &Profile, keys: &Keys, seed: Option<&KeySeed>, shards: &[ShardSrc], s_o: &DeviceBuffer<i8>, n: usize, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, keep_z: bool, timing: &mut AuthTiming,
 ) -> Result<AuthOut, AuthError> {
     for attempt in 0..p.attempts as u16 {
-        let o = run_attempt_sharded(p, keys, shards, s_o, n, coins, opening, tr, pt, attempt, timing)?;
+        let o = run_attempt_sharded(p, keys, seed, shards, s_o, n, coins, opening, tr, pt, attempt, timing)?;
         match o.verdict {
             Coin::Accept => { let t = Instant::now(); let out = accept(p, attempt, o, keep_z); timing.extract_ms += t.elapsed().as_secs_f64() * 1e3; return Ok(out); }
             Coin::Reject => {}
@@ -321,11 +321,32 @@ pub fn prove_sharded(
 
 /// (f_x, f_ox) of τ rows of device blocks laid out [row][cols][N] (i64):
 /// the prover's first messages on the masks, the verifier's left sides on z.
-fn first_message(p: &Profile, keys: &Keys, dp: &DevPoint, uw: &DeviceBuffer<i64>, ul: &DeviceBuffer<i64>, uo: &DeviceBuffer<i64>) -> (Vec<Tuple>, Vec<AuxTuple>) {
+/// A·u over the payload and hiding columns of both source rows. Without a
+/// resident source key cache (it was freed for the link), the key is
+/// generated from `seed` in column chunks and the NTT-domain partial
+/// products are summed; the result is the same.
+fn source_product(p: &Profile, keys: &Keys, seed: Option<&KeySeed>, uw: &DeviceBuffer<i64>) -> DeviceBuffer<u64> {
+    let (sw, c) = (p.source_cols(), p.source_cols() - p.rank);
+    if keys.w.buf.len() > 1 {
+        return finish(partial_raw(&keys.w, 5, uw.as_ptr() as *const c_void, 8, 2, c, sw * N, None), 2, 5, p.rank, None);
+    }
+    let seed = seed.expect("source key cache dropped and no key seed for chunked generation");
+    let chunk: usize = std::env::var("MORPHEUS_W_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).max(1);
+    let mut acc: Option<DeviceBuffer<u32>> = None;
+    for c0 in (0..c).step_by(chunk) {
+        let nc = chunk.min(c - c0);
+        let key = KeyCache::build(seed, KeyKind::Source, p.rank, c0 as u64, nc, 5);
+        let part = partial_raw(&key, 5, unsafe { uw.as_ptr().add(c0 * N) } as *const c_void, 8, 2, nc, sw * N, None);
+        match acc.as_mut() { Some(a) => super::commit_gpu::add(a, &part, 2, 5, p.rank), None => acc = Some(part) }
+    }
+    finish(acc.expect("no source columns"), 2, 5, p.rank, None)
+}
+
+fn first_message(p: &Profile, keys: &Keys, seed: Option<&KeySeed>, dp: &DevPoint, uw: &DeviceBuffer<i64>, ul: &DeviceBuffer<i64>, uo: &DeviceBuffer<i64>) -> (Vec<Tuple>, Vec<AuxTuple>) {
     let (sw, sl, so) = (p.source_cols(), p.link_cols(), p.aux_cols());
     let degs = p.degs();
     let half = K8::ONE.scale((Q + 1) / 2);
-    let cw = ring_rows(finish(partial_raw(&keys.w, 5, uw.as_ptr() as *const c_void, 8, 2, sw - p.rank, sw * N, None), 2, 5, p.rank, None).to_vec().unwrap(), p.rank);
+    let cw = ring_rows(source_product(p, keys, seed, uw).to_vec().unwrap(), p.rank);
     let cl = ring_rows(finish(partial_raw(&keys.l, 5, ul.as_ptr() as *const c_void, 8, 2, sl - p.rank, sl * N, None), 2, 5, p.rank, None).to_vec().unwrap(), p.rank);
     let co = ring_rows(finish(partial_raw(&keys.o, 5, uo.as_ptr() as *const c_void, 8, 2, so - p.rank, so * N, None), 2, 5, p.rank, None).to_vec().unwrap(), p.rank);
     let (mut d, mut d_o) = (Vec::new(), Vec::new());
@@ -488,7 +509,7 @@ pub fn verify(p: &Profile, keys: &Keys, tr: &MTranscript, pt: &Point, targets: &
         }
     }
     let dp = DevPoint::new(p, pt);
-    let (lhs, lhs_o) = first_message(p, keys, &dp, &zw, &zl, &zo);
+    let (lhs, lhs_o) = first_message(p, keys, None, &dp, &zw, &zl, &zo);
     for r in 0..p.tau {
         let acted: Vec<Tuple> = targets.par_iter().enumerate().map(|(e, t)| act_tuple(&beta[r][e], t)).collect();
         let rhs = acted.iter().fold(pf.d[r].clone(), |acc, t| add_tuple(&acc, t));
@@ -549,6 +570,24 @@ mod tests {
         assert_eq!(gpu.z, cpu.z);
         assert!(auth::verify(&p, &seed, &tr, &pt, &targets, &target_o, &gpu));
         let _ = rng.gen::<u8>();
+    }
+
+    #[test]
+    fn chunked_source_product_equals_cached_product() {
+        let p = Profile::toy();
+        let seed = KeySeed([5; 8]);
+        let mut keys = Keys::build(&p, &seed);
+        let sw = p.source_cols();
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(7);
+        let u: Vec<i64> = (0..2 * sw * N).map(|_| rng.gen_range(-1_000_000_000i64..1_000_000_000)).collect();
+        let uw = DeviceBuffer::from_slice(&u).unwrap();
+        let full = source_product(&p, &keys, None, &uw).to_vec().unwrap();
+        keys.w = KeyCache { buf: DeviceBuffer::<u32>::new(1).unwrap(), ..keys.w.clone_meta() };
+        for chunk in ["1", "2", "100"] {
+            std::env::set_var("MORPHEUS_W_CHUNK", chunk);
+            assert_eq!(source_product(&p, &keys, Some(&seed), &uw).to_vec().unwrap(), full, "chunk {chunk}");
+        }
+        std::env::remove_var("MORPHEUS_W_CHUNK");
     }
 
     #[test]
