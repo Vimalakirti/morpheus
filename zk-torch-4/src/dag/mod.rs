@@ -439,6 +439,10 @@ pub struct Node {
 /// tree protocol; the structural plumbing here is shared between zk-torch-3
 /// and zk-torch-4.
 pub struct Dag {
+    /// Four canonical exp domain/remainder range roots per helper.
+    pub(crate) exp_guard_nodes: std::collections::BTreeMap<NodeId, [NodeId; 4]>,
+    /// Verifier-trusted literal values, frozen by the builder (never request data).
+    pub(crate) program_literals: std::collections::BTreeMap<EdgeId, Vec<u64>>,
     pub nodes: Vec<Node>,
     pub num_edges: usize,
     pub topo: Vec<NodeId>,

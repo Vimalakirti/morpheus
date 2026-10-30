@@ -1,4 +1,4 @@
-//! Canonical PUBLIC statement codec, version 1. This binds a verifier-trusted
+//! Canonical PUBLIC statement codec, version 2. This binds a verifier-trusted
 //! DAG; it is NOT a proof that a compiler implements the intended model.
 //! Private tensor payloads, advice, and Coins never enter this module. Fixed
 //! private model values must be identified separately by pinned commitments.
@@ -54,7 +54,12 @@ fn operator(k: &BasicBlockType) -> Result<Vec<u64>, String> {
         Einsum(b) => { w.u(14); w.bytes(b.equation.as_bytes())?; w.nested(&b.input_shapes)?; w.usizes(&b.output_shape)?; let (perms, rounds) = b.public_schedule(); w.us(perms.len())?; for p in perms { w.pairs(p)?; } w.us(rounds)?; },
         FlattenKernel(b) => { w.u(15); w.us(b.s_w)?; w.us(b.kh)?; w.us(b.kw)?; w.us(b.c_out)?; w.us(b.c_in)?; w.us(b.dilation_h)?; w.us(b.dilation_w)?; },
         FlattenKernel3D(b) => { w.u(16); w.us(b.stride_h)?; w.us(b.stride_w)?; w.us(b.kd)?; w.us(b.kh)?; w.us(b.kw)?; w.us(b.c_out)?; w.us(b.c_in)?; },
-        ExpHelper(b) => { w.u(17); w.us(b.num_bits)?; },
+        ExpHelper(b) => {
+            if !(1..=8).contains(&b.num_bits) || *crate::SF_LOG > 30 { return Err("unsupported exp profile".into()); }
+            w.u(17); w.us(b.num_bits)?;
+            w.u(crate::basicblock::exp::exp_ln2(*crate::SF_LOG) as u64);
+            w.bytes(b"canonical-nonpositive-unclipped-exp-v1")?;
+        },
         GatherFromGrid(b) => { w.u(18); w.us(b.n_points)?; w.us(b.channels)?; w.us(b.grid_h)?; w.us(b.grid_w)?; },
         GeneralMaxPoolHelper(b) => { w.u(19); w.us(b.channels)?; w.us(b.input_h)?; w.us(b.input_w)?; w.us(b.kernel_h)?; w.us(b.kernel_w)?; w.us(b.stride_h)?; w.us(b.stride_w)?; },
         InstanceNorm3D(b) => { w.u(20); w.us(b.channels)?; w.us(b.depth)?; w.us(b.height)?; w.us(b.width)?; if !b.eps.is_finite() { return Err("nonfinite InstanceNorm3D.eps".into()); } w.u(b.eps.to_bits()); },
@@ -83,7 +88,7 @@ fn operator(k: &BasicBlockType) -> Result<Vec<u64>, String> {
 
 /// Public protocol setup identity (no private randomness).
 fn setup(w: &mut Words, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_log: usize) -> Result<(), String> {
-    w.bytes(b"morpheus-public-statement")?; w.u(1);
+    w.bytes(b"morpheus-public-statement")?; w.u(2);
     w.bytes(p.name.as_bytes())?;
     w.usizes(&[p.rank,p.tau,p.hiding,p.source_payload_cols,p.aux_coeffs,p.deg_old,p.deg_final])?;
     w.u(p.sigma); w.u(p.b_z); for v in p.raw_noise { w.u(v); }
@@ -150,6 +155,7 @@ fn encode(g: &Graph, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_
     if g.cfg.tcl == 0 || g.cfg.tcl >= usize::BITS as usize || g.cfg.slots_log >= usize::BITS as usize || g.cfg.req_planes_log >= usize::BITS as usize {
         return Err("invalid graph configuration width".into());
     }
+    g.validate_exp_profile()?;
     let mut w = Words::default(); setup(&mut w,p,seed,b0,defer,carry_log)?;
     w.u(u64::from(values));
     w.usizes(&[g.cfg.tcl,g.cfg.slots_log,g.cfg.req_planes_log])?;
@@ -162,6 +168,8 @@ fn encode(g: &Graph, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_
         w.us(n.id)?; let op = operator(&n.kind)?; w.us(op.len())?; w.0.extend(op);
         w.usizes(&n.inputs)?; w.usizes(&n.outputs)?;
     }
+    w.us(d.exp_guard_nodes.len())?;
+    for (&n,ids) in &d.exp_guard_nodes { w.us(n)?; w.usizes(ids)?; }
     w.usizes(&d.topo)?; w.nested(&d.topo_levels)?;
     w.usizes(&d.range)?; w.usizes(&d.two_pow)?;
     w.nested(&d.consumers)?;
@@ -194,6 +202,16 @@ fn encode(g: &Graph, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_
     }
     w.us(g.lookups.len())?;
     for (&n,&bits) in &g.lookups { if n >= nn || bits >= usize::BITS as usize { return Err("invalid lookup descriptor".into()); } w.us(n)?; w.us(bits)?; }
+    // Registry membership and VALUES belong to program identity, unlike request
+    // inputs. Refuse even request-time replacement of an immutable literal.
+    w.us(d.program_literals.len())?;
+    for (&e, v) in &d.program_literals {
+        if e >= ne || d.producers[e].is_some() || g.edge_meta[e].3 != Role::Input
+            || g.public.get(&e).map(|x| x.as_slice()) != Some(v.as_slice()) {
+            return Err("program literal missing, overwritten, or not an input leaf".into());
+        }
+        public_array(&mut w,g,e,v,true)?;
+    }
     let mut public: Vec<_> = g.public.iter().collect(); public.sort_unstable_by_key(|(e,_)| **e);
     w.us(public.len())?;
     for (&e,v) in public { public_array(&mut w,g,e,v,values)?; }
@@ -297,6 +315,26 @@ mod tests {
         g.shapes[0] = vec![1,4]; assert_ne!(registered,model(&g)); g.shapes[0] = vec![2,2];
         g.edge_meta[0].3 = Role::Auxiliary; assert_ne!(registered,model(&g)); g.edge_meta[0].3 = Role::Input;
         g.cfg.tcl += 1; assert_ne!(registered,model(&g));
+    }
+    #[test]
+    fn program_literal_values_frozen_but_private_weights_remain_hidden() {
+        use almost_goldilocks_cuda::field::AlmostGoldilocksField as F;
+        let make = |literal, weight| {
+            let mut b=DagBuilder::new();
+            b.public_literal(Witness::new(vec![2],vec![F(literal);2],DataType::Uint,0,Role::Constant));
+            b.param(Witness::new(vec![2],vec![F(weight);2],DataType::Uint,0,Role::Constant));
+            b.compile()
+        };
+        let (d1,w1)=make(17,99); let (d2,w2)=make(18,99); let (d3,w3)=make(17,100);
+        let g1=Graph::new(&d1,&w1,Config::default());
+        let g2=Graph::new(&d2,&w2,Config::default());
+        let g3=Graph::new(&d3,&w3,Config::default());
+        let id=|g:&Graph| model_words(g,&Profile::toy(),&KeySeed([1;8]),11,true,4).unwrap();
+        assert_ne!(id(&g1),id(&g2)); assert_eq!(id(&g1),id(&g3));
+        assert!(g1.public.contains_key(&0)); assert!(!g1.public.contains_key(&1));
+        assert!(!g1.model[0]); assert!(g1.model[1]);
+        let mut g=Graph::new(&d1,&w1,Config::default()); g.public.remove(&0);
+        assert!(words(&g,&Profile::toy(),&KeySeed([1;8]),11,false,4).is_err());
     }
     #[test]
     fn reject_nonfinite_public_parameter() {

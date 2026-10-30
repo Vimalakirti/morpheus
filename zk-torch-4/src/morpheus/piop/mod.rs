@@ -30,6 +30,8 @@ pub mod cv;
 pub mod gpu;
 pub mod layout;
 pub mod tensor;
+#[cfg(test)]
+mod exp_tests;
 
 use crate::basicblock::BasicBlockType;
 use crate::dag::{Dag, PolyType, Role, Witness};
@@ -112,7 +114,7 @@ fn advice_kind(k: &BasicBlockType) -> bool {
 }
 
 /// ln2 in the ExpHelper fixed point.
-fn exp_ln2() -> i128 { (2.0_f64.ln() * (*crate::SF_FLOAT as f64)).round() as i128 }
+fn exp_ln2() -> i128 { crate::basicblock::exp::exp_ln2(*crate::SF_LOG) }
 
 /// 2^h·Θ^a for W_G plane b = 64a + h.
 fn wg_monomials() -> &'static Arc<Vec<K8>> {
@@ -170,7 +172,11 @@ impl<'a> Graph<'a> {
                 _ => {}
             }
         }
-        let public = HashMap::new();
+        let public = dag.program_literals.iter().map(|(&e,v)| {
+            assert!(dag.producers[e].is_none() && wit[e][0].role == Role::Input,
+                "program literal must be a public input leaf");
+            (e, Arc::new(v.clone()))
+        }).collect();
         // Terminal outputs: unconsumed first outputs of compute nodes (not the
         // zero certificate of a product check, not lookup gates).
         let outputs: Vec<(usize, Arc<Vec<u64>>)> = (0..ne).filter(|&e| {
@@ -178,7 +184,67 @@ impl<'a> Graph<'a> {
             dag.consumers[e].is_empty() && w.role == Role::Output && w.data.is_some() && !committed[e]
                 && dag.producers[e].map(|p| { let nd = &dag.nodes[p]; nd.outputs[0] == e && !matches!(nd.kind, BasicBlockType::ProductZeroCheck(_) | BasicBlockType::NonNegative(_)) }).unwrap_or(false)
         }).map(|e| (e, witness_vals(&wit[e][0]))).collect();
-        Graph { dag, shapes, edge_meta, nvars, committed, model, bool_typed, lookups, public, outputs, cfg, protocol_conv_pp }
+        let g = Graph { dag, shapes, edge_meta, nvars, committed, model, bool_typed, lookups, public, outputs, cfg, protocol_conv_pp };
+        g.validate_exp_profile().expect("invalid canonical exp guard graph");
+        g
+    }
+
+    /// Fail closed when a manually assembled/mutated graph omits any canonical
+    /// exp gate. Called by both construction and the verifier statement codec.
+    pub(crate) fn validate_exp_profile(&self) -> Result<(), String> {
+        let d = self.dag;
+        let helpers: Vec<_> = d.nodes.iter().filter(|n| matches!(n.kind, BasicBlockType::ExpHelper(_))).collect();
+        if helpers.len() != d.exp_guard_nodes.len() { return Err("exp guard registry mismatch".into()); }
+        let sub = |e: usize| -> Result<(usize,usize),String> {
+            let n = d.producers.get(e).and_then(|x| *x).and_then(|n| d.nodes.get(n)).ok_or("exp guard missing subtraction")?;
+            if !matches!(n.kind, BasicBlockType::Sub(_)) || n.inputs.len()!=2 || n.outputs.as_slice()!=[e] {
+                return Err("exp guard must be subtraction".into());
+            }
+            Ok((n.inputs[0],n.inputs[1]))
+        };
+        for n in helpers {
+            let bits = match &n.kind { BasicBlockType::ExpHelper(h) => h.num_bits, _=>unreachable!() };
+            if !(1..=8).contains(&bits) || *crate::SF_LOG>30 || n.inputs.len()!=1 || n.outputs.len()!=2 {
+                return Err("unsupported exp profile".into());
+            }
+            if self.lookups.get(&n.id) != Some(&bits) || self.cfg.tcl==0 {
+                return Err("exp selector width/configuration mismatch".into());
+            }
+            if self.cfg.tcl<4 && bits>self.cfg.tcl && d.nodes.iter().any(|tp|
+                matches!(tp.kind,BasicBlockType::TwoPow(_)) && tp.inputs.first()==n.outputs.get(1)) {
+                return Err("chunked TwoPow requires first chunk width at least four".into());
+            }
+            let x=n.inputs[0]; let r=n.outputs[0];
+            if self.edge_meta[x].2 != *crate::SF_LOG || self.edge_meta[r].2 != *crate::SF_LOG || self.shapes[x]!=self.shapes[r] || self.committed[r] {
+                return Err("exp scale/shape mismatch".into());
+            }
+            let l=exp_ln2(); let bound=(1i128<<bits)*l-l/2-1;
+            let width=|v:i128| (128-(v as u128).leading_zeros() as usize).max(1);
+            let ids=d.exp_guard_nodes.get(&n.id).ok_or("missing exp guards")?;
+            let mut es=[0;4];
+            for j in 0..4 {
+                let guard=d.nodes.get(ids[j]).ok_or("missing exp range node")?;
+                let expected=if j<2 {width(bound)} else {width(l-1)};
+                if !matches!(&guard.kind, BasicBlockType::NonNegative(b) if b.table_size_log==expected)
+                    || guard.inputs.len()!=1 || !d.range.contains(&ids[j]) || self.lookups.get(&ids[j])!=Some(&expected) {
+                    return Err("wrong exp range guard".into());
+                }
+                es[j]=guard.inputs[0];
+                if self.shapes[es[j]]!=self.shapes[x] || self.committed[es[j]] { return Err("exp guard shape mismatch".into()); }
+            }
+            let (z,a)=sub(es[0])?; let (b,nx)=sub(es[1])?;
+            let (h,rr)=sub(es[2])?; let (lm1,rho)=sub(es[3])?;
+            if (a,nx,rr,rho)!=(x,es[0],r,es[2]) {return Err("disconnected exp guard".into());}
+            for (e,v) in [(z,0),(b,bound),(h,l/2),(lm1,l-1)] {
+                let vals=d.program_literals.get(&e).ok_or("exp bound is not an immutable literal")?;
+                if self.shapes[e]!=self.shapes[x] || self.edge_meta[e].2!=*crate::SF_LOG
+                    || vals.len()!=1usize.checked_shl(self.nvars[x] as u32).ok_or("exp shape overflow")?
+                    || vals.iter().any(|&a| a!=v as u64) || self.public.get(&e).map(|a|a.as_slice())!=Some(vals.as_slice()) {
+                    return Err("wrong exp literal bound".into());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stop committing tensors the PIOP never claims: non-public edges whose

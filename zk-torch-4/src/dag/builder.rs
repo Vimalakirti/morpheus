@@ -15,6 +15,7 @@ fn letters(a: usize) -> String {
 
 /// DagBuilder: DSL for constructing the computation graph.
 pub struct DagBuilder {
+    pub(crate) program_literals: std::collections::BTreeMap<EdgeId, Vec<u64>>,
     pub nodes: Vec<Node>,
     pub num_edges: usize,
     pub init_values: Vec<Option<Witness>>,
@@ -30,6 +31,7 @@ pub struct DagBuilder {
 impl DagBuilder {
     pub fn new() -> Self {
         Self {
+            program_literals: Default::default(),
             nodes: Vec::new(),
             num_edges: 0,
             init_values: Vec::new(),
@@ -61,6 +63,41 @@ impl DagBuilder {
         assert_eq!(t.role, Role::Constant, "Parameters must be constants");
         self.init_values.push(Some(t));
         e
+    }
+
+    /// Immutable public program data, NOT a private model weight or request input.
+    /// Its canonical values are frozen into both program and request identities.
+    pub fn public_literal(&mut self, mut t: Witness) -> EdgeId {
+        assert_eq!(t.poly_type, crate::dag::PolyType::Dense, "literal must be dense");
+        let values = t.data.as_ref().expect("literal requires data").evaluations()
+            .iter().map(|x| x.reduce().0).collect();
+        t.role = Role::Input;
+        let e = self.committed_input(t);
+        self.program_literals.insert(e, values);
+        e
+    }
+
+    /// Dense full-padded literal used for integer range constraints.
+    fn integer_literal(&mut self, shape: Vec<usize>, value: i128, sf: usize) -> EdgeId {
+        let n = shape.iter().map(|s| s.next_power_of_two()).product();
+        self.public_literal(Witness::new(shape, vec![int_to_f(value); n], DataType::Float, sf, Role::Input))
+    }
+
+    /// Integer interval certificate. Both sides are lookup roots, with a
+    /// common authenticated small sum; the field relation therefore lifts.
+    fn integer_interval(&mut self, a: EdgeId, lo: i128, hi: i128) {
+        assert!(lo <= hi && hi-lo < (1i128<<40), "unsupported interval budget");
+        let w=self.init_values[a].as_ref().unwrap();
+        let shape=w.shape.clone(); let sf=w.sf;
+        let low=self.integer_literal(shape.clone(),lo,sf);
+        let high=self.integer_literal(shape,hi,sf);
+        let above=self.sub(a,low)[0];
+        let below=self.sub(high,a)[0];
+        self.init_values[above].as_mut().unwrap().role=Role::Output;
+        self.init_values[below].as_mut().unwrap().role=Role::Output;
+        let bits=(128-((hi-lo) as u128).leading_zeros() as usize).max(1);
+        self.add_nonneg_node_bits(above,bits);
+        self.add_nonneg_node_bits(below,bits);
     }
 
     /// Create a leaf edge with a known value but a NON-`Constant` role
@@ -187,7 +224,7 @@ impl DagBuilder {
         let pad_val_arr = pad_to_pow_of_two(&val_arr, &AlmostGoldilocksField(0));
         let col_major_output: Vec<_> = pad_val_arr.view().reversed_axes().iter().cloned().collect();
         let mask = Witness::new(raw_mask_shape, col_major_output, DataType::Float, 0, Role::Constant);
-        let e = self.param(mask);
+        let e = self.public_literal(mask);
         let out = self.einsum(format!("{},{}->{}", s, s, s), vec![a, e], false);
         out[0]
     }
@@ -238,7 +275,7 @@ impl DagBuilder {
             sf,
             Role::Constant,
         );
-        let mask_id = self.param(mask);
+        let mask_id = self.public_literal(mask);
         self.add(scores, mask_id)[0]
     }
 
@@ -266,7 +303,12 @@ impl DagBuilder {
                 self.init_values[b].as_ref().unwrap(),
             ];
             let mut out = add_basicblock.run(inps_values.as_slice()).first().unwrap().to_owned();
-            out.role = Role::Constant;
+            // Having eager data does not make a request-dependent edge a
+            // model parameter. Only model-only precomputation may be shared.
+            out.role = if self.init_values[a].as_ref().unwrap().role == Role::Constant
+                && self.init_values[b].as_ref().unwrap().role == Role::Constant {
+                Role::Constant
+            } else { Role::Output };
             out
         };
         self.init_values.push(Some(out_value));
@@ -298,7 +340,12 @@ impl DagBuilder {
                 self.init_values[b].as_ref().unwrap(),
             ];
             let mut out = sub_basicblock.run(inps_values.as_slice()).first().unwrap().to_owned();
-            out.role = Role::Constant;
+            // Having eager data does not make a request-dependent edge a
+            // model parameter. Only model-only precomputation may be shared.
+            out.role = if self.init_values[a].as_ref().unwrap().role == Role::Constant
+                && self.init_values[b].as_ref().unwrap().role == Role::Constant {
+                Role::Constant
+            } else { Role::Output };
             out
         };
         self.init_values.push(Some(out_value));
@@ -403,21 +450,30 @@ impl DagBuilder {
         self.add_gkr_node(vec![a], scale_basicblock)
     }
 
+    /// Canonical unclipped exp on logical coordinates, zero on padding.
+    /// The input/output masks are immutable program literals derived from the
+    /// registered logical shape; this is an explicit padding-profile repair.
+    /// Downstream reductions can change if they previously consumed bad pads.
     pub fn exp(&mut self, a: EdgeId) -> Vec<EdgeId> {
-        let _nid = self.nodes.len();
         let shape = self.init_values[a].as_ref().unwrap().shape.clone();
-        let flat_shape = vec![shape
-            .iter()
-            .map(|s| next_pow(*s as u32) as usize)
-            .product()];
+        assert!(!shape.is_empty() && shape.len()<=26 && shape.iter().all(|&s| s>0),
+            "exp requires explicit nonzero supported logical extents");
+        let padded_len = shape.iter().try_fold(1usize, |n,&s| {
+            let d=u32::try_from(s).ok()?.checked_next_power_of_two()? as usize;
+            n.checked_mul(d)
+        }).expect("exp padded shape exceeds supported indexing domain");
+        let padded = shape.iter().any(|s| !s.is_power_of_two());
+        // Mask BEFORE helper domain checks: shifts from SoftmaxConst can put
+        // positive numbers in padded cells even when all logical cells are <=0.
+        let a = if padded { self.mask(a,shape.clone()) } else { a };
+        let flat_shape = vec![padded_len];
         let data_type = self.init_values[a].as_ref().unwrap().data_type;
 
-        let exp_basicblock =
-            // K_BITS = 4 matches the 16-entry TwoPow table (`2^(15-k)` for k ∈ [0, 16)).
-            // The previous `num_bits: 16` was a typo: it created an aux of arity
-            // `input_n + 16` instead of `input_n + 4`, blowing up the fold-tree
-            // bucket for ExpHelper by 4096× at hidden=768.
-            BasicBlockType::ExpHelper(ExpHelper { num_bits: crate::basicblock::exp::exp_bits() });
+        let sf = *SF_LOG;
+        assert_eq!(self.init_values[a].as_ref().unwrap().sf, sf, "exp activation scale mismatch");
+        let bits = crate::basicblock::exp::exp_bits();
+        let _ = crate::basicblock::exp::exp_ln2(sf);
+        let exp_basicblock = BasicBlockType::ExpHelper(ExpHelper { num_bits: bits });
         self.init_values.push(Some(Witness::new_wo_data(
             shape.clone(),
             data_type,
@@ -436,6 +492,10 @@ impl DagBuilder {
         let k = outs[1]; // sparse poly
 
         r = self.scale(r, *SF_LOG, 15)[0];
+        // ScaleDown alone is a field quotient relation, not integer rounding.
+        // Bound every rounded quotient before using it: together with the
+        // bounded numerator this excludes nonzero multiples of p in residuals.
+        self.integer_interval(r, -(1<<14), 1<<14);
 
         // A. compute 2^(-k)
         let nid = self.nodes.len();
@@ -467,7 +527,7 @@ impl DagBuilder {
             15,
             Role::Constant,
         );
-        let one_sixth = self.param(one_sixth);
+        let one_sixth = self.public_literal(one_sixth);
 
         // B2. compute 1/2
         let vals_half: Vec<AlmostGoldilocksField> =
@@ -483,7 +543,7 @@ impl DagBuilder {
             15,
             Role::Constant,
         );
-        let half = self.param(half);
+        let half = self.public_literal(half);
 
         // B3. compute fixed-point 1 at sf=15. Witness::new stores raw
         // coefficients: integer 1 here would represent 2^-15, not one.
@@ -499,18 +559,21 @@ impl DagBuilder {
             15,
             Role::Constant,
         );
-        let one = self.param(one);
+        let one = self.public_literal(one);
 
         // B4. compute exp(r) by Taylor series
         r = self.change_shape(r, flat_shape);
         let r_square = self.einsum("a,a->a".to_string(), vec![r, r], true);
+        self.integer_interval(r_square[0], 0, 8192);
         let r_one_sixth = self.einsum("a,a->a".to_string(), vec![r, one_sixth], true);
+        self.integer_interval(r_one_sixth[0], -2731, 2731);
         let r_one_sixth_plus_half = self.add(r_one_sixth[0], half)[0];
         let deg_two_plus_deg_three = self.einsum(
             "a,a->a".to_string(),
             vec![r_one_sixth_plus_half, r_square[0]],
             true,
         );
+        self.integer_interval(deg_two_plus_deg_three[0], 0, 4779);
         let deg_one_plus_deg_two_plus_deg_three =
             self.add(deg_two_plus_deg_three[0], r);
         let exp_r = self.add(deg_one_plus_deg_two_plus_deg_three[0], one)[0];
@@ -518,7 +581,15 @@ impl DagBuilder {
         // C. compute 2^(-k) * exp(r)
         let exp_x = self.einsum("a,a->a".to_string(), vec![two_pow_out, exp_r], false);
         let exp_x = self.scale(exp_x[0], 30, *SF_LOG)[0];
-        let exp = self.change_shape(exp_x, shape);
+        // The signed bound remains a conservative integer-lifting certificate.
+        // Logical outputs are nonnegative; the explicit output mask below
+        // makes every padding coordinate exactly zero.
+        self.integer_interval(exp_x, -(2i128 << *SF_LOG), 2i128 << *SF_LOG);
+        // All internal products are <2^31. With these quotient bounds,
+        // every ScaleDown residual interval is <2^33 << p, including the
+        // final (30-sf)-bit divisor and sf>15 remainder conversion.
+        let exp = self.change_shape(exp_x, shape.clone());
+        let exp = if padded { self.mask(exp,shape) } else { exp };
         vec![exp]
     }
 
@@ -1833,9 +1904,56 @@ impl DagBuilder {
         outs[0]
     }
 
+    /// Attach canonical domain gates even for standalone raw ExpHelper nodes.
+    fn exp_guards(&mut self, a: EdgeId, r: EdgeId, bits: usize) -> [NodeId; 4] {
+        assert!((1..=8).contains(&bits), "unsupported exp selector width");
+        let sf = *SF_LOG;
+        let shape = self.init_values[a].as_ref().unwrap().shape.clone();
+        assert_eq!(self.init_values[a].as_ref().unwrap().sf, sf);
+        let l = crate::basicblock::exp::exp_ln2(sf);
+        let mut ids = [0; 4];
+        // Canonical remainder and nonpositive finite-domain roots. These are
+        // real NonNegative gates consumed by the PIOP, not witness assertions.
+        // max(-x) = 2^bits L - floor(L/2) - 1 gives k < 2^bits.
+        // All range sums and the full x = r-Lk interval are < 2^40 << p
+        // for sf<=30, bits<=8, so no nonzero field multiple can counterfeit it.
+        let bound = (1i128 << bits) * l - l / 2 - 1;
+        let range_bits = |v: i128| -> usize { (128 - (v as u128).leading_zeros() as usize).max(1) };
+        let zero = self.integer_literal(shape.clone(), 0, sf);
+        let hi = self.integer_literal(shape.clone(), bound, sf);
+        let neg_x = self.sub(zero, a)[0];
+        self.init_values[neg_x].as_mut().unwrap().role = Role::Output;
+        let slack = self.sub(hi, neg_x)[0];
+        self.init_values[slack].as_mut().unwrap().role = Role::Output;
+        ids[0] = self.nodes.len();
+        self.add_nonneg_node_bits(neg_x, range_bits(bound));
+        ids[1] = self.nodes.len();
+        self.add_nonneg_node_bits(slack, range_bits(bound));
+        let half = self.integer_literal(shape.clone(), l / 2, sf);
+        let lm1 = self.integer_literal(shape.clone(), l - 1, sf);
+        let rho = self.sub(half, r)[0];
+        self.init_values[rho].as_mut().unwrap().role = Role::Output;
+        let rho_slack = self.sub(lm1, rho)[0];
+        self.init_values[rho_slack].as_mut().unwrap().role = Role::Output;
+        ids[2] = self.nodes.len();
+        self.add_nonneg_node_bits(rho, range_bits(l - 1));
+        ids[3] = self.nodes.len();
+        self.add_nonneg_node_bits(rho_slack, range_bits(l - 1));
+
+        ids
+    }
+
     /// Compile: build consumers/producers, ports, and topological order.
-    pub fn compile(self) -> (Dag, Vec<Vec<Witness>>) {
+    pub fn compile(mut self) -> (Dag, Vec<Vec<Witness>>) {
+        let helpers: Vec<_> = self.nodes.iter().filter_map(|n| {
+            if let BasicBlockType::ExpHelper(h) = &n.kind {
+                Some((n.id, n.inputs[0], n.outputs[0], h.num_bits))
+            } else { None }
+        }).collect();
+        let exp_guard_nodes = helpers.into_iter().map(|(n,x,r,bits)|
+            (n, self.exp_guards(x,r,bits))).collect();
         let DagBuilder {
+            program_literals,
             nodes,
             num_edges,
             init_values,
@@ -1952,6 +2070,8 @@ impl DagBuilder {
         }
 
         let dag = Dag {
+            exp_guard_nodes,
+            program_literals,
             nodes,
             num_edges,
             topo,
@@ -2017,6 +2137,63 @@ mod tests {
         assert_eq!(result.sf, *SF_LOG);
         assert!(result.data.as_ref().unwrap().evaluations_ref().iter()
             .all(|v| *v == AlmostGoldilocksField(1u64 << *SF_LOG)));
+    }
+
+    #[test]
+    fn exp_logical_values_ignore_padding_and_padded_outputs_are_zero() {
+        let evaluate = |shape: Vec<usize>, values: Vec<i128>| {
+            let mut b=DagBuilder::new();
+            let x=b.committed_input(Witness::new(shape,values.into_iter().map(int_to_f).collect(),DataType::Float,*SF_LOG,Role::Input));
+            let y=b.exp(x)[0]; let (d,mut w)=b.compile();
+            for &n in &d.topo {
+                let nd=&d.nodes[n]; let inputs=nd.inputs.iter().map(|&e|&w[e][0]).collect::<Vec<_>>();
+                let outputs=nd.kind.run(&inputs);
+                for (&e,v) in nd.outputs.iter().zip(outputs) {w[e]=vec![v];}
+            }
+            w[y][0].data.as_ref().unwrap().evaluations().iter().map(|v|v.reduce().0).collect::<Vec<_>>()
+        };
+        let logical=-(1i128<<*SF_LOG);
+        let expected=evaluate(vec![1],vec![logical])[0];
+        for pad in [400,-5000,10000] {
+            let mut v=vec![logical;5]; v.extend([pad;3]);
+            let out=evaluate(vec![5],v);
+            assert_eq!(&out[..5],&[expected;5]); assert_eq!(&out[5..],&[0;3]);
+        }
+        // Multi-axis, column-major layout: axis0 varies fastest.
+        let mut v=vec![400;16];
+        for j in 0..3 {for i in 0..3 {v[i+4*j]=logical;}}
+        let out=evaluate(vec![3,3],v);
+        for j in 0..4 {for i in 0..4 {
+            assert_eq!(out[i+4*j],if i<3 && j<3 {expected} else {0});
+        }}
+    }
+
+    #[test]
+    fn eager_request_arithmetic_is_not_a_model_parameter() {
+        for v in [3,19] {
+            let mut b=DagBuilder::new();
+            let x=b.committed_input(Witness::new(vec![1],vec![int_to_f(v)],DataType::Int,0,Role::Input));
+            let literal=b.public_literal(Witness::new(vec![1],vec![int_to_f(7)],DataType::Int,0,Role::Constant));
+            let a=b.add(x,literal)[0]; let z=b.sub(a,literal)[0];
+            assert_eq!(b.init_values[a].as_ref().unwrap().role,Role::Output);
+            assert_eq!(b.init_values[z].as_ref().unwrap().role,Role::Output);
+            assert_eq!(crate::util::arith::f_to_int(b.init_values[z].as_ref().unwrap().data.as_ref().unwrap().index(0)),v);
+            let (d,w)=b.compile();
+            let g=crate::morpheus::piop::Graph::new(&d,&w,crate::morpheus::piop::Config::default());
+            assert!(!g.model[a] && !g.model[z] && !g.committed[a] && !g.committed[z]);
+        }
+    }
+
+    #[test]
+    fn eager_model_only_arithmetic_remains_trusted_precomputation() {
+        let mut b=DagBuilder::new();
+        let a=b.param(Witness::new(vec![1],vec![int_to_f(3)],DataType::Int,0,Role::Constant));
+        let c=b.param(Witness::new(vec![1],vec![int_to_f(7)],DataType::Int,0,Role::Constant));
+        let sum=b.add(a,c)[0]; let difference=b.sub(sum,c)[0];
+        assert_eq!(b.init_values[sum].as_ref().unwrap().role,Role::Constant);
+        assert_eq!(b.init_values[difference].as_ref().unwrap().role,Role::Constant);
+        // Such values belong to the trusted model-registration preprocessing;
+        // this is not a proof of their relationship to separate weight leaves.
     }
 
     #[test]

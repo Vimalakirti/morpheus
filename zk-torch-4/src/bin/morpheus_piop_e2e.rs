@@ -280,13 +280,13 @@ fn main() {
         use almost_goldilocks_cuda::DeviceBuffer;
         let t = Instant::now();
         let owned;
-        let keys = match pcs.as_ref() { Some(pc) => &pc.keys, None => { owned = auth_gpu::Keys::build(&profile, &seed); &owned } };
         let r_cols: Vec<Vec<Vec<i64>>> = fast.sources.iter().map(|s| s.r.clone()).collect();
         let to_dev = |cols: &[Vec<i64>]| DeviceBuffer::from_slice(&cols.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
-        let dsrc: Vec<auth_gpu::DevSource> = match pcs.as_ref() {
+        let dsrc: Vec<auth_gpu::DevSource> = match pcs.as_mut() {
             Some(pc) => pc.dev_sources(&r_cols),
             None => raw.iter().zip(&r_cols).map(|(rw, r)| auth_gpu::DevSource { w: to_dev(&link::raw_to_cols(rw)), r: to_dev(r) }).collect(),
         };
+        let keys = match pcs.as_ref() { Some(pc) => &pc.keys, None => { owned = auth_gpu::Keys::build(&profile, &seed); &owned } };
         let mut tm = auth_gpu::AuthTiming::default();
         let tw = Instant::now();
         let mut reps: Vec<_> = replica_jobs.into_iter().map(|h| h.join().expect("replica")).collect();
