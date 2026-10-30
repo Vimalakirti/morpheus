@@ -32,11 +32,16 @@ pub fn run_hook(dag: &Dag, wit: &[Vec<Witness>]) {
 }
 
 pub fn run(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize], units: usize, unit: &str) {
+    run_with_ar(name, dag, wit, public, units, unit, None);
+}
+
+pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize], units: usize, unit: &str, ar: Option<super::ar_statement::ArStatement>) {
     let n = ev("N_REQUESTS", 1);
     let mut o = Opts::from_env();
     let mut req_secs = Vec::new();
     let mut verify_secs = Vec::new();
     let n = if o_defer_batches().is_some() { batch_sizes(n).iter().sum() } else { n };
+    println!("MORPHEUS_POLICY profile={} auth={} verify={} requests={}", o.profile.name, o.auth, o.verify, n);
     let mut outs = Vec::new();
     let mut vqueue = Vec::new();
     let mut model_reg = None;
@@ -44,6 +49,8 @@ pub fn run(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize], units:
     // One preparation per witness (per request with FRESH_INPUTS).
     let t = Instant::now();
     let mut pp = request::prepare(dag, wit, public, &mut o);
+    pp.ar = ar;
+    if let Some(ar) = &pp.ar { assert!(ar.validate(&pp.g), "invalid AR public statement"); }
     let prep = t.elapsed().as_secs_f64();
     println!("prep {:.2}s: {} tensors, sources model {:?} request {:?} carry {:?}", prep, pp.lay.tensors.len(), pp.model, pp.req, pp.carry);
     {
@@ -85,6 +92,8 @@ pub fn run(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize], units:
             let mut vt = Times::new();
             let t = Instant::now();
             let pf = crate::morpheus::wire::decode_request(&o.profile, &out.bytes).expect("proof decodes");
+            println!("MORPHEUS_AUTH request={j} present={}", pf.auth.is_some());
+            assert!(pf.auth.is_some(), "benchmark request lacks authentication");
             vt.insert("decode", t.elapsed().as_secs_f64());
             if j == 0 {
                 let parts = crate::morpheus::wire::parts(&o.profile, &pf);
@@ -118,6 +127,8 @@ pub fn run(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize], units:
             if o.verify {
                 let t = Instant::now();
                 let fpf = crate::morpheus::wire::decode_final(&o.profile, &fo.bytes).expect("finalization proof decodes");
+                println!("MORPHEUS_AUTH batch={b} present={}", fpf.auth.is_some());
+                assert!(fpf.auth.is_some(), "benchmark finalization lacks authentication");
                 let dec = t.elapsed().as_secs_f64();
                 let vq: Vec<QueueEntry> = range.clone().map(|j| { let (rows, dg, cc) = &vqueue[j]; QueueEntry { j: j as u64, deferred: rows, c_carry: cc.as_ref().unwrap(), digest: *dg } }).collect();
                 let mut vt = Times::new();

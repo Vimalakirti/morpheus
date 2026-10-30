@@ -118,6 +118,7 @@ pub struct Prepared<'a> {
     pub req: Range<usize>,
     pub carry: Range<usize>,
     pub specs: Vec<(TKey, usize, usize, bool)>,
+    pub ar: Option<super::ar_statement::ArStatement>,
 }
 
 pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &mut Opts) -> Prepared<'a> {
@@ -146,7 +147,7 @@ pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &
         (lay, 0..0, 0..n, n..n)
     };
     if o.timing { eprintln!("[prep] graph + prover data + layout {:.2}s: model sources {:?}, request {:?}, carry {:?}", t.elapsed().as_secs_f64(), model, req, carry); }
-    Prepared { g, pd, lay, model, req, carry, specs }
+    Prepared { g, pd, lay, model, req, carry, specs, ar: None }
 }
 
 /// Renumber the sources of `rows` through `map` (global -> local).
@@ -215,6 +216,15 @@ fn absorb_layout(tr: &mut MTranscript, lay: &Layout) {
 fn request_transcript(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model: Option<&[Vec<Vec<u64>>]>, c_req: &[Vec<Vec<u64>>]) -> MTranscript {
     let mut tr = MTranscript::new(o.profile.name, salt);
     absorb_layout(&mut tr, &pp.lay);
+    if let Some(ar) = &pp.ar {
+        assert!(ar.validate(&pp.g), "invalid public AR statement");
+        tr.absorb(Item::Statement, &ar.words());
+        // Bind exact canonical public selector arrays before graph challenges.
+        for e in std::iter::once(&ar.embedding).chain(ar.selectors.iter()).chain(ar.rank_constants.iter().flatten()) {
+            tr.absorb(Item::Statement, &[*e as u64]);
+            tr.absorb(Item::Statement, &pp.g.public[e]);
+        }
+    }
     if let Some(cm) = c_model {
         absorb_model(&mut tr, cm);
         tr.absorb(Item::Statement, &[pp.req.len() as u64, j]);
@@ -442,8 +452,21 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
 
 /// Verifier of request `j`; returns its deferred rows and digest.
 pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<&[Vec<Vec<u64>>]>, out: &wire::RequestProof, keys: &auth_gpu::Keys, times: &mut Times) -> Option<(Vec<Row>, K8)> {
+    if pp.ar.as_ref().map(|ar| !ar.validate(&pp.g)).unwrap_or(false) { return None; }
+    // Diagnostic NO_AUTH proofs are never accepted by this API.
+    let apf = out.auth.as_ref()?;
     let defer = o.defer;
-    let nreq = out.c_src.len() - defer as usize;
+    let nreq = out.c_src.len().checked_sub(defer as usize)?;
+    if nreq != pp.req.len() || out.c_src.len() > o.profile.n_max
+        || !out.c_src.iter().all(|c| wire::commitment_ok(&o.profile, c))
+        || !wire::link_shape_ok(&o.profile, out.c_src.len(), &out.link)
+        || !wire::auth_shape_ok(&o.profile, apf)
+        || !out.piop.iter().all(wire::canonical_k) { return None; }
+    match (defer, model) {
+        (true, Some(cs)) if cs.len() == pp.model.len() && cs.iter().all(|c| wire::commitment_ok(&o.profile, c)) => {},
+        (false, None) => {},
+        _ => return None,
+    }
     // The salt is disclosed with the proof; the verifier never sees the
     // prover's private tape.
     let tr = request_transcript(o, pp, j, &out.salt, model, &out.c_src[..nreq]);
@@ -552,6 +575,16 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
 }
 
 pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, c_model: &[Vec<Vec<u64>>], q: &[QueueEntry], out: &wire::FinalProof, keys: &auth_gpu::Keys, times: &mut Times) -> bool {
+    let Some(apf) = out.auth.as_ref() else { return false; };
+    let Some(n) = c_model.len().checked_add(q.len()) else { return false; };
+    if !o.defer || pp.carry.len() != 1 || c_model.len() != pp.model.len()
+        || n > o.profile.n_max || !c_model.iter().all(|c| wire::commitment_ok(&o.profile, c))
+        || !wire::link_shape_ok(&o.profile, n, &out.link)
+        || !wire::auth_shape_ok(&o.profile, apf)
+        || !q.iter().all(|e| wire::commitment_ok(&o.profile, e.c_carry)
+            && wire::canonical_k(&e.digest)
+            && e.deferred.iter().flat_map(|r| &r.terms).all(|t|
+                pp.model.contains(&t.region.source) || pp.carry.contains(&t.region.source))) { return false; }
     let st = final_statement(pp, q);
     let mut c_src = c_model.to_vec();
     for e in q { c_src.push(e.c_carry.to_vec()); }

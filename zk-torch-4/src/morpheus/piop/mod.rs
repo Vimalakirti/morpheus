@@ -282,6 +282,10 @@ pub fn tensor_specs(g: &Graph, pd: &ProverData) -> Vec<(TKey, usize, usize, bool
             // Model tensors: widths declared once at model registration (part
             // of the registered model's public type), independent of requests.
             (log2_ceil(maxb), v.par_iter().all(|&x| x <= 1))
+        } else if g.public.contains_key(&e) {
+            // Public structural/request data may declare its exact width:
+            // these values are already in the public statement, not secrets.
+            (log2_ceil(maxb), v.par_iter().all(|&x| x <= 1))
         } else {
             // Request tensors: a public rule, never the request's values. Bit
             // type is declared by the producer (sign and selection helpers) or
@@ -873,6 +877,8 @@ impl<'g, 'a> Walk<'g, 'a> {
                     lin_add(&mut lin, &c.pad, &K8::ONE.neg());
                     (lin, s.mul(&vx).sub(&c.z).add(&hs))
                 };
+                // Exact upscaling: authenticate the remainder, not only its range.
+                if up { ctx.row(terms.clone(), &Lin::new(), hs); }
                 ctx.row(terms, &lin, y);
                 self.push(ctx, x, AClaim { point: c.point, pad: lin1(sx, K8::ONE), z: vx });
                 "scale"

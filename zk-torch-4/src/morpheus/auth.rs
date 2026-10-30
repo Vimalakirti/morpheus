@@ -224,6 +224,12 @@ pub fn verify(
     p: &Profile, seed: &KeySeed, tr: &MTranscript, pt: &Point,
     targets: &[Tuple], target_o: &AuxTuple, pf: &AuthProof,
 ) -> bool {
+    if !super::wire::auth_shape_ok(p, pf) || targets.len() > p.n_max
+        || pt.xi.len() != p.ell() || !pt.xi.iter().all(super::wire::canonical_k)
+        || !super::wire::canonical_k(&pt.rho) || pt.rho == K8::ZERO || pt.rho == K8::ONE
+        || !targets.iter().all(|t| super::wire::commitment_ok(p, &t.c)
+            && super::wire::commitment_ok(p, &t.g) && super::wire::endpoint_ok(&t.a))
+        || !super::wire::commitment_ok(p, &target_o.c) || !super::wire::endpoint_ok(&target_o.t) { return false; }
     let (sw, sl, so) = block_cols(p);
     if (pf.attempt as usize) >= p.attempts || pf.d.len() != p.tau || pf.d_o.len() != p.tau {
         return false;

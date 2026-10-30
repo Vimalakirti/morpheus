@@ -14,5 +14,5 @@ fn main() {
     let inst = models::build(&model, 0);
     println!("{}: {} nodes, {} edges; graph {:.2}s, witness {:.2}s; {} {}s per request",
         inst.name, inst.dag.nodes.len(), inst.dag.num_edges(), t.elapsed().as_secs_f64() - inst.witness_secs, inst.witness_secs, inst.units, inst.unit);
-    driver::run(&inst.name, &inst.dag, &inst.wit, &inst.public, inst.units, inst.unit);
+    driver::run_with_ar(&inst.name, &inst.dag, &inst.wit, &inst.public, inst.units, inst.unit, inst.ar.clone());
 }

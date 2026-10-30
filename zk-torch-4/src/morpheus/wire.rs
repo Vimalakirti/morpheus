@@ -14,7 +14,7 @@ use super::auth::{AuthProof, AuxTuple, Responses, Tuple};
 use super::field8::K8;
 use super::link::LinkProof;
 use super::params::Profile;
-use super::ring::{AElem, N};
+use super::ring::{AElem, DS, N};
 use rayon::prelude::*;
 
 pub const MAGIC: &[u8; 8] = b"MRPHSv1\0";
@@ -117,16 +117,71 @@ impl<'a> R<'a> {
         let s = self.take(n.checked_mul(8)?)?;
         s.chunks(8).map(|c| Self::canon(u64::from_le_bytes(c.try_into().unwrap()))).collect()
     }
-    pub fn ring_vec(&mut self) -> Option<Vec<Vec<u64>>> { let n = self.len()?; (0..n).map(|_| self.u64s()).collect() }
+    // Bound counts against bytes before creating collection iterators.
+    fn count(&mut self, max: usize, min_bytes: usize) -> Option<usize> {
+        let n = self.len()?;
+        if n > max || n.checked_mul(min_bytes)? > self.b.len().checked_sub(self.pos)? { return None; }
+        Some(n)
+    }
+    fn exact_len(&mut self, want: usize) -> Option<()> { (self.len()? == want).then_some(()) }
+    fn commitment(&mut self, p: &Profile) -> Option<Vec<Vec<u64>>> {
+        self.exact_len(p.rank)?;
+        let row_bytes = N.checked_mul(8)?.checked_add(4)?;
+        if p.rank.checked_mul(row_bytes)? > self.b.len().checked_sub(self.pos)? { return None; }
+        (0..p.rank).map(|_| {
+            self.exact_len(N)?;
+            self.take(N * 8)?.chunks_exact(8).map(|c| Self::canon(u64::from_le_bytes(c.try_into().ok()?))).collect()
+        }).collect()
+    }
+    fn bytes_exact(&mut self, n: usize) -> Option<Vec<u8>> {
+        self.exact_len(n)?; Some(self.take(n)?.to_vec())
+    }
     pub fn k8(&mut self) -> Option<K8> {
         let s = self.take(64)?;
         let mut c = [0u64; 8];
         for (i, x) in c.iter_mut().enumerate() { *x = Self::canon(u64::from_le_bytes(s[8 * i..8 * i + 8].try_into().unwrap()))?; }
         Some(K8(c))
     }
-    pub fn k8s(&mut self) -> Option<Vec<K8>> { let n = self.len()?; (0..n).map(|_| self.k8()).collect() }
-    pub fn a(&mut self) -> Option<AElem> { Some(AElem(self.k8s()?)) }
+    pub fn k8s(&mut self) -> Option<Vec<K8>> { let n = self.count(usize::MAX, 64)?; (0..n).map(|_| self.k8()).collect() }
+    fn k8s_exact(&mut self, n: usize) -> Option<Vec<K8>> {
+        self.exact_len(n)?;
+        if n.checked_mul(64)? > self.b.len().checked_sub(self.pos)? { return None; }
+        (0..n).map(|_| self.k8()).collect()
+    }
+    pub fn a(&mut self) -> Option<AElem> { Some(AElem(self.k8s_exact(DS)?)) }
     pub fn bytes(&mut self) -> Option<Vec<u8>> { let n = self.len()?; Some(self.take(n)?.to_vec()) }
+}
+
+// Public verifier inputs must use a registered, locally validated Profile.
+// These validators also protect callers passing in-memory proof structures.
+pub(crate) fn canonical_k(k: &K8) -> bool {
+    k.0.iter().all(|&v| v < almost_goldilocks_cuda::field::ALMOST_GOLDILOCKS_PRIME)
+}
+pub(crate) fn endpoint_ok(a: &AElem) -> bool {
+    a.0.len() == DS && a.0.iter().all(canonical_k)
+}
+pub(crate) fn commitment_ok(p: &Profile, c: &[Vec<u64>]) -> bool {
+    c.len() == p.rank && c.iter().all(|r| r.len() == N && r.iter().all(|&v| v < almost_goldilocks_cuda::field::ALMOST_GOLDILOCKS_PRIME))
+}
+pub(crate) fn link_shape_ok(p: &Profile, n: usize, l: &LinkProof) -> bool {
+    n <= p.n_max && l.g_commit.len() == n && l.a_hat.len() == n
+        && l.g_commit.iter().all(|c| commitment_ok(p, c))
+        && commitment_ok(p, &l.c_o) && l.a_hat.iter().all(endpoint_ok) && endpoint_ok(&l.t_o)
+        && l.rounds.len() == p.ell() + 1
+        && l.rounds.iter().zip(p.degs()).all(|(r, d)| r.len() == d + 1 && r.iter().all(canonical_k))
+}
+fn response_bytes(p: &Profile, cols: usize) -> Option<usize> {
+    let n = p.tau.checked_mul(cols)?.checked_mul(N)?;
+    if n % 8 != 0 { return None; }
+    (n / 8).checked_mul(Z_BITS)
+}
+pub(crate) fn auth_shape_ok(p: &Profile, a: &AuthProof) -> bool {
+    (a.attempt as usize) < p.attempts && a.d.len() == p.tau && a.d_o.len() == p.tau
+        && a.d.iter().all(|t| commitment_ok(p, &t.c) && commitment_ok(p, &t.g) && endpoint_ok(&t.a))
+        && a.d_o.iter().all(|t| commitment_ok(p, &t.c) && endpoint_ok(&t.t))
+        && response_bytes(p, p.source_cols()) == Some(a.z.w.len())
+        && response_bytes(p, p.link_cols()) == Some(a.z.l.len())
+        && response_bytes(p, p.aux_cols()) == Some(a.z.o.len())
 }
 
 // ------------------------------------------------------------ proof parts
@@ -141,14 +196,15 @@ pub fn put_link(w: &mut W, l: &LinkProof) {
     for a in &l.a_hat { w.a(a); }
     w.a(&l.t_o);
 }
-pub fn get_link(r: &mut R) -> Option<LinkProof> {
-    let n = r.len()?;
-    let g_commit = (0..n).map(|_| r.ring_vec()).collect::<Option<_>>()?;
-    let c_o = r.ring_vec()?;
-    let nr = r.len()?;
-    let rounds = (0..nr).map(|_| r.k8s()).collect::<Option<_>>()?;
-    let na = r.len()?;
-    let a_hat = (0..na).map(|_| r.a()).collect::<Option<_>>()?;
+pub fn get_link(p: &Profile, r: &mut R) -> Option<LinkProof> {
+    let min_commit = p.rank.checked_mul(N.checked_mul(8)?.checked_add(4)?)?.checked_add(4)?;
+    let n = r.count(p.n_max, min_commit)?;
+    let g_commit = (0..n).map(|_| r.commitment(p)).collect::<Option<_>>()?;
+    let c_o = r.commitment(p)?;
+    r.exact_len(p.ell() + 1)?;
+    let rounds = p.degs().into_iter().map(|d| r.k8s_exact(d + 1)).collect::<Option<_>>()?;
+    r.exact_len(n)?;
+    let a_hat = (0..n).map(|_| r.a()).collect::<Option<_>>()?;
     let t_o = r.a()?;
     Some(LinkProof { g_commit, c_o, rounds, a_hat, t_o })
 }
@@ -164,13 +220,16 @@ pub fn put_auth(w: &mut W, a: &AuthProof) {
 }
 pub fn get_auth(p: &Profile, r: &mut R) -> Option<AuthProof> {
     let attempt = r.u16()?;
-    let nd = r.len()?;
-    let d = (0..nd).map(|_| Some(Tuple { c: r.ring_vec()?, g: r.ring_vec()?, a: r.a()? })).collect::<Option<Vec<_>>>()?;
-    let no = r.len()?;
-    let d_o = (0..no).map(|_| Some(AuxTuple { c: r.ring_vec()?, t: r.a()? })).collect::<Option<Vec<_>>>()?;
-    let z = Responses { w: r.bytes()?, l: r.bytes()?, o: r.bytes()? };
-    let n = |cols: usize| packed_len(p.tau * cols * N);
-    if z.w.len() != n(p.source_cols()) || z.l.len() != n(p.link_cols()) || z.o.len() != n(p.aux_cols()) { return None; }
+    if attempt as usize >= p.attempts { return None; }
+    r.exact_len(p.tau)?;
+    let d = (0..p.tau).map(|_| Some(Tuple { c: r.commitment(p)?, g: r.commitment(p)?, a: r.a()? })).collect::<Option<Vec<_>>>()?;
+    r.exact_len(p.tau)?;
+    let d_o = (0..p.tau).map(|_| Some(AuxTuple { c: r.commitment(p)?, t: r.a()? })).collect::<Option<Vec<_>>>()?;
+    let z = Responses {
+        w: r.bytes_exact(response_bytes(p, p.source_cols())?)?,
+        l: r.bytes_exact(response_bytes(p, p.link_cols())?)?,
+        o: r.bytes_exact(response_bytes(p, p.aux_cols())?)?,
+    };
     Some(AuthProof { attempt, d, d_o, z })
 }
 
@@ -206,14 +265,15 @@ pub fn encode_request(p: &Profile, pf: &RequestProof) -> Vec<u8> {
 
 pub fn decode_request(p: &Profile, b: &[u8]) -> Option<RequestProof> {
     let mut r = R::new(b);
-    if r.take(8)? != MAGIC || r.bytes()? != p.name.as_bytes() { return None; }
+    if r.take(8)? != MAGIC || r.bytes_exact(p.name.len())? != p.name.as_bytes() { return None; }
     let salt: [u8; 64] = r.take(64)?.try_into().ok()?;
     let piop = r.k8s()?;
-    let n = r.len()?;
-    let c_src = (0..n).map(|_| r.ring_vec()).collect::<Option<_>>()?;
-    let link = get_link(&mut r)?;
+    let min_commit = p.rank.checked_mul(N.checked_mul(8)?.checked_add(4)?)?.checked_add(4)?;
+    let n = r.count(p.n_max, min_commit)?;
+    let c_src = (0..n).map(|_| r.commitment(p)).collect::<Option<_>>()?;
+    let link = get_link(p, &mut r)?;
     let auth = get_opt_auth(p, &mut r)?;
-    r.done().then_some(RequestProof { salt, piop, c_src, link, auth })
+    (r.done() && link.g_commit.len() == n).then_some(RequestProof { salt, piop, c_src, link, auth })
 }
 
 /// Encoded bytes by part: (header+salt, PIOP messages, source commitments,
@@ -251,9 +311,9 @@ pub fn encode_final(p: &Profile, pf: &FinalProof) -> Vec<u8> {
 
 pub fn decode_final(p: &Profile, b: &[u8]) -> Option<FinalProof> {
     let mut r = R::new(b);
-    if r.take(8)? != MAGIC || r.bytes()? != p.name.as_bytes() { return None; }
+    if r.take(8)? != MAGIC || r.bytes_exact(p.name.len())? != p.name.as_bytes() { return None; }
     let salt: [u8; 64] = r.take(64)?.try_into().ok()?;
-    let link = get_link(&mut r)?;
+    let link = get_link(p, &mut r)?;
     let auth = get_opt_auth(p, &mut r)?;
     r.done().then_some(FinalProof { salt, link, auth })
 }
@@ -262,6 +322,39 @@ pub fn decode_final(p: &Profile, b: &[u8]) -> Option<FinalProof> {
 mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
+
+    #[test]
+    fn typed_reader_rejects_malformed_shapes_before_field_reads() {
+        for n in [0usize, DS - 1, DS + 1, u32::MAX as usize] {
+            let mut w = W::default(); w.len(n);
+            assert!(R::new(&w.b).a().is_none());
+        }
+        let mut w = W::default(); w.a(&AElem(vec![K8::ZERO; DS]));
+        assert!(R::new(&w.b).a().is_some());
+        let p = Profile::toy();
+        for n in [0usize, p.rank - 1, p.rank + 1, u32::MAX as usize] {
+            let mut w = W::default(); w.len(n);
+            assert!(R::new(&w.b).commitment(&p).is_none());
+        }
+        let mut w = W::default(); w.len(u32::MAX as usize);
+        assert!(R::new(&w.b).k8s().is_none());
+        let mut w = W::default(); w.u8(2);
+        assert!(get_opt_auth(&p, &mut R::new(&w.b)).is_none());
+    }
+
+    #[test]
+    fn in_memory_shapes_are_checked_not_just_decoded_bytes() {
+        let p = Profile::toy();
+        for n in [0usize, DS - 1, DS, DS + 1] {
+            assert_eq!(endpoint_ok(&AElem(vec![K8::ZERO; n])), n == DS);
+        }
+        for n in [0usize, N - 1, N, N + 1] {
+            assert_eq!(commitment_ok(&p, &vec![vec![0; n]; p.rank]), n == N);
+        }
+        let mut a = AElem(vec![K8::ZERO; DS]);
+        a.0[0].0[0] = almost_goldilocks_cuda::field::ALMOST_GOLDILOCKS_PRIME;
+        assert!(!endpoint_ok(&a));
+    }
 
     #[test]
     fn pack37_round_trips_the_full_support_and_rejects_out_of_range_codes() {

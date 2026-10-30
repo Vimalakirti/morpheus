@@ -185,10 +185,27 @@ template <int N> __device__ __forceinline__ double to_double(const U<N>& a) {
     return r;
 }
 
+// Exact bounded fallback: long division of d * 2^128 by den.
+// Precondition: d < 2^128 < den. No floating-point estimate is trusted.
+__device__ __forceinline__ U<2> div_z_exact(const U<2>& d, const U<3>& den, bool& inexact) {
+    U<3> rem = resize<3>(d);
+    U<2> q = uzero<2>();
+    for (int bit = 127; bit >= 0; --bit) {
+        rem = shl(rem, 1);
+        if (cmp(rem, den) >= 0) {
+            rem = sub(rem, den);
+            q.w[bit >> 6] |= 1ULL << (bit & 63);
+        }
+    }
+    inexact = !is_zero(rem);
+    return q;
+}
+
 /// floor and remainder-nonzero of (d * 2^128) / den, d < 2^128 < den < 2^130.
 /// Quotient digits are estimated in double precision, biased low by 2^-46 so
-/// every partial quotient is an underestimate, and the remainder is kept exact;
-/// a final exact correction loop finishes. The result is the exact floor.
+/// an exact product guard validates each estimate before subtraction. Bounded
+/// correction falls back to restoring division; correctness does not rely on
+/// the floating-point underestimate claim. The result is the exact floor.
 __device__ __forceinline__ U<2> div_z(const U<2>& d, const U<3>& den, bool& inexact) {
     U<4> rem = uzero<4>();
     rem.w[2] = d.w[0]; rem.w[3] = d.w[1];
@@ -197,15 +214,22 @@ __device__ __forceinline__ U<2> div_z(const U<2>& d, const U<3>& den, bool& inex
 #pragma unroll
     for (int it = 0; it < 3; it++) {
         double qd = to_double(rem) / dd * (1.0 - 1.4210854715202004e-14);
+        if (!isfinite(qd) || qd >= ldexp(1.0, 128)) return div_z_exact(d, den, inexact);
         if (!(qd >= 1.0)) break;
         U<2> qe;
         if (qd < 18446744073709551616.0) { qe.w[0] = (u64)qd; qe.w[1] = 0; }
         else { double h = floor(qd * 5.421010862427522e-20); qe.w[1] = (u64)h; qe.w[0] = (u64)(qd - h * 18446744073709551616.0); }
-        rem = resize<4>(sub(resize<5>(rem), mul(qe, den)));
+        U<5> product = mul(qe, den);
+        U<5> remainder = resize<5>(rem);
+        if (cmp(product, remainder) > 0) return div_z_exact(d, den, inexact);
+        rem = resize<4>(sub(remainder, product));
         q = add(q, qe);
     }
     U<4> den4 = resize<4>(den);
-    while (cmp(rem, den4) >= 0) { rem = sub(rem, den4); q = add(q, small<2>(1)); }
+    for (int it = 0; it < 2 && cmp(rem, den4) >= 0; ++it) {
+        rem = sub(rem, den4); q = add(q, small<2>(1));
+    }
+    if (cmp(rem, den4) >= 0) return div_z_exact(d, den, inexact);
     inexact = !is_zero(rem);
     return q;
 }

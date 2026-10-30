@@ -11,6 +11,10 @@
 # morpheus_e2e; the rest through their benchmark binaries with
 # MORPHEUS_AT_RUN (the benchmark's own forward pass is proven).
 set -u
+# Fail closed: debug and deterministic/private-coin overrides are not paper runs.
+for flag in NO_AUTH NO_VERIFY LAYOUT_ONLY LINK_ROWS MORPHEUS_UNCLAIMED MORPHEUS_COIN_SEED; do
+  if [ "${!flag+x}" ]; then echo "Refusing benchmark override: $flag" >&2; exit 2; fi
+done
 cd "$(dirname "$0")/../../.."
 OUT=${OUT:-scripts/bench/morpheus/out}
 mkdir -p "$OUT"
@@ -40,7 +44,21 @@ run() {   # name kind(e2e|hook:bin:cfg:units) env...
     # Monolithic: N_MONO independent openings (fresh private randomness, so
     # the number of authentication attempts varies); the tables report the
     # mean. Deferred: measured finalizations of batches DEFER_BATCHES.
-    local m=(DEFER=0 N_REQUESTS=${N_MONO:-3}); [ "$mode" = defer ] && m=(DEFER=1 DEFER_BATCHES=${DEFER_BATCHES:-2,8})
+    local expected=${N_MONO:-3} batch_spec=-
+    local m=(DEFER=0 N_REQUESTS=$expected)
+    if [ "$mode" = defer ]; then
+      batch_spec=${DEFER_BATCHES:-2,8}; expected=0
+      [[ "$batch_spec" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 2
+      local sizes j; IFS=, read -ra sizes <<< "$batch_spec"
+      for j in "${sizes[@]}"; do expected=$((expected+j)); done
+      m=(DEFER=1 DEFER_BATCHES=$batch_spec)
+    elif [ "$mode" = mono ]; then
+      # An inherited DEFER_BATCHES otherwise overrides N_REQUESTS in the driver.
+      [ "${DEFER_BATCHES+x}" ] && { echo "Unset DEFER_BATCHES for mono runs" >&2; return 2; }
+    else
+      echo "Unknown benchmark mode: $mode" >&2; return 2
+    fi
+    [[ "$expected" =~ ^[1-9][0-9]*$ ]] && [ "$expected" -le 10000 ] || return 2
     # A run that fails for GPU memory while another user's job held a GPU
     # is retried (up to RETRIES times) once the GPUs are free again.
     local try=0
@@ -54,11 +72,14 @@ run() {   # name kind(e2e|hook:bin:cfg:units) env...
       for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do u=$(ps -o user= -p "$p" 2>/dev/null); [ -n "$u" ] && [ "$u" != "$USER" ] && echo "$(date +%T) $u $p" >> "$log.foreign"; done
       sleep 0.5; done ) &
     local sampler=$!
+    printf "MORPHEUS_EXPECT profile=morpheus-ternary-v1 requests=%s batches=%s\n" "$expected" "$batch_spec" > "$log"
     case $kind in
-      e2e) env "$@" "${m[@]}" timeout ${TMO:-14400} ./target/release/morpheus_e2e > "$log" 2>&1 ;;
+      e2e) env "$@" "${m[@]}" timeout ${TMO:-14400} ./target/release/morpheus_e2e >> "$log" 2>&1 ;;
       hook:*) IFS=: read -r _ bin cfg units <<< "$kind"
-        env "$@" "${m[@]}" MORPHEUS_AT_RUN=1 MORPHEUS_NAME="$name" MORPHEUS_UNITS="$units" timeout ${TMO:-14400} ./target/release/$bin "$cfg" > "$log" 2>&1 ;;
+        env "$@" "${m[@]}" MORPHEUS_AT_RUN=1 MORPHEUS_NAME="$name" MORPHEUS_UNITS="$units" timeout ${TMO:-14400} ./target/release/$bin "$cfg" >> "$log" 2>&1 ;;
     esac
+    local run_status=$?
+    printf "MORPHEUS_EXIT status=%s\n" "$run_status" >> "$log"
     kill $sampler 2>/dev/null; wait $sampler 2>/dev/null
     echo "peak GPU memory (sum over devices) $(cat "$log.peak" 2>/dev/null) MiB" >> "$log"
     grep -E "^(prove|request stage|batch J|verify per|proof per|peak GPU)|panicked" "$log" | sed 's/^/    /'
