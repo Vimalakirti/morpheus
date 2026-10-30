@@ -886,23 +886,34 @@ impl<'g, 'a> Walk<'g, 'a> {
         for &node in &lookups {
             let nd = &self.g.dag.nodes[node];
             let n = self.g.nvars[nd.inputs[0]];
+            let t1 = std::time::Instant::now();
             for c in 0..self.g.chunks(node).len() {
                 let r = ctx.chals(n);
                 let w = self.g.chunks(node)[c];
                 let terms = ctx.lay.terms(&t_key(node, c), &r, &vec![K8::ONE; 1 << w], K8::ONE);
                 ctx.row(terms, &Lin::new(), K8::ONE);
             }
+            ctx.tick(".rt_sel_rows", t1);
             if let BasicBlockType::NonNegative(_) = nd.kind {
+                let t1 = std::time::Instant::now();
                 let x = nd.inputs[0];
                 let r = ctx.chals(n);
                 let a = ctx.alloc("root pad");
                 let z = ctx.send(if ctx.prover { Some(self.mle_e(x, &r).add(&ctx.bank[a as usize])) } else { None });
+                ctx.tick(".rt_nn_mle", t1);
+                let t1 = std::time::Instant::now();
                 let terms = self.sel_terms(ctx, node, &r, K8::ONE, None);
                 ctx.row(terms, &lin1(a, K8::ONE), z);
+                ctx.tick(".rt_nn_row", t1);
+                let t1 = std::time::Instant::now();
                 self.push(ctx, x, AClaim { point: r, pad: lin1(a, K8::ONE), z });
+                ctx.tick(".rt_nn_push", t1);
             }
         }
+        let t1 = std::time::Instant::now();
         self.pzc_roots(ctx);
+        ctx.tick(".rt_pzc", t1);
+        let t1 = std::time::Instant::now();
         // Public outputs: Ỹ(r) at a random r.
         let outs = self.g.outputs.clone();
         for (e, vals) in outs {
@@ -920,6 +931,7 @@ impl<'g, 'a> Walk<'g, 'a> {
             let terms = ctx.lay.terms(&TKey::Edge(e), &r, &value_pw(p), K8::ONE);
             ctx.row(terms, &Lin::new(), y);
         }
+        ctx.tick(".rt_out_pub", t1);
     }
 
     /// Merge the pending claims of a non-committed edge into one.

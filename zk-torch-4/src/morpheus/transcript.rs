@@ -121,8 +121,8 @@ fn parse_frame(rest: &[u8], frame_number: usize, pending: &mut Option<BigUint>) 
                 if matches!(ty,4|5) && index!=0 { return None; }
                 if !(1..=8).contains(&stage) { return None; }
                 let n=match ty {
-                    1 if arity==1=>BigUint::from(Q).pow(8),
-                    2 if arity==1=>BigUint::from(Q).pow(8)-2u32,
+                    1 if arity==1=>krank().q8.clone(),
+                    2 if arity==1=>&krank().q8-2u32,
                     4=> {
                         let exp=arity.checked_mul(8)?;
                         if exp.checked_mul(64)?>MAX_RANK_BITS { return None; }
@@ -243,6 +243,68 @@ pub fn registered_cardinality(address: &[u8]) -> BigUint {
     parse(address).unwrap_or_else(BigUint::one)
 }
 
+/// Fixed-width `typed_rank` for K challenges (cardinality Q^8): the raw
+/// sample X (ell = bits(Q^8 − 1) + RAW_SLACK bits, a whole number of bytes)
+/// is reduced as Σ_j w_j·(2^{64j} mod Q^8) with each table entry in base-Q
+/// digits, then carried in base Q; the low 8 base-Q digits of X are the K8
+/// limbs of X mod Q^8 (digits beyond Q^8 are dropped). Same result as
+/// `typed_rank_from` + `unrank_k` without big-integer division.
+struct KRank { q8: BigUint, nbytes: usize, t: Vec<[u64; 8]> }
+fn krank() -> &'static KRank {
+    static K: std::sync::OnceLock<KRank> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let q8 = BigUint::from(Q).pow(8);
+        let ell = usize::try_from((&q8 - BigUint::one()).bits()).unwrap() + RAW_SLACK;
+        assert_eq!(ell % 64, 0, "fast K rank needs whole words");
+        let nbytes = ell / 8;
+        let q = BigUint::from(Q);
+        let t = (0..nbytes / 8).map(|j| {
+            let mut v = (BigUint::one() << (64 * j)) % &q8;
+            let mut d = [0u64; 8];
+            for x in &mut d { *x = (&v % &q).to_u64().unwrap(); v /= &q; }
+            d
+        }).collect();
+        KRank { q8, nbytes, t }
+    })
+}
+fn k_from_sponge(h: sha3::Shake256) -> [u64; 8] {
+    let kr = krank();
+    let mut bytes = vec![0u8; kr.nbytes];
+    h.finalize_xof().read(&mut bytes);
+    let nw = kr.nbytes / 8;
+    // acc[k] = Σ_j w_j T_j[k] as (lo: u128, hi: u64).
+    let mut lo = [0u128; 8];
+    let mut hi = [0u64; 8];
+    for j in 0..nw {
+        let w = u64::from_be_bytes(bytes[kr.nbytes - 8 * (j + 1)..kr.nbytes - 8 * j].try_into().unwrap()) as u128;
+        if w == 0 { continue; }
+        let tj = &kr.t[j];
+        for k in 0..8 {
+            let (s, c) = lo[k].overflowing_add(w * tj[k] as u128);
+            lo[k] = s; hi[k] += c as u64;
+        }
+    }
+    // Base-Q carry (a 3-limb carry: hi·2^128 + lo + carry < 2^192).
+    let mut d = [0u64; 8];
+    let mut carry = [0u64; 3];   // little-endian limbs
+    for k in 0..8 {
+        // v = (hi[k], lo[k]) + carry
+        let l0 = lo[k] as u64 as u128 + carry[0] as u128;
+        let l1 = (lo[k] >> 64) + carry[1] as u128 + (l0 >> 64);
+        let l2 = hi[k] as u128 + carry[2] as u128 + (l1 >> 64);
+        let limbs = [l2 as u64, l1 as u64, l0 as u64];
+        let (mut rem, mut quo) = (0u128, [0u64; 3]);
+        for (i, &x) in limbs.iter().enumerate() {
+            let cur = (rem << 64) | x as u128;
+            quo[2 - i] = (cur / Q as u128) as u64;
+            rem = cur % Q as u128;
+        }
+        d[k] = rem as u64;
+        carry = quo;
+    }
+    d
+}
+
 impl MTranscript {
     pub fn new(profile: &str, salt: &[u8; 64]) -> Self {
         let mut t = Self { prefix: FS_DOMAIN.to_vec(), sponge: sha3::Shake256::default(), absorbed: 0, parse: ParseState::new() };
@@ -313,8 +375,33 @@ impl MTranscript {
         r
     }
     pub fn challenge_k(&mut self, stage: Stage, attempt: u64, index: u64) -> K8 {
-        let r = self.query(ChalType::K, stage, attempt, index, 1);
-        unrank_k(r, 1).remove(0)
+        let t_q = std::time::Instant::now();
+        let k = self.query_k(stage, attempt, index);
+        QUERY_STATS.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        QUERY_STATS.1.fetch_add(t_q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        k
+    }
+    /// `query(ChalType::K, ..)` + `unrank_k` with the fixed-width rank.
+    fn query_k(&mut self, stage: Stage, attempt: u64, index: u64) -> K8 {
+        let mut a = Vec::with_capacity(40);
+        for w in [ChalType::K as u64, stage as u64, attempt, index, 1] { a.extend_from_slice(&w.to_be_bytes()); }
+        frame(&mut self.prefix, 4, 0, &a);
+        assert!(u64::try_from(self.prefix.len()).unwrap() <= MAX_ADDRESS_BYTES, "address cap exceeded");
+        self.parse.advance(&self.prefix);
+        assert!(self.parse.cardinality() == krank().q8, "builder/parser mismatch");
+        self.sponge.update(&self.prefix[self.absorbed..]);
+        self.absorbed = self.prefix.len();
+        let d = k_from_sponge(self.sponge.clone());
+        let r = d.iter().rev().fold(BigUint::zero(), |acc, &x| acc * Q + x);
+        #[cfg(test)]
+        {
+            let n = krank().q8.clone();
+            assert_eq!(registered_cardinality(&self.prefix), n, "incremental parser differs");
+            let slow = typed_rank(&self.prefix, &n);
+            assert_eq!(slow, r, "fixed-width rank differs");
+        }
+        frame(&mut self.prefix, 5, 0, &r.to_bytes_be());
+        K8(d)
     }
     pub fn challenge_k_not01(&mut self, stage: Stage, attempt: u64, index: u64) -> K8 {
         let r = self.query(ChalType::KNot01, stage, attempt, index, 1) + 2u32;
