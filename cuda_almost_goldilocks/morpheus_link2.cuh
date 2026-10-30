@@ -295,9 +295,10 @@ __global__ void __launch_bounds__(160, 3) generic_kernel(
                         const K8d w0 = F[2 * rl], dw = ksub(F[2 * rl + 1], w0);
                         K8d wt;
                         for (int a = 0; a < 8; a++) wt.c[a] = mauth::fadd(w0.c[a], mauth::fmul(dw.c[a], tq));
-                        const K8d w2 = kmul(wt, wt), w3 = kmul(w2, wt);
-                        b3 = kadd(b3, kmul(ea, ksub(w3, wt)));
-                        b2 = kadd(b2, kmul(ea, ksub(w2, wt)));
+                        // ea·w, ea·w², ea·w³ by three products.
+                        const K8d ew = kmul(ea, wt), ew2 = kmul(ew, wt), ew3 = kmul(ew2, wt);
+                        b3 = kadd(b3, ksub(ew3, ew));
+                        b2 = kadd(b2, ksub(ew2, ew));
                         if (hasq) acc_q = kadd(acc_q, kmul(qt, wt));
                     }
                 }
@@ -341,8 +342,10 @@ __global__ void __launch_bounds__(256) fold_kernel(
 
 /// q_coarse and χ_coarse for every block of every region (thread per block).
 /// Block g of the flattened list belongs to region rid[g] with index k[g].
+/// Dense tables have 2^qbits entries (b0, or 0 for factored tables already
+/// reduced against e_full).
 __global__ void coarse_q_kernel(Consts C, const uint32_t* __restrict__ rid, const uint32_t* __restrict__ kk, uint64_t n,
-                                const K8d* __restrict__ tfold, const K8d* __restrict__ e_full, int b0, uint64_t coarse,
+                                const K8d* __restrict__ tfold, const K8d* __restrict__ e_full, int qbits, uint64_t coarse,
                                 K8d* __restrict__ q, K8d* __restrict__ chi)
 {
     for (uint64_t g = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; g < n; g += (uint64_t)gridDim.x * blockDim.x) {
@@ -357,13 +360,26 @@ __global__ void coarse_q_kernel(Consts C, const uint32_t* __restrict__ rid, cons
         }
         uint32_t qi = (R.flags & 4) ? C.qidx[R.qd_off + k] : 0xffffffffu;
         if (qi != 0xffffffffu) {
-            const K8d* qb = C.qd + ((uint64_t)qi << b0);
-            for (int p = 0; p < (1 << b0); p++) if (!kzero_p(qb[p])) acc = kadd(acc, kmul(qb[p], e_full[p]));
+            const K8d* qb = C.qd + ((uint64_t)qi << qbits);
+            if (qbits == 0) acc = kadd(acc, qb[0]);
+            else for (int p = 0; p < (1 << qbits); p++) if (!kzero_p(qb[p])) acc = kadd(acc, kmul(qb[p], e_full[p]));
         }
         const uint64_t at = (uint64_t)R.src * coarse + R.base_blk + k;
         q[at] = kcanon(acc);
         K8d c1 = kzero(); if (R.flags & 1) c1.c[0] = 1;
         chi[at] = c1;
+    }
+}
+
+/// Factored dense query tables (table t = a_t ⊗ pw of its region) at level i:
+/// out[t][y] = af[t][y >> pbits]·pf[pf_off[t] + (y & (2^pbits − 1))].
+__global__ void dense_expand_kernel(const K8d* __restrict__ af, int afn, const K8d* __restrict__ pf, const uint32_t* __restrict__ pf_off,
+                                    int pbits, int ybits, uint64_t ntab, K8d* __restrict__ out)
+{
+    const uint64_t tot = ntab << ybits;
+    for (uint64_t g = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; g < tot; g += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t t = g >> ybits; const uint32_t y = (uint32_t)(g & ((1u << ybits) - 1));
+        out[g] = kmul(af[t * afn + (y >> pbits)], pf[pf_off[t] + (y & ((1u << pbits) - 1))]);
     }
 }
 
@@ -566,6 +582,7 @@ __global__ void __launch_bounds__(128) onehot_pre_kernel(
     for (uint64_t bi = s0; bi < e0; bi++) {
         const Blk b = blks[bi];
         const Region R = C.regions[b.region];
+        if (R.flags & 8) continue;
         if ((int)b.region != cur) {
             flush();
             g3 = g2 = w0 = w1 = w2 = w3 = kzero();
@@ -600,6 +617,222 @@ __global__ void __launch_bounds__(128) onehot_pre_kernel(
     flush();
 }
 
+__device__ __forceinline__ K8d shfl_down_seg(const K8d& v, int off, int width) {
+    K8d r; for (int w = 0; w < 8; w++) r.c[w] = __shfl_down_sync(0xffffffffu, v.c[w], off, width); return r;
+}
+
+// ------------------------------------------------------------- one-hot bins
+/// Binned one-hot blocks (p = 4, ≤ 2 terms; region flag 8). One pass over the
+/// digits gives what the plane rounds and round i = p need, so these blocks
+/// never enter the round kernels at i ≤ p. With V_b[r] = ca(b)·eq(α_(p..B0), r):
+///   GV[par][s]   = Σ_b Σ_{idx: sel = s, idx&1 = par} V_b[idx >> 1]
+///                  (G3[s] = γ_range·Σ_par eqb(α_p, par)·GV[par][s], G2 likewise),
+///   U[T][b][par][s] = Σ_blk c_T Σ_{idx: sel = s, idx&1 = par, (idx>>1)&1 = b} B5_T[idx >> 2]
+///                  (B5_T the round-5 table; the host derives the round-4 and
+///                  plane-round bins: U4[par][s] = Σ_b eqb(r_T1, b)·U[b][par][s],
+///                  W_T[s] = Σ_par eqb(r_T0, par)·U4[par][s]),
+///   J[s0][s1]    = Σ_b Σ_{r: (sel(2r), sel(2r+1)) = (s0, s1)} V_b[r],
+///   J5[c]        = (Σ cr·ea5[r], Σ cb·ea5[r]) over round-5 pairs r (indices
+///                  4r..4r+3) of quad class c = (s0, s1, s2, s3) (global atomics;
+///                  each block's most frequent class by complement, Σ_r ea5[r] = 1).
+/// GV and J are kept per (source, χ) run and flushed times γ_range, γ_bit:
+/// out GV[0..1] = (γ_range·GV, γ_bit·GV), J[0..1] = (γ_range·J, γ_bit·J).
+/// Warp per data block; lane (s, par) = (lane & 15, lane >> 4) owns class s
+/// and index parity par; J rows s0 are owned by lanes 0..15.
+constexpr int BIN_P = 4, BIN_NP = 1 << BIN_P;
+__device__ unsigned long long g_bin_prof[8];
+#define BPROF(k) do { if (prof && lane == 0) { long long _t = clock64(); atomicAdd(&g_bin_prof[k], (unsigned long long)(_t - _t0)); _t0 = _t; } } while (0)
+__global__ void __launch_bounds__(128) onehot_bin_kernel(
+    const int8_t* __restrict__ raw, uint64_t src_len, int b0,
+    const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc_oh,
+    const K8d* __restrict__ ea1, const K8d* __restrict__ ea5, const K8d* __restrict__ B5, uint32_t chunk, int prof,
+    u64* __restrict__ GV, u64* __restrict__ U, u64* __restrict__ J, u64* __restrict__ J5)
+{
+    extern __shared__ K8d bin_sh[];   // per warp: J (256 K), V (64 K), sel (128 B)
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int cls = lane & 15, par = lane >> 4;
+    // Warps take interleaved chunks of consecutive blocks.
+    const uint64_t gw = blockIdx.x * 4 + warp, nw = (uint64_t)gridDim.x * 4;
+    K8d* Jw = bin_sh + (size_t)warp * (BIN_NP * BIN_NP + 64 + 2);
+    K8d* V = Jw + BIN_NP * BIN_NP;
+    uint8_t* sel = reinterpret_cast<uint8_t*>(V + 64);
+    for (int j = lane; j < BIN_NP * BIN_NP; j += 32) Jw[j] = kzero();
+    int cur = -1, ctc = 0, jsrc = -1, jchi = 0;
+    uint32_t ctoff = 0, cw = 0;
+    K8d gv = kzero(), u00 = kzero(), u01 = kzero(), u10 = kzero(), u11 = kzero();   // u{term}{b}
+    auto flush = [&]() {
+        if (cur < 0) return;
+        if (ctc > 0) { kacc_atomic(U + (((size_t)(cw + 0) * 4 + 0 + par) * 32 + cls) * 16, kcanon(u00)); kacc_atomic(U + (((size_t)(cw + 0) * 4 + 2 + par) * 32 + cls) * 16, kcanon(u01)); }
+        if (ctc > 1) { kacc_atomic(U + (((size_t)(cw + 1) * 4 + 0 + par) * 32 + cls) * 16, kcanon(u10)); kacc_atomic(U + (((size_t)(cw + 1) * 4 + 2 + par) * 32 + cls) * 16, kcanon(u11)); }
+    };
+    // Per-warp cache of the dominant round-5 class contributions.
+    int d5 = -1; K8d d5r = kzero(), d5b = kzero();
+    auto flush5 = [&]() {
+        if (d5 >= 0 && lane == 0) {
+            kacc_atomic(J5 + ((size_t)0 * 65536 + d5) * 16, kcanon(d5r));
+            kacc_atomic(J5 + ((size_t)1 * 65536 + d5) * 16, kcanon(d5b));
+        }
+        d5 = -1; d5r = d5b = kzero();
+    };
+    auto flush_j = [&]() {
+        __syncwarp();
+        if (jsrc < 0) return;
+        const K8d gr = C.g_range[jsrc], gb = C.g_bit[jsrc];
+        if (!kzero_p(gv)) {
+            kacc_atomic(GV + ((size_t)(0 * 2 + par) * 32 + cls) * 16, kcanon(kmul(gr, gv)));
+            if (jchi) kacc_atomic(GV + ((size_t)(1 * 2 + par) * 32 + cls) * 16, kcanon(kmul(gb, gv)));
+        }
+        gv = kzero();
+        for (int j = lane; j < BIN_NP * BIN_NP; j += 32) {
+            const K8d x = Jw[j];
+            if (kzero_p(x)) continue;
+            kacc_atomic(J + ((size_t)0 * BIN_NP * BIN_NP + j) * 16, kcanon(kmul(gr, x)));
+            if (jchi) kacc_atomic(J + ((size_t)1 * BIN_NP * BIN_NP + j) * 16, kcanon(kmul(gb, x)));
+            Jw[j] = kzero();
+        }
+        __syncwarp();
+    };
+    const uint32_t mlo = (1u << C.ca_lo_bits) - 1;
+    const uint32_t pmask = par ? 0xAAAAAAAAu : 0x55555555u;
+    long long _t0 = clock64();
+    for (uint64_t ch = gw; ch * chunk < nblk; ch += nw)
+    for (uint64_t bi = ch * chunk; bi < nblk && bi < (ch + 1) * chunk; bi++) {
+        const Blk b = blks[bi];
+        const Region R = C.regions[b.region];
+        if (!(R.flags & 8)) continue;
+        BPROF(7);
+        if ((int)b.region != cur) {
+            flush();
+            u00 = u01 = u10 = u11 = kzero();
+            cur = (int)b.region; ctoff = R.toff; cw = R.qd_off; ctc = (int)R.tcnt;
+        }
+        const int chi = (int)(R.flags & 1);
+        if ((int)b.src != jsrc || chi != jchi) { flush_j(); jsrc = (int)b.src; jchi = chi; }
+        BPROF(0);
+        // Selected plane of each of the 128 indices (16 bytes each).
+        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        #pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int idx = lane * 4 + q;
+            const int4 v = __ldg(reinterpret_cast<const int4*>(dg) + idx);
+            const uint32_t wv[4] = {(uint32_t)v.x, (uint32_t)v.y, (uint32_t)v.z, (uint32_t)v.w};
+            int s = 0;
+            #pragma unroll
+            for (int k = 3; k >= 0; k--) if (wv[k]) s = k * 4 + ((__ffs(wv[k]) - 1) >> 3);
+            sel[idx] = (uint8_t)s;
+        }
+        const K8d ca = kmul(C.ca_lo[b.id & mlo], C.ca_hi[b.id >> C.ca_lo_bits]);
+        V[lane] = kmul(ca, ea1[lane]);
+        V[lane + 32] = kmul(ca, ea1[lane + 32]);
+        __syncwarp();
+        BPROF(1);
+        const K8d* o = bc_oh + C.bco[C.oh_base + nblk - 1 - bi];
+        {
+            // Round-5 pair r = lane: quad class of indices 4r..4r+3.
+            const int c5 = (sel[4 * lane] << 12) | (sel[4 * lane + 1] << 8) | (sel[4 * lane + 2] << 4) | sel[4 * lane + 3];
+            const unsigned peers = __match_any_sync(0xffffffffu, c5);
+            const unsigned best = __reduce_max_sync(0xffffffffu, ((unsigned)__popc(peers) << 16) | (unsigned)c5);
+            const int dom5 = (int)(best & 0xffff);
+            const K8d cr = o[0], cb = o[1];
+            const bool hb = !kzero_p(cb);
+            K8d vr = kzero(), vb = kzero();
+            if (c5 != dom5) {
+                vr = kmul(cr, ea5[lane]);
+                kacc_atomic(J5 + ((size_t)0 * 65536 + c5) * 16, kcanon(vr));
+                if (hb) { vb = kmul(cb, ea5[lane]); kacc_atomic(J5 + ((size_t)1 * 65536 + c5) * 16, kcanon(vb)); }
+            }
+            // Dominant: cr·Σ ea5 − Σ_{others} = cr − Σ_{others}.
+            vr = kcanon(vr); vb = kcanon(vb);
+            for (int off = 16; off > 0; off >>= 1) { vr = kadd(vr, shfl_down_k(vr, off)); vb = kadd(vb, shfl_down_k(vb, off)); }
+            if (lane == 0) {
+                if (dom5 != d5) { flush5(); d5 = dom5; }
+                d5r = kadd(d5r, ksub(cr, vr));
+                if (hb) d5b = kadd(d5b, ksub(cb, vb));
+            }
+            d5 = __shfl_sync(0xffffffffu, d5, 0);
+        }
+        uint32_t mk[4];
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const int sv = sel[c * 32 + lane];
+            uint32_t mine = 0;
+            #pragma unroll
+            for (int s = 0; s < BIN_NP; s++) { const uint32_t m = __ballot_sync(0xffffffffu, sv == s); if (s == cls) mine = m; }
+            mk[c] = mine & pmask;
+        }
+        // Dominant class (most indices): its bins follow by complement, so
+        // no lane walks its (typically most) indices.
+        int n = 0;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) n += __popc(mk[c]);
+        const int tot = n + __shfl_xor_sync(0xffffffffu, n, 16);
+        const int dom = (int)(__reduce_max_sync(0xffffffffu, (unsigned)((tot << 4) | cls)) & 15);
+        if (prof) {
+            const int mx = __reduce_max_sync(0xffffffffu, (unsigned)n);
+            const int m2 = __reduce_max_sync(0xffffffffu, (unsigned)(cls == dom ? 0 : n));
+            if (lane == 0) { atomicAdd(&g_bin_prof[5], (unsigned long long)mx); atomicAdd(&g_bin_prof[6], (unsigned long long)m2); }
+        }
+        BPROF(2);
+        const Term* Ts = C.terms + ctoff;
+        const K8d* B0t = ctc > 0 ? C.B + Ts[0].boff : nullptr;
+        const K8d* B1t = ctc > 1 ? C.B + Ts[1].boff : nullptr;
+        // Block-local sums of this lane's class and parity; js: this lane's
+        // J additions (pairs not both dominant).
+        const K8d* B50 = ctc > 0 ? B5 + (size_t)(cw + 0) * 32 : nullptr;
+        const K8d* B51 = ctc > 1 ? B5 + (size_t)(cw + 1) * 32 : nullptr;
+        K8d gvb = kzero(), ub00 = kzero(), ub01 = kzero(), ub10 = kzero(), ub11 = kzero(), js = kzero();
+        if (cls != dom) {
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                uint32_t m = mk[c];
+                while (m) {
+                    const int bt = __ffs(m) - 1; m &= m - 1;
+                    const int idx = c * 32 + bt, r = idx >> 1;
+                    const K8d vr = V[r];
+                    gvb = kadd(gvb, vr);
+                    const int y5 = idx >> 2;
+                    if ((idx >> 1) & 1) { if (B50) ub01 = kadd(ub01, B50[y5]); if (B51) ub11 = kadd(ub11, B51[y5]); }
+                    else                { if (B50) ub00 = kadd(ub00, B50[y5]); if (B51) ub10 = kadd(ub10, B51[y5]); }
+                    // Pair (s0, s1): row s0 ≠ dom by lane (s0, 0); (dom, s1) by lane (s1, 1).
+                    if (par == 0) { K8d& jj = Jw[cls * BIN_NP + sel[idx + 1]]; jj = kadd(jj, vr); js = kadd(js, vr); }
+                    else if (sel[idx - 1] == dom) { K8d& jj = Jw[dom * BIN_NP + cls]; jj = kadd(jj, vr); js = kadd(js, vr); }
+                }
+            }
+        }
+        // Complements: Σ_par-lanes gvb = Σ_r V[r] = ca (Σ ea1 = 1), Σ J = ca.
+        const K8d tvb = ca;
+        js = kcanon(js);
+        for (int off = 16; off > 0; off >>= 1) js = kadd(js, shfl_down_k(js, off));
+        js = kcanon(js);
+        K8d jsb;
+        for (int w = 0; w < 8; w++) jsb.c[w] = __shfl_sync(0xffffffffu, js.c[w], 0);
+        // Half (parity) totals of the non-dominant lanes; Σ_{y5} B5[y5] = 1 per (b, par).
+        auto half_sum = [&](K8d x) -> K8d {
+            x = kcanon(x);
+            for (int off = 8; off > 0; off >>= 1) x = kadd(x, shfl_down_seg(x, off, 16));
+            K8d h; for (int w = 0; w < 8; w++) h.c[w] = __shfl_sync(0xffffffffu, x.c[w], lane & 16);
+            return h;
+        };
+        const K8d hg = half_sum(gvb), h00 = half_sum(ub00), h01 = half_sum(ub01), h10 = half_sum(ub10), h11 = half_sum(ub11);
+        if (cls == dom) {
+            K8d one = kzero(); one.c[0] = 1;
+            gvb = ksub(tvb, hg);
+            ub00 = ksub(one, h00); ub01 = ksub(one, h01); ub10 = ksub(one, h10); ub11 = ksub(one, h11);
+            if (par == 0) { K8d& jj = Jw[dom * BIN_NP + dom]; jj = kadd(jj, ksub(tvb, jsb)); }
+        }
+        gv = kadd(gv, gvb);
+        __syncwarp();
+        BPROF(3);
+        if (ctc > 0) { u00 = kadd(u00, kmul(o[2], ub00)); u01 = kadd(u01, kmul(o[2], ub01)); }
+        if (ctc > 1) { u10 = kadd(u10, kmul(o[3], ub10)); u11 = kadd(u11, kmul(o[3], ub11)); }
+        __syncwarp();
+        BPROF(4);
+    }
+    flush();
+    flush_j();
+    flush5();
+}
+
 // ------------------------------------------------------------- index rounds
 /// Late block-local rounds (2^{b0−i} ≤ 128, 2^i ≥ 16): one warp per data
 /// block, folded digits F and query weights QF in a per-warp shared slice.
@@ -614,9 +847,6 @@ __global__ void __launch_bounds__(128) onehot_pre_kernel(
 /// partial[block][t] range at t (slot 1 zero), [4 + t] query at t (slot 5 zero).
 constexpr int IDX_WARPS = 4;
 constexpr int IDX_MAXY = 128;
-__device__ __forceinline__ K8d shfl_down_seg(const K8d& v, int off, int width) {
-    K8d r; for (int w = 0; w < 8; w++) r.c[w] = __shfl_down_sync(0xffffffffu, v.c[w], off, width); return r;
-}
 __global__ void __launch_bounds__(128, 4) index_kernel(
     const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
@@ -705,17 +935,19 @@ __global__ void __launch_bounds__(128, 4) index_kernel(
             }
             __syncwarp();
         }
-        // ---- C: evaluations.
+        // ---- C: evaluations; the block's range constants are applied once:
+        // Σ ea(cr(w³ − w) + cb(w² − w)) = cr·Σ(ea w³ − ea w) + cb·Σ(ea w² − ea w).
         const K8d cr = s_c[warp][0], cb = s_c[warp][1];
+        K8d b3 = kzero(), b2 = kzero();
         for (int rest = pl; rest < nrest; rest += 10) {
             const K8d w0 = Fw[2 * rest], w1 = Fw[2 * rest + 1];
             if (kzero_p(w0) && kzero_p(w1)) continue;
             const K8d dw = ksub(w1, w0);
             K8d wt;
             for (int a = 0; a < 8; a++) wt.c[a] = mauth::fadd(w0.c[a], mauth::fmul(dw.c[a], tq));
-            const K8d w2 = kmul(wt, wt), w3 = kmul(w2, wt);
-            const K8d r = kadd(kmul(cr, ksub(w3, wt)), kmul(cb, ksub(w2, wt)));
-            ar = kadd(ar, kmul(e_alpha[rest], r));
+            const K8d ew = kmul(e_alpha[rest], wt), ew2 = kmul(ew, wt), ew3 = kmul(ew2, wt);
+            b3 = kadd(b3, ksub(ew3, ew));
+            b2 = kadd(b2, ksub(ew2, ew));
             if (tl < 3) {
                 const K8d q0 = QFw[2 * rest], q1 = QFw[2 * rest + 1];
                 const K8d dq = ksub(q1, q0);
@@ -724,10 +956,152 @@ __global__ void __launch_bounds__(128, 4) index_kernel(
                 aq = kadd(aq, kmul(qt, wt));
             }
         }
+        if (nrest > pl) ar = kadd(ar, kadd(kmul(cr, b3), kmul(cb, b2)));
         __syncwarp();
     }
     // Lanes with equal t reduce through shared memory (once per kernel; the
     // dynamic slice holds at least IDX_WARPS·32·2 K).
+    __syncthreads();
+    K8d (*red)[2] = reinterpret_cast<K8d (*)[2]>(dyn_sh);
+    red[threadIdx.x][0] = kcanon(ar); red[threadIdx.x][1] = kcanon(aq);
+    __syncthreads();
+    if (threadIdx.x < 7) {
+        const int slot = threadIdx.x;
+        const int tt = slot < 4 ? slot : slot - 4, which = slot < 4 ? 0 : 1;
+        K8d sacc = kzero();
+        if (tt != 1 && !(which == 1 && tt == 3))
+            for (int l = 0; l < IDX_WARPS * 32; l++) {
+                const int ln = l & 31;
+                if (ln >= 30) continue;
+                const int lt = ln % 3 == 0 ? 0 : ln % 3 + 1;
+                if (lt == tt) sacc = kcanon(kadd(sacc, red[l][which]));
+            }
+        partial[(size_t)blockIdx.x * 7 + slot] = kcanon(sacc);
+    }
+}
+
+// ------------------------------------------------------------- late index rounds
+/// Index rounds with few pairs per block (2^{b0−i} ≤ 8): a warp takes K =
+/// 10/nrest blocks at once so its 30 evaluation lanes stay busy. Slot sl =
+/// lane/3 (block kk = sl/nrest, pair rest = sl%nrest); in phase B the slot's
+/// three lanes split the terms, in phase C they evaluate t ∈ {0, 2, 3}.
+/// Phase A (digit fold) is index_kernel's, per block of the batch. Output as
+/// index_kernel.
+constexpr int IB_SLOTS = 10;
+__global__ void __launch_bounds__(128, 4) index_batch_kernel(
+    const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
+    const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
+    const K8d* __restrict__ e_pre, const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
+{
+    extern __shared__ K8d dyn_sh[];   // per warp: F[2·IB_SLOTS], QF[2·IB_SLOTS]
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int ny = 1 << (b0 - i), nrest = ny >> 1;
+    const int K = IB_SLOTS / nrest;
+    const uint64_t gw = blockIdx.x * IDX_WARPS + warp, nw = (uint64_t)gridDim.x * IDX_WARPS;
+    K8d* Fw = dyn_sh + (size_t)warp * 4 * IB_SLOTS;
+    K8d* QFw = Fw + 2 * IB_SLOTS;
+    const int P = 1 << (b0 - 5);
+    const int span = P < (1 << i) ? P : (1 << i);
+    const int G = (1 << i) > P ? (1 << i) / P : 1;
+    const int nys = P >> (31 - __clz(span));
+    const int sl = lane < 30 ? lane / 3 : IB_SLOTS, sub = lane % 3;
+    const int tl = lane < 30 ? (sub == 0 ? 0 : sub + 1) : 0;
+    const u64 tq = (u64)tl;
+    const int kk = sl / nrest, rest = sl % nrest;
+    K8d ar = kzero(), aq = kzero();
+    for (uint64_t bb = gw * K; bb < nblk; bb += nw * K) {
+        const int nb = nblk - bb < (uint64_t)K ? (int)(nblk - bb) : K;
+        for (int q = 0; q < nb; q++) {
+            const Blk b = blks[bb + q];
+            uint32_t qd = 0xffffffffu;
+            if (b.region != 0xffffffffu) {
+                const Region R = C.regions[b.region];
+                if (R.flags & 4) { uint32_t qi = C.qidx[R.qd_off + b.k]; qd = qi == 0xffffffffu ? 0xffffffffu : (qi << (b0 - i)); }
+            }
+            K8d* F = Fw + q * ny;
+            const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0) + (size_t)lane * P;
+            for (int s = 0; s < nys; s++) {
+                const int start = lane * P + s * span;
+                const int poff = start & ((1 << i) - 1);
+                K8d acc = kzero();
+                for (int c = 0; c < span; c += 16) {
+                    const int4 v = __ldg(reinterpret_cast<const int4*>(dg + s * span + c));
+                    const uint32_t wv[4] = {(uint32_t)v.x, (uint32_t)v.y, (uint32_t)v.z, (uint32_t)v.w};
+                    #pragma unroll
+                    for (int qq = 0; qq < 4; qq++) {
+                        uint32_t x = wv[qq];
+                        while (x) {
+                            const int bt = __ffs(x) - 1, by = bt >> 3;
+                            const int8_t dv = (int8_t)((x >> (by * 8)) & 0xff);
+                            x &= ~(0xffu << (by * 8));
+                            const K8d e = e_pre[poff + c + qq * 4 + by];
+                            acc = dv == 1 ? kadd(acc, e) : ksub(acc, e);
+                        }
+                    }
+                }
+                if (G > 1) {
+                    acc = kcanon(acc);
+                    for (int off = G >> 1; off > 0; off >>= 1) acc = kadd(acc, shfl_down_seg(acc, off, G));
+                }
+                if (lane % G == 0) F[start >> i] = kcanon(acc);
+            }
+            if (lane < ny) QFw[q * ny + lane] = qd != 0xffffffffu ? C.qd[qd + lane] : kzero();
+        }
+        __syncwarp();
+        // ---- B: the slot's three lanes split its block's terms.
+        const bool live = sl < IB_SLOTS && kk < nb;
+        K8d q0 = kzero(), q1 = kzero();
+        const K8d* o = nullptr;
+        if (live) {
+            const Blk b = blks[bb + kk];
+            o = bc + C.bco[bb + kk];
+            if (b.region != 0xffffffffu) {
+                const Region R = C.regions[b.region];
+                for (int k = sub; k < (int)R.tcnt; k += 3) {
+                    const Term T = C.terms[R.toff + k];
+                    const int pr = rest & ((1 << T.pa) - 1), ir = rest >> T.pa;
+                    const K8d bv = kmul(C.B[T.boff + ir], o[2 + k]);
+                    q0 = kadd(q0, kmul(C.A[T.aoff + pr], bv));
+                    q1 = kadd(q1, kmul(C.A[T.aoff + (1 << T.pa) + pr], bv));
+                }
+            }
+        }
+        q0 = kcanon(q0); q1 = kcanon(q1);
+        K8d x0, x1, y0, y1;
+        for (int w = 0; w < 8; w++) {
+            x0.c[w] = __shfl_down_sync(0xffffffffu, q0.c[w], 1); x1.c[w] = __shfl_down_sync(0xffffffffu, q1.c[w], 1);
+            y0.c[w] = __shfl_down_sync(0xffffffffu, q0.c[w], 2); y1.c[w] = __shfl_down_sync(0xffffffffu, q1.c[w], 2);
+        }
+        if (live && sub == 0) {
+            K8d* QF = QFw + kk * ny;
+            QF[2 * rest] = kcanon(kadd(QF[2 * rest], kadd(q0, kadd(x0, y0))));
+            QF[2 * rest + 1] = kcanon(kadd(QF[2 * rest + 1], kadd(q1, kadd(x1, y1))));
+        }
+        __syncwarp();
+        // ---- C: evaluations.
+        if (live) {
+            const K8d* F = Fw + kk * ny;
+            const K8d w0 = F[2 * rest], w1 = F[2 * rest + 1];
+            if (!(kzero_p(w0) && kzero_p(w1))) {
+                const K8d cr = o[0], cb = o[1];
+                const K8d dw = ksub(w1, w0);
+                K8d wt;
+                for (int a = 0; a < 8; a++) wt.c[a] = mauth::fadd(w0.c[a], mauth::fmul(dw.c[a], tq));
+                const K8d ew = kmul(e_alpha[rest], wt);
+                const K8d ew2 = kmul(ew, wt), ew3 = kmul(ew2, wt);
+                // e·(cr(w³ − w) + cb(w² − w))
+                ar = kadd(ar, kadd(kmul(cr, ksub(ew3, ew)), kmul(cb, ksub(ew2, ew))));
+                if (tl < 3) {
+                    const K8d* QF = QFw + kk * ny;
+                    const K8d qa = QF[2 * rest], dq = ksub(QF[2 * rest + 1], qa);
+                    K8d qt;
+                    for (int a = 0; a < 8; a++) qt.c[a] = mauth::fadd(qa.c[a], mauth::fmul(dq.c[a], tq));
+                    aq = kadd(aq, kmul(qt, wt));
+                }
+            }
+        }
+        __syncwarp();
+    }
     __syncthreads();
     K8d (*red)[2] = reinterpret_cast<K8d (*)[2]>(dyn_sh);
     red[threadIdx.x][0] = kcanon(ar); red[threadIdx.x][1] = kcanon(aq);

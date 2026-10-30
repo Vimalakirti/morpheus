@@ -36,12 +36,15 @@ extern "C" {
     pub fn agl_add_i32_i64(d: *mut i64, s: *const i32, n: u64) -> i32;
     pub fn agl_mlink2_coarse_init2(d_raw_virtual: *const i8, src_len: u64, b0: i32, h_consts: *const c_void,
         d_blks: *const c_void, nblk: u32, d_rid: *const u32, d_k: *const u32, nrb: u64,
-        d_tfold: *const u64, d_efull: *const u64, coarse: u64, src_base: u32, nsrc: u32,
+        d_tfold: *const u64, d_efull: *const u64, qbits: i32, coarse: u64, src_base: u32, nsrc: u32,
         d_w: *mut u64, d_q: *mut u64, d_chi: *mut u64) -> i32;
+    pub fn agl_mlink2_dense_expand(d_af: *const u64, afn: c_int, d_pf: *const u64, d_pf_off: *const u32, pbits: c_int, ybits: c_int,
+        ntab: u64, d_out: *mut u64) -> c_int;
     pub fn agl_mlink2_coarse_round(d_w: *const u64, d_q: *const u64, d_chi: *const u64, nsrc: u32, len: u64, d_grange: *const u64, d_gbit: *const u64, d_ealpha: *const u64, d: c_int, h_out: *mut u64) -> c_int;
     pub fn agl_mlink2_coarse_fold(d_in: *const u64, d_out: *mut u64, nsrc: u32, len: u64, h_r: *const u64) -> c_int;
     pub fn agl_mlink2_onehot3(d_raw: *const i8, src_len: u64, b0: c_int, i: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_e1: *const u64, d_e2: *const u64, d_e3: *const u64, d_eai: *const u64, d_eai_off: *const u32, d_eapr: *const u64, d_eapr_off: *const u32, h_out: *mut u64) -> c_int;
     pub fn agl_mlink2_onehot_pre(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc_oh: *const u64, d_eai: *const u64, d_eai_off: *const u32, d_g: *mut u64, d_w: *mut u64) -> c_int;
+    pub fn agl_mlink2_onehot_bin(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc_oh: *const u64, d_ea1: *const u64, d_ea5: *const u64, d_b5: *const u64, d_gv: *mut u64, d_u: *mut u64, d_j: *mut u64, d_j5: *mut u64) -> c_int;
     pub fn agl_morpheus_permute(d_src: *const i8, d_dst: *mut i8, n: u64) -> c_int;
     pub fn agl_mpiop_pe(d_vals: *const u64, rest_pos: *const c_int, nrest_v: c_int, fix_pos: *const c_int, nfix_v: c_int, d_e: *const u64, d_out: *mut u64) -> c_int;
     pub fn agl_mpiop_eq(h_point: *const u64, n: c_int, d_out: *mut u64) -> c_int;
