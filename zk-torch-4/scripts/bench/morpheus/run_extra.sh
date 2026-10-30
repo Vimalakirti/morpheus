@@ -16,6 +16,7 @@ OUT=${OUT:-scripts/bench/morpheus/out_extra}
 mkdir -p "$OUT"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3,0,1}
 export PROFILE=ternary B0=11 SLOTS_LOG=17 ZK4_EXP_BITS=8 MORPHEUS_TIMING=1 DEFER=1 N_REQUESTS=${N_DEFER:-2}
+export ARGMAX_LOGIT_BITS=${ARGMAX_LOGIT_BITS:-20}
 TW=(WEIGHTS=${WEIGHTS:-dense} ZK4_EXACT_RMS=1 ZK4_TABLE_SIZE_LOG=24)
 
 # The server is shared: wait until no process holds GPU memory, so a foreign

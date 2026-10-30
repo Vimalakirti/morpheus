@@ -152,17 +152,47 @@ fn ar_run(name: &str, ar: Ar, seq: usize, vocab: usize, request: u64) -> Instanc
     let prompt_len = 16.min(seq);
     let mut tokens: Vec<usize> = (0..seq).map(|_| rng.gen::<usize>() % vocab).collect();
     // Generate an actual suffix. This is deliberately outside proof timing.
-    for position in prompt_len..seq {
+    // Jacobi decoding: each pass sets every suffix token to the argmax at the
+    // previous position. The model is causal, so after k passes the first k
+    // suffix tokens are final, and the unique fixed point is the sequential
+    // greedy suffix. Stops at the fixed point (at most seq - prompt_len passes).
+    let mut passes = 0;
+    for _ in prompt_len..seq {
         wit[emb_sel] = vec![DagBuilder::build_one_hot_selector_witness(seq, vocab, &tokens, Role::Input)];
         dag.run(&mut wit, &[]);
-        let (mut best, mut value) = (0usize, i128::MIN);
-        for (k, &(start,len)) in ranges.iter().enumerate() {
-            for off in 0..len {
-                let v=f_to_int(wit[logits[k]][0].get(&[position-1,off]));
-                if v>value { value=v; best=start+off; }
+        passes += 1;
+        let mut changed = false;
+        for position in prompt_len..seq {
+            let (mut best, mut value) = (0usize, i128::MIN);
+            for (k, &(start,len)) in ranges.iter().enumerate() {
+                for off in 0..len {
+                    let v=f_to_int(wit[logits[k]][0].get(&[position-1,off]));
+                    if v>value { value=v; best=start+off; }
+                }
             }
+            if tokens[position] != best { tokens[position]=best; changed = true; }
         }
-        tokens[position]=best;
+        if !changed { break; }
+    }
+    eprintln!("[generate] {} suffix tokens in {passes} forward passes", seq - prompt_len);
+    if std::env::var("MORPHEUS_GEN_CHECK").is_ok() {
+        // Reference: one position per forward pass.
+        let mut seq_tokens = tokens.clone();
+        for position in prompt_len..seq { seq_tokens[position] = 0; }
+        for position in prompt_len..seq {
+            wit[emb_sel] = vec![DagBuilder::build_one_hot_selector_witness(seq, vocab, &seq_tokens, Role::Input)];
+            dag.run(&mut wit, &[]);
+            let (mut best, mut value) = (0usize, i128::MIN);
+            for (k, &(start,len)) in ranges.iter().enumerate() {
+                for off in 0..len {
+                    let v=f_to_int(wit[logits[k]][0].get(&[position-1,off]));
+                    if v>value { value=v; best=start+off; }
+                }
+            }
+            seq_tokens[position]=best;
+        }
+        assert_eq!(seq_tokens, tokens, "Jacobi suffix differs from sequential generation");
+        eprintln!("[generate] matches sequential generation");
     }
     wit[emb_sel] = vec![DagBuilder::build_one_hot_selector_witness(seq, vocab, &tokens, Role::Input)];
     dag.run(&mut wit, &[]);

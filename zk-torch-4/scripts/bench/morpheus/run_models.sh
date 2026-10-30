@@ -21,6 +21,8 @@ mkdir -p "$OUT"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3,0,1}
 export MORPHEUS_GPUS=${MORPHEUS_GPUS:-4} MORPHEUS_AUTH_GPUS=${MORPHEUS_AUTH_GPUS:-4}
 export PROFILE=ternary B0=11 SLOTS_LOG=${SLOTS_LOG:-17} ZK4_EXP_BITS=8 MORPHEUS_TIMING=1
+# Public argmax logit bound: |logit| < 2^20 at the logit scale (GPT-2 reaches ~2^16).
+export ARGMAX_LOGIT_BITS=${ARGMAX_LOGIT_BITS:-20}
 # Transformers: quantized-model-like dense weights (the previous evaluation
 # used zero matrices) and the exact RMS reciprocal gadget.
 TW=(WEIGHTS=${WEIGHTS:-dense} ZK4_EXACT_RMS=1)
