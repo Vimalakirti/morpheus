@@ -82,3 +82,26 @@ link guard before publication; this is not a substitute for compilation.
 5. Complete numerical/causal/no-wrap repairs, prove canonical program binding,
    then rerun source/mask/query census and authenticated performance workloads.
    Persist full accepted proof bytes, binary/source identities and run manifests.
+
+## Subsequent fixed-point exp unit repair
+
+The cubic's constant term was raw integer `1` tagged `sf=15`. `Witness::new`
+does not scale its coefficients, so this represented `2^-15`, not one. It is
+now raw `32768`. At input zero, the other cubic terms vanish and TwoPow(0)
+is 32768; after the final sf30-to-output rescale, the old result was 0 at sf10
+(or 1 at sf15), while the repaired result is 1024 (or 32768). This intentionally
+changes numerical outputs; old benchmark measurements are not evidence for it.
+
+`python3 zk-torch-4/scripts/audit/test_exp_unit_reference.py` passes two scalar
+unit checks, including all output scales 1 through 29. The new Rust test
+`exp_zero_is_one_at_output_scale_cpu_forward` executes the actual graph's CPU
+operators without benchmark hooks/backend overrides, but remains UNEXECUTED
+until the Rust/CUDA dependency build can be satisfied. This is a unit-value bug
+repair only: it does not constrain ExpHelper's canonical remainder, pin arbitrary
+private model constants, repair softmax normalization, or prove causal masking.
+
+The library test build now ignores libtest filters/flags as YAML arguments;
+production binaries still reject missing explicitly requested config files.
+After supplying the real build dependencies, the focused check is:
+`cd zk-torch-4 && cargo test --lib exp_zero_is_one_at_output_scale_cpu_forward`.
+This command has NOT run in the current environment.

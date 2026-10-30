@@ -485,9 +485,10 @@ impl DagBuilder {
         );
         let half = self.param(half);
 
-        // B3. compute 1
+        // B3. compute fixed-point 1 at sf=15. Witness::new stores raw
+        // coefficients: integer 1 here would represent 2^-15, not one.
         let vals_one: Vec<AlmostGoldilocksField> =
-            (0..val_num).map(|_| AlmostGoldilocksField(1)).collect();
+            (0..val_num).map(|_| AlmostGoldilocksField(1 << 15)).collect();
         let vals_one = ArrayD::from_shape_vec(shape.clone(), vals_one).unwrap();
         let pad_vals_one = pad_to_pow_of_two(&vals_one, &AlmostGoldilocksField(0));
         let col_major_one: Vec<_> = pad_vals_one.view().reversed_axes().iter().cloned().collect();
@@ -1991,6 +1992,32 @@ impl DagBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exp_zero_is_one_at_output_scale_cpu_forward() {
+        // Execute the actual graph's CPU operators directly, avoiding the
+        // benchmark run hook and any GPU backend environment override.
+        let mut g = DagBuilder::new();
+        let x = g.committed_input(Witness::new(
+            vec![2], vec![AlmostGoldilocksField(0); 2],
+            DataType::Float, *SF_LOG, Role::Input,
+        ));
+        let out = g.exp(x)[0];
+        let (dag, mut witnesses) = g.compile();
+        for &nid in &dag.topo {
+            let node = &dag.nodes[nid];
+            let inputs: Vec<&Witness> = node.inputs.iter().map(|&e| &witnesses[e][0]).collect();
+            let outputs = node.kind.run(&inputs);
+            assert_eq!(outputs.len(), node.outputs.len());
+            for (&edge, value) in node.outputs.iter().zip(outputs) {
+                witnesses[edge] = vec![value];
+            }
+        }
+        let result = &witnesses[out][0];
+        assert_eq!(result.sf, *SF_LOG);
+        assert!(result.data.as_ref().unwrap().evaluations_ref().iter()
+            .all(|v| *v == AlmostGoldilocksField(1u64 << *SF_LOG)));
+    }
 
     #[test]
     fn test_dag_builder_simple_add() {

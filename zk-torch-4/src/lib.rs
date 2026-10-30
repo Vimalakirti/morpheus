@@ -31,6 +31,9 @@ use crate::util::config::Config;
 // ============================================================================
 
 pub static CONFIG_FILE: Lazy<String> = Lazy::new(|| {
+    // libtest arguments are test filters/flags, never a benchmark YAML path.
+    // Keep production binaries' explicit-config fail-closed behavior unchanged.
+    if cfg!(test) { return "config.yaml".to_string(); }
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         return "config.yaml".to_string();
@@ -48,7 +51,7 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
     // the fold tree quietly doubled, because tcl 6 -> the default 8 pushes the
     // top aux bucket from arity 24 to 26, past the GPU same-point cap. Only the
     // no-argument case is allowed to default.
-    let explicit = env::args().len() >= 2;
+    let explicit = !cfg!(test) && env::args().len() >= 2;
     match File::open(&*CONFIG_FILE) {
         Ok(mut file) => {
             let mut contents = String::new();
