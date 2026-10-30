@@ -162,4 +162,62 @@ __global__ void sc_fold_kernel(const K8d* __restrict__ in, K8d* __restrict__ out
     }
 }
 
+/// One fused round: fold every table with r (out_j[k] = T_j[2k] + r (T_j[2k+1] − T_j[2k]),
+/// len/2 entries) and, over the folded pairs, the next round's
+/// Σ_k Π_j (F_j[2k] + t (F_j[2k+1] − F_j[2k])) for t = 0..d; partial per block.
+struct OutTabs { K8d* t[MAXTAB]; };
+__global__ void __launch_bounds__(256) sc_fold_round_kernel(Tabs T, OutTabs O, uint64_t len, K8d r, int d, K8d* __restrict__ partial) {
+    __shared__ K8d red[8][MAXTAB + 1];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    K8d acc[MAXTAB + 1];
+    for (int t = 0; t <= d; t++) acc[t] = kzero();
+    const uint64_t quarter = len >> 2;   // next-round pairs
+    for (uint64_t k = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; k < quarter; k += (uint64_t)gridDim.x * blockDim.x) {
+        K8d v[MAXTAB], dv[MAXTAB];
+        for (int j = 0; j < T.ntab; j++) {
+            const K8d a0 = T.t[j][4 * k], a1 = T.t[j][4 * k + 1], b0 = T.t[j][4 * k + 2], b1 = T.t[j][4 * k + 3];
+            const K8d f0 = kcanon(kadd(a0, mauth::k8_mul(r, ksub(a1, a0))));
+            const K8d f1 = kcanon(kadd(b0, mauth::k8_mul(r, ksub(b1, b0))));
+            O.t[j][2 * k] = f0; O.t[j][2 * k + 1] = f1;
+            v[j] = f0; dv[j] = ksub(f1, f0);
+        }
+        for (int t = 0; t <= d; t++) {
+            if (t > 0) for (int j = 0; j < T.ntab; j++) v[j] = kadd(v[j], dv[j]);
+            K8d p = v[0];
+            for (int j = 1; j < T.ntab; j++) p = mauth::k8_mul(p, v[j]);
+            acc[t] = kadd(acc[t], p);
+        }
+    }
+    for (int t = 0; t <= d; t++) {
+        K8d x = kcanon(acc[t]);
+        for (int off = 16; off > 0; off >>= 1) x = kadd(x, shfl_down_k(x, off));
+        if (lane == 0) red[warp][t] = kcanon(x);
+    }
+    __syncthreads();
+    if (threadIdx.x <= d) {
+        K8d s = kzero();
+        for (int w = 0; w < 8; w++) s = kadd(s, red[w][threadIdx.x]);
+        partial[(size_t)blockIdx.x * (MAXTAB + 1) + threadIdx.x] = kcanon(s);
+    }
+}
+
+/// out[t] = Σ_b partial[b][t] for t = 0..d (one block, grid-stride over b).
+__global__ void __launch_bounds__(256) sc_partial_sum_kernel(const K8d* __restrict__ partial, int nblk, int d, K8d* __restrict__ out) {
+    __shared__ K8d red[8][MAXTAB + 1];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int t = 0; t <= d; t++) {
+        K8d x = kzero();
+        for (int b = threadIdx.x; b < nblk; b += blockDim.x) x = kadd(x, partial[(size_t)b * (MAXTAB + 1) + t]);
+        x = kcanon(x);
+        for (int off = 16; off > 0; off >>= 1) x = kadd(x, shfl_down_k(x, off));
+        if (lane == 0) red[warp][t] = kcanon(x);
+    }
+    __syncthreads();
+    if (threadIdx.x <= d) {
+        K8d s = kzero();
+        for (int w = 0; w < 8; w++) s = kadd(s, red[w][threadIdx.x]);
+        out[threadIdx.x] = kcanon(s);
+    }
+}
+
 }  // namespace mpiop

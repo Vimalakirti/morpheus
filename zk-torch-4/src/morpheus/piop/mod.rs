@@ -702,6 +702,12 @@ impl<'a> Ctx<'a> {
         let mut mpref = K8::ZERO;
         let mut x = Vec::with_capacity(n);
         let mut inv2p = K8::ONE; // 2^-(i+1) after update
+        // Device rounds: the fused fold of round i also returns round i+1's sums.
+        #[cfg(feature = "cuda")]
+        let mut next_sums: Option<Vec<K8>> = None;
+        // Ping-pong partner tables (half size), allocated once per sumcheck.
+        #[cfg(feature = "cuda")]
+        let mut spare: Vec<gpu::KTab> = Vec::new();
         for i in 0..n {
             inv2p = inv2p.mul(&half);
             let d = degs[i];
@@ -709,7 +715,7 @@ impl<'a> Ctx<'a> {
             let on_dev = backend_tables!(true, matches!(tables.as_ref(), Some(Tables::Dev(_))), false);
             let g = if self.prover {
                 let s: Vec<K8> = match tables.as_ref().unwrap() {
-                #[cfg(feature = "cuda")] Tables::Dev(t) => gpu::sc_round(t, d),
+                #[cfg(feature = "cuda")] Tables::Dev(t) => next_sums.take().unwrap_or_else(|| gpu::sc_round(t, d)),
                 Tables::Host(tabs) => {
                 let len = tabs[0].len();
                 (0..len / 2).into_par_iter().with_min_len(512).fold(|| vec![K8::ZERO; d + 1], |mut acc, k| {
@@ -744,7 +750,16 @@ impl<'a> Ctx<'a> {
                         let h = t.len() / 2;
                         *t = (0..h).into_par_iter().with_min_len(1024).map(|k| t[2 * k].add(&r.mul(&t[2 * k + 1].sub(&t[2 * k])))).collect();
                     },
-                    #[cfg(feature = "cuda")] Tables::Dev(ts) => for t in ts.iter_mut() { *t = gpu::sc_fold(t, &r); },
+                    #[cfg(feature = "cuda")] Tables::Dev(ts) => {
+                        if i + 1 < n && ts[0].len >= 4 && ts.len() <= 6 && degs[i + 1] <= 6 {
+                            if spare.is_empty() { spare = ts.iter().map(|t| gpu::KTab::new(t.len / 2)).collect(); }
+                            let sums = gpu::sc_fold_round_into(ts, &mut spare, &r, degs[i + 1]);
+                            std::mem::swap(ts, &mut spare);
+                            next_sums = Some(sums);
+                        } else {
+                            for t in ts.iter_mut() { *t = gpu::sc_fold(t, &r); }
+                        }
+                    }
                 }
             }
             self.tick(if on_dev { ".r_dev_fold" } else { ".r_host_fold" }, tr2);
@@ -980,7 +995,10 @@ impl<'g, 'a> Walk<'g, 'a> {
 
     fn child_lin(&self, ctx: &mut Ctx, e: usize, r: &[K8]) -> (u32, K8) {
         let a = ctx.alloc("linear/merge child pad");
-        let v = ctx.send(if ctx.prover { Some(self.mle_e(e, r).add(&ctx.bank[a as usize])) } else { None });
+        let t0 = std::time::Instant::now();
+        let m = if ctx.prover { Some(self.mle_e(e, r)) } else { None };
+        if ctx.prover { ctx.tick(if gpu::enabled() && (1usize << r.len()) >= gpu::threshold() { ".mle_dev" } else { ".mle_host" }, t0); }
+        let v = ctx.send(m.map(|m| m.add(&ctx.bank[a as usize])));
         (a, v)
     }
 
@@ -1151,8 +1169,11 @@ impl<'g, 'a> Walk<'g, 'a> {
         }).collect();
         let has_pub = n_multi > 0;
         let use_gpu = gpu::enabled() && (1usize << n_sc) >= gpu::threshold();
+        // A small sumcheck over large operands: partial evaluation and gather
+        // on the device, then the short sumcheck on the host.
+        let big_input = gpu::enabled() && inputs.iter().any(|&inp| (1usize << self.g.nvars[inp]) >= gpu::threshold());
         let t_tab = std::time::Instant::now();
-        let tables = backend_tables!(ctx.prover && use_gpu, {
+        let tables = backend_tables!(ctx.prover && (use_gpu || big_input), {
             let mut t = Vec::new();
             if has_pub { t.push(gpu::gather(&gpu::eq(&r_multi), &(0..n_multi).collect::<Vec<_>>(), n_sc)); }
             for (k, &inp) in inputs.iter().enumerate() {
@@ -1166,7 +1187,7 @@ impl<'g, 'a> Walk<'g, 'a> {
                 let rest: Vec<usize> = maps[k].iter().filter_map(|&(_, m)| m.err()).collect();
                 t.push(gpu::gather(&pe, &rest, n_sc));
             }
-            Some(Tables::Dev(t))
+            if use_gpu { Some(Tables::Dev(t)) } else { Some(Tables::Host(t.iter().map(|x| x.to_host()).collect())) }
         }, { if ctx.prover {
             let mut t = Vec::new();
             if has_pub {
@@ -1188,6 +1209,7 @@ impl<'g, 'a> Walk<'g, 'a> {
             Some(Tables::Host(t))
         } else { None } });
         ctx.tick(".es_tables", t_tab);
+        if ctx.prover { ctx.tick(if use_gpu { ".es_tab_dev" } else if big_input { ".es_tab_mixed" } else { ".es_tab_host" }, t_tab); }
         let out = ctx.masked_sc(n_sc, inputs.len(), has_pub, c.z, &c.pad, tables, &|x: &[K8]| eq_pt(&r_multi, &x[..n_multi]));
         let rr = out.rho.mul(&out.rho.sub(&K8::ONE));
         for (k, &inp) in inputs.iter().enumerate() {

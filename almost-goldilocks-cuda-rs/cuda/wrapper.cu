@@ -3528,6 +3528,37 @@ int agl_mpiop_sc_round(const uint64_t* const* h_tabs, int ntab, uint64_t len, in
     return rc;
 }
 
+// Fused round: fold the ntab tables with r into d_outs, and return the next
+// round's d+1 sums (reduced on the device; one small copy, one sync).
+int agl_mpiop_sc_fold_round(const uint64_t* const* h_tabs, uint64_t* const* h_outs, int ntab, uint64_t len,
+                            const uint64_t* h_r, int d, uint64_t* h_out) {
+    if (ntab > mpiop::MAXTAB || d > mpiop::MAXTAB || len < 4) return -3;
+    mpiop::Tabs T; T.ntab = ntab; mpiop::OutTabs O;
+    for (int j = 0; j < ntab; j++) { T.t[j] = (const mauth::K8d*)h_tabs[j]; O.t[j] = (mauth::K8d*)h_outs[j]; }
+    mauth::K8d r; memcpy(r.c, h_r, 64);
+    int grid = mp_grid(len / 4, 256);
+    // Persistent per-device scratch (partials of the largest grid, the sums,
+    // pinned host landing): no allocation per round.
+    static void* part_buf[64] = {nullptr}; static void* sum_buf[64] = {nullptr}; static uint64_t* host_buf[64] = {nullptr};
+    static std::mutex mx;
+    int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 64) return -4;
+    std::lock_guard<std::mutex> lk(mx);   // scratch is shared per device
+    {
+        if (!part_buf[dev]) {
+            const size_t cap = (size_t)ma_sms() * 32 * (mpiop::MAXTAB + 1) * 64;
+            if (cudaMalloc(&part_buf[dev], cap) != cudaSuccess) return -1;
+            if (cudaMalloc(&sum_buf[dev], (size_t)(mpiop::MAXTAB + 1) * 64) != cudaSuccess) return -1;
+            if (cudaMallocHost((void**)&host_buf[dev], (size_t)(mpiop::MAXTAB + 1) * 64) != cudaSuccess) return -1;
+        }
+    }
+    mpiop::sc_fold_round_kernel<<<grid, 256>>>(T, O, len, r, d, (mauth::K8d*)part_buf[dev]);
+    mpiop::sc_partial_sum_kernel<<<1, 256>>>((const mauth::K8d*)part_buf[dev], grid, d, (mauth::K8d*)sum_buf[dev]);
+    int rc = (int)cudaGetLastError();
+    if (rc == 0) rc = (int)cudaMemcpy(host_buf[dev], sum_buf[dev], (size_t)(d + 1) * 64, cudaMemcpyDeviceToHost);
+    if (rc == 0) memcpy(h_out, host_buf[dev], (size_t)(d + 1) * 64);
+    return rc;
+}
+
 int agl_mpiop_sc_fold(const uint64_t* d_in, uint64_t* d_out, uint64_t len, const uint64_t* h_r) {
     mauth::K8d r; memcpy(r.c, h_r, 64);
     mpiop::sc_fold_kernel<<<mp_grid(len / 2, 256), 256>>>((const mauth::K8d*)d_in, (mauth::K8d*)d_out, len, r);

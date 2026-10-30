@@ -52,6 +52,7 @@ extern "C" {
     pub fn agl_mpiop_lift(d_in: *const u64, n: u64, d_out: *mut u64) -> c_int;
     pub fn agl_mpiop_sc_round(h_tabs: *const *const u64, ntab: c_int, len: u64, d: c_int, h_out: *mut u64) -> c_int;
     pub fn agl_mpiop_sc_fold(d_in: *const u64, d_out: *mut u64, len: u64, h_r: *const u64) -> c_int;
+    pub fn agl_mpiop_sc_fold_round(h_tabs: *const *const u64, h_outs: *const *mut u64, ntab: i32, len: u64, h_r: *const u64, d: i32, h_out: *mut u64) -> i32;
     pub fn agl_mlink2_index(d_raw: *const i8, src_len: u64, b0: c_int, i: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc: *const u64, d_epre: *const u64, d_ealpha: *const u64, h_out: *mut u64) -> c_int;
     pub fn agl_morpheus_gauss_scatter(d_out: *mut i64, h_idx: *const u32, h_val: *const i64, m: u32) -> c_int;
 

@@ -154,6 +154,32 @@ pub fn sc_round(tabs: &[KTab], d: usize) -> Vec<K8> {
     kvec(&out)
 }
 
+/// Fold every table with r and return the next round's d+1 sums over the
+/// folded tables (= sc_fold on each table, then sc_round), in one launch.
+pub fn sc_fold_round(tabs: &[KTab], r: &K8, d: usize) -> (Vec<KTab>, Vec<K8>) {
+    let len = tabs[0].len;
+    let outs: Vec<KTab> = tabs.iter().map(|_| KTab::new(len / 2)).collect();
+    let ins: Vec<*const u64> = tabs.iter().map(|t| t.buf.as_ptr()).collect();
+    let ops: Vec<*mut u64> = outs.iter().map(|t| t.buf.as_ptr() as *mut u64).collect();
+    let mut out = vec![0u64; 8 * (d + 1)];
+    let rc = unsafe { ffi::agl_mpiop_sc_fold_round(ins.as_ptr(), ops.as_ptr(), tabs.len() as i32, len as u64, r.words().as_ptr(), d as i32, out.as_mut_ptr()) };
+    assert_eq!(rc, 0, "fused fold/round kernel");
+    (outs, kvec(&out))
+}
+
+/// `sc_fold_round` into caller-owned tables whose buffers hold at least
+/// len/2 entries (ping-pong buffers; no allocation per round).
+pub fn sc_fold_round_into(tabs: &[KTab], outs: &mut [KTab], r: &K8, d: usize) -> Vec<K8> {
+    let len = tabs[0].len;
+    for o in outs.iter_mut() { assert!(o.buf.len() >= 8 * (len / 2), "ping-pong buffer too small"); o.len = len / 2; }
+    let ins: Vec<*const u64> = tabs.iter().map(|t| t.buf.as_ptr()).collect();
+    let ops: Vec<*mut u64> = outs.iter().map(|t| t.buf.as_ptr() as *mut u64).collect();
+    let mut out = vec![0u64; 8 * (d + 1)];
+    let rc = unsafe { ffi::agl_mpiop_sc_fold_round(ins.as_ptr(), ops.as_ptr(), tabs.len() as i32, len as u64, r.words().as_ptr(), d as i32, out.as_mut_ptr()) };
+    assert_eq!(rc, 0, "fused fold/round kernel");
+    kvec(&out)
+}
+
 pub fn sc_fold(t: &KTab, r: &K8) -> KTab {
     let out = KTab::new(t.len / 2);
     let rc = unsafe { ffi::agl_mpiop_sc_fold(t.buf.as_ptr(), out.buf.as_ptr() as *mut u64, t.len as u64, r.words().as_ptr()) };
@@ -197,6 +223,13 @@ mod tests {
                 });
                 assert_eq!(s[t as usize], want);
             }
+            // Fused fold + next round equals the separate kernels.
+            let r = rk(&mut rng);
+            let tabs = [KTab::from_host(&eq_table(&pt)), lift(&dv, 1 << n)];
+            let (fused, s2) = sc_fold_round(&tabs, &r, 3);
+            let sep: Vec<KTab> = tabs.iter().map(|t| sc_fold(t, &r)).collect();
+            assert_eq!(s2, sc_round(&sep, 3), "fused round sums n={n}");
+            for (a, b) in fused.iter().zip(&sep) { assert_eq!(a.to_host(), b.to_host(), "fused fold n={n}"); }
         }
     }
 }

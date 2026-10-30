@@ -45,6 +45,8 @@ pub enum Stage {
 
 
 pub const RAW_SLACK: usize = 8192;
+/// (queries, nanoseconds) over the process, for timing reports.
+pub static QUERY_STATS: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
 pub const FS_DOMAIN: &[u8] = b"MORPHEUS/FS/SHAKE256/v2\0";
 const MAX_RANK_BITS: u64 = 1 << 30;
 // All u64-length byte strings: no smaller arbitrary protocol restriction.
@@ -268,6 +270,13 @@ impl MTranscript {
         frame(&mut self.prefix, 3, item as u64, &bytes);
     }
     fn query(&mut self, ty: ChalType, stage: Stage, attempt: u64, index: u64, arity: usize) -> BigUint {
+        let t_q = std::time::Instant::now();
+        let r = self.query_inner(ty, stage, attempt, index, arity);
+        QUERY_STATS.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        QUERY_STATS.1.fetch_add(t_q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        r
+    }
+    fn query_inner(&mut self, ty: ChalType, stage: Stage, attempt: u64, index: u64, arity: usize) -> BigUint {
         let arity64 = u64::try_from(arity).expect("arity overflow");
         let n = match ty {
             ChalType::K => { assert_eq!(arity, 1); BigUint::from(Q).pow(8) },
