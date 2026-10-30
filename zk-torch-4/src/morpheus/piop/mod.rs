@@ -32,6 +32,8 @@ pub mod layout;
 pub mod tensor;
 #[cfg(test)]
 mod exp_tests;
+#[cfg(test)]
+mod cv_batch_tests;
 
 use crate::basicblock::BasicBlockType;
 use crate::dag::{Dag, PolyType, Role, Witness};
@@ -165,7 +167,7 @@ impl<'a> Graph<'a> {
             if matches!(nd.kind, BasicBlockType::Conv1D(_) | BasicBlockType::Conv2D(_) | BasicBlockType::Conv3D(_) | BasicBlockType::DepthwiseConv2D(_)) {
                 for &o in &nd.outputs[1..] { committed[o] = false; }
                 // The polynomial-product baseline commits Y_full.
-                if protocol_conv_pp && matches!(nd.kind, BasicBlockType::Conv2D(_)) && nd.outputs.len() == 2 { committed[nd.outputs[1]] = true; }
+                if protocol_conv_pp && matches!(nd.kind, BasicBlockType::Conv2D(_)) && nd.outputs.len() >= 2 { committed[nd.outputs[1]] = true; }
             }
             match &nd.kind {
                 BasicBlockType::NonNegative(nn) => { lookups.insert(nd.id, nn.table_size_log); }
