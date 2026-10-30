@@ -336,6 +336,21 @@ fn phases_v2_body<'u>(
     let mut n_ohw = 0u32;
     for r in regions_c.iter_mut() { if r.flags & 2 != 0 { r.qd_off = n_ohw; n_ohw += r.tcnt; } }
     lap("dense tables + regions");
+    if std::env::var("MORPHEUS_LINK_STATS").is_ok() {
+        // Term work: region blocks x query terms, by plane bits and term count.
+        let mut agg: std::collections::BTreeMap<(usize, usize, bool), (usize, usize)> = Default::default();
+        for (ri, r) in regs.iter().enumerate() {
+            let rc = &regions_c[ri];
+            let nb = 1usize << rc.h;
+            let tb = match r.terms.len() { 0..=2 => 2, 3..=4 => 4, 5..=8 => 8, 9..=16 => 16, 17..=32 => 32, _ => 999 };
+            let e = agg.entry((r.p, tb, rc.flags & 2 != 0)).or_default();
+            e.0 += nb; e.1 += nb * rc.tcnt as usize;
+        }
+        let tot: usize = agg.values().map(|v| v.1).sum();
+        eprintln!("[linkstats] total block-terms {tot}");
+        let mut v: Vec<_> = agg.into_iter().collect(); v.sort_by_key(|x| std::cmp::Reverse(x.1 .1));
+        for ((p, tb, oh), (nb, w)) in v.iter().take(20) { eprintln!("[linkstats] p={p:2} terms<={tb:3} onehot={oh:5} blocks {nb:9} block-terms {w:10} ({:4.1}%)", 100.0 * *w as f64 / tot.max(1) as f64); }
+    }
     // Nonzero blocks and their regions.
     let mut reg_sorted: Vec<(usize, usize, usize, usize)> = regs.iter().enumerate().map(|(i, r)| (r.src, r.base >> b0, 1usize << (r.m + r.p - b0), i)).collect();
     reg_sorted.sort();

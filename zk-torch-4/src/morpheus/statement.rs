@@ -1,4 +1,4 @@
-//! Canonical PUBLIC statement codec, version 3. This binds a verifier-trusted
+//! Canonical PUBLIC statement codec, version 4 (public arrays as maximal runs). This binds a verifier-trusted
 //! DAG; it is NOT a proof that a compiler implements the intended model.
 //! Private tensor payloads, advice, and Coins never enter this module. Fixed
 //! private model values must be identified separately by pinned commitments.
@@ -28,9 +28,18 @@ impl Words {
     fn pairs(&mut self, xs: &[(usize, usize)]) -> Result<(), String> {
         self.us(xs.len())?; for &(a,b) in xs { self.us(a)?; self.us(b)?; } Ok(())
     }
+    /// A canonical field array as its maximal runs: length, run count, then
+    /// (value, run length) pairs. Maximal runs are unique, so the encoding is
+    /// injective, and it binds every value; constant tables (interval
+    /// bounds), masks and one-hot selectors stay small.
     fn field_values(&mut self, xs: &[u64]) -> Result<(), String> {
         if xs.iter().any(|&v| v >= Q) { return Err("noncanonical public field value".into()); }
-        self.us(xs.len())?; self.0.extend_from_slice(xs); Ok(())
+        self.us(xs.len())?;
+        let mut runs: Vec<(u64, usize)> = Vec::new();
+        for &v in xs { match runs.last_mut() { Some(r) if r.0 == v => r.1 += 1, _ => runs.push((v, 1)) } }
+        self.us(runs.len())?;
+        for (v, n) in runs { self.u(v); self.us(n)?; }
+        Ok(())
     }
 }
 
@@ -96,7 +105,7 @@ fn operator(k: &BasicBlockType) -> Result<Vec<u64>, String> {
 
 /// Public protocol setup identity (no private randomness).
 fn setup(w: &mut Words, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_log: usize) -> Result<(), String> {
-    w.bytes(b"morpheus-public-statement")?; w.u(3);
+    w.bytes(b"morpheus-public-statement")?; w.u(4);
     w.bytes(p.name.as_bytes())?;
     w.usizes(&[p.rank,p.tau,p.hiding,p.source_payload_cols,p.aux_coeffs,p.deg_old,p.deg_final])?;
     w.u(p.sigma); w.u(p.b_z); for v in p.raw_noise { w.u(v); }
@@ -239,6 +248,24 @@ fn encode(g: &Graph, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_
     // MTranscript absorbs field elements. Split EVERY raw word into two
     // 32-bit limbs so values >= q cannot alias after field reduction.
     Ok(w.0.into_iter().flat_map(|v| [v & 0xffff_ffff, v >> 32]).collect())
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::Words;
+    fn enc(xs: &[u64]) -> Vec<u64> { let mut w = Words::default(); w.field_values(xs).unwrap(); w.0 }
+    #[test]
+    fn run_encoding_is_injective_on_small_arrays() {
+        // Every array over {0,1,2} of length <= 6 has a distinct encoding.
+        let mut seen = std::collections::HashMap::new();
+        for len in 0..=6usize {
+            for code in 0..3usize.pow(len as u32) {
+                let xs: Vec<u64> = (0..len).map(|i| ((code / 3usize.pow(i as u32)) % 3) as u64).collect();
+                if let Some(prev) = seen.insert(enc(&xs), xs.clone()) { panic!("{prev:?} and {xs:?} collide"); }
+            }
+        }
+        assert_eq!(enc(&[5; 1000]), vec![1000, 1, 5, 1000]);
+    }
 }
 
 fn public_array(w: &mut Words, g: &Graph, e: usize, v: &[u64], values: bool) -> Result<(), String> {

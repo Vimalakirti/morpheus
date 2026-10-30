@@ -207,6 +207,7 @@ impl<'a> Graph<'a> {
         }).map(|e| (e, witness_vals(&wit[e][0]))).collect();
         let g = Graph { dag, shapes, edge_meta, nvars, committed, model, bool_typed, lookups, public, outputs, cfg, protocol_conv_pp };
         g.validate_exp_profile().expect("invalid canonical exp guard graph");
+        if std::env::var("MORPHEUS_LOOKUP_STATS").is_ok() { g.lookup_stats(); }
         g
     }
 
@@ -266,6 +267,43 @@ impl<'a> Graph<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Diagnostic: lookup volume (elements x chunks) by originating gadget.
+    fn lookup_stats(&self) {
+        let kind = |n: usize| format!("{:?}", self.dag.nodes[n].kind).split(|c: char| c == '(' || c == ' ').next().unwrap().to_string();
+        let mut agg: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+        for (&node, &bits) in &self.lookups {
+            let nd = &self.dag.nodes[node];
+            let x = nd.inputs[0];
+            let n = 1usize << self.nvars[x];
+            let ch = self.chunks(node).len(); let _ = bits;
+            let k = kind(node);
+            let tag = if k != "NonNegative" { k } else {
+                match self.dag.producers[x] {
+                    None => "NonNegative<-leaf".into(),
+                    Some(p) => {
+                        let pn = &self.dag.nodes[p];
+                        let lit = pn.inputs.iter().position(|e| self.dag.program_literals.contains_key(e));
+                        match (kind(p).as_str(), lit) {
+                            ("Sub", Some(i)) => {
+                                let other = pn.inputs[1 - i];
+                                let o = self.dag.producers[other].map(|q| kind(q)).unwrap_or("leaf".into());
+                                format!("interval[{}] on {o}", if i == 1 { "lo" } else { "hi" })
+                            }
+                            (pk, _) => format!("NonNegative<-{pk}"),
+                        }
+                    }
+                }
+            };
+            let e = agg.entry(format!("{tag} b{bits}")).or_default();
+            e.0 += 1; e.1 += n; e.2 += n * ch;
+        }
+        let mut v: Vec<_> = agg.into_iter().collect();
+        v.sort_by_key(|(_, (_, _, c))| std::cmp::Reverse(*c));
+        let tot: usize = v.iter().map(|(_, (_, _, c))| c).sum();
+        eprintln!("[lookups] total chunk-indices {tot}");
+        for (k, (cnt, n, c)) in v.iter().take(40) { eprintln!("[lookups] {:>12} {:5.1}%  {cnt:6} nodes {n:>12} elems  {k}", c, 100.0 * *c as f64 / tot as f64); }
     }
 
     /// Stop committing tensors the PIOP never claims: non-public edges whose
@@ -1118,9 +1156,13 @@ impl<'g, 'a> Walk<'g, 'a> {
             let mut t = Vec::new();
             if has_pub { t.push(gpu::gather(&gpu::eq(&r_multi), &(0..n_multi).collect::<Vec<_>>(), n_sc)); }
             for (k, &inp) in inputs.iter().enumerate() {
+                let td = std::time::Instant::now();
                 let dv = self.pd.unwrap().dev(inp);
+                ctx.tick(".es_dev", td);
                 let fixed: Vec<(usize, K8)> = maps[k].iter().filter_map(|&(v, m)| m.ok().map(|o| (v, c.point[o]))).collect();
+                let td = std::time::Instant::now();
                 let pe = gpu::partial_eval(&dv, self.g.nvars[inp], &fixed);
+                ctx.tick(".es_pe", td);
                 let rest: Vec<usize> = maps[k].iter().filter_map(|&(_, m)| m.err()).collect();
                 t.push(gpu::gather(&pe, &rest, n_sc));
             }

@@ -52,7 +52,106 @@ const MAX_ADDRESS_BYTES: u64 = u64::MAX;
 
 /// Literal, injectively framed prefix. It is deliberately not a hash digest.
 #[derive(Clone)]
-pub struct MTranscript { prefix: Vec<u8> }
+pub struct MTranscript {
+    prefix: Vec<u8>,
+    /// SHAKE256 state after absorbing prefix[..absorbed]. Absorbing the
+    /// prefix incrementally and cloning the state per query gives exactly
+    /// SHAKE256(prefix) without rehashing the whole prefix every time.
+    sponge: sha3::Shake256,
+    absorbed: usize,
+    /// Incremental state of `registered_cardinality` over prefix[..parsed].
+    parse: ParseState,
+}
+
+/// `registered_cardinality`'s parser, resumable over appended frames.
+#[derive(Clone)]
+struct ParseState { parsed: usize, frame_number: usize, pending: Option<BigUint>, failed: bool }
+
+impl ParseState {
+    fn new() -> Self { ParseState { parsed: 0, frame_number: 0, pending: None, failed: false } }
+    /// Consume the complete frames of address[self.parsed..] (same checks as
+    /// `registered_cardinality::parse`, frame by frame).
+    fn advance(&mut self, address: &[u8]) {
+        if self.failed { return; }
+        if self.parsed == 0 {
+            if address.len() as u64 > MAX_ADDRESS_BYTES || !address.starts_with(FS_DOMAIN) { self.failed = true; return; }
+            self.parsed = FS_DOMAIN.len();
+        }
+        while self.parsed < address.len() {
+            let rest = &address[self.parsed..];
+            match parse_frame(rest, self.frame_number, &mut self.pending) {
+                Some(used) => { self.parsed += used; self.frame_number += 1; }
+                None => { self.failed = true; return; }
+            }
+        }
+    }
+    fn cardinality(&self) -> BigUint {
+        if self.failed || self.frame_number < 3 { return BigUint::one(); }
+        self.pending.clone().unwrap_or_else(BigUint::one)
+    }
+}
+
+/// One frame of the registered-domain parser: bytes used, or None if malformed.
+fn parse_frame(rest: &[u8], frame_number: usize, pending: &mut Option<BigUint>) -> Option<usize> {
+    if rest.len()<17 { return None; }
+    let enc=rest[0];
+    let item=u64::from_be_bytes(rest[1..9].try_into().ok()?);
+    let len=usize::try_from(u64::from_be_bytes(rest[9..17].try_into().ok()?)).ok()?;
+    let end=17usize.checked_add(len)?;
+    let bytes=rest.get(17..end)?;
+    if frame_number==0 {
+        if enc!=2 || item!=Item::Profile as u64 { return None; }
+    } else if frame_number==1 {
+        if enc!=2 || item!=Item::Salt as u64 || len!=64 { return None; }
+    } else if let Some(n)=pending.take() {
+        if enc!=5 || item!=0 || bytes.is_empty() || (bytes.len()>1 && bytes[0]==0) || BigUint::from_bytes_be(bytes)>=n { return None; }
+    } else {
+        match enc {
+            1|2|3|6 => {
+                if !matches!(item,1..=11|99) || ((enc==1 || enc==6) && len%8!=0) || (enc==3 && len%64!=0) { return None; }
+                if matches!(enc,1|3) && bytes.chunks_exact(8).any(|b|u64::from_be_bytes(b.try_into().unwrap())>=Q) { return None; }
+            },
+            4 => {
+                if item!=0 || len!=40 { return None; }
+                let mut fields=[0u64;5];
+                for (w,b) in fields.iter_mut().zip(bytes.chunks_exact(8)) { *w=u64::from_be_bytes(b.try_into().ok()?); }
+                let [ty,stage,_attempt,index,arity]=fields;
+                if matches!(ty,4|5) && index!=0 { return None; }
+                if !(1..=8).contains(&stage) { return None; }
+                let n=match ty {
+                    1 if arity==1=>BigUint::from(Q).pow(8),
+                    2 if arity==1=>BigUint::from(Q).pow(8)-2u32,
+                    4=> {
+                        let exp=arity.checked_mul(8)?;
+                        if exp.checked_mul(64)?>MAX_RANK_BITS { return None; }
+                        BigUint::from(Q).pow(u32::try_from(exp).ok()?)
+                    },
+                    3|5 if ty==5 || arity==1=> {
+                        let bits=arity.checked_mul(128)?;
+                        if bits>MAX_RANK_BITS { return None; }
+                        BigUint::one()<<usize::try_from(bits).ok()?
+                    },
+                    _=>return None
+                };
+                *pending=Some(n);
+            },
+            _=>return None
+        }
+    }
+    Some(end)
+}
+
+/// `typed_rank` from a sponge that has absorbed the address.
+fn typed_rank_from(h: sha3::Shake256, cardinality: &BigUint) -> BigUint {
+    assert!(!cardinality.is_zero());
+    let bits = (cardinality - BigUint::one()).bits();
+    assert!(bits <= MAX_RANK_BITS, "unregistered typed width");
+    let ell = usize::try_from(bits).unwrap() + RAW_SLACK;
+    let mut bytes = vec![0u8; ell.div_ceil(8)];
+    h.finalize_xof().read(&mut bytes);
+    let unused = (8 - ell % 8) % 8;
+    (BigUint::from_bytes_be(&bytes) >> unused) % cardinality
+}
 
 fn frame(dst: &mut Vec<u8>, encoding: u8, item: u64, bytes: &[u8]) {
     let total=dst.len().checked_add(17).and_then(|n|n.checked_add(bytes.len())).expect("address length overflow");
@@ -144,7 +243,7 @@ pub fn registered_cardinality(address: &[u8]) -> BigUint {
 
 impl MTranscript {
     pub fn new(profile: &str, salt: &[u8; 64]) -> Self {
-        let mut t = Self { prefix: FS_DOMAIN.to_vec() };
+        let mut t = Self { prefix: FS_DOMAIN.to_vec(), sponge: sha3::Shake256::default(), absorbed: 0, parse: ParseState::new() };
         t.absorb_bytes(Item::Profile, profile.as_bytes());
         t.absorb_bytes(Item::Salt, salt);
         t
@@ -189,8 +288,16 @@ impl MTranscript {
         for w in [ty as u64, stage as u64, attempt, index, arity64] { a.extend_from_slice(&w.to_be_bytes()); }
         frame(&mut self.prefix, 4, 0, &a);
         assert!(u64::try_from(self.prefix.len()).unwrap() <= MAX_ADDRESS_BYTES, "address cap exceeded");
-        assert_eq!(registered_cardinality(&self.prefix), n, "builder/parser mismatch");
-        let r = typed_rank(&self.prefix, &n);
+        self.parse.advance(&self.prefix);
+        assert_eq!(self.parse.cardinality(), n, "builder/parser mismatch");
+        self.sponge.update(&self.prefix[self.absorbed..]);
+        self.absorbed = self.prefix.len();
+        let r = typed_rank_from(self.sponge.clone(), &n);
+        #[cfg(test)]
+        {
+            assert_eq!(registered_cardinality(&self.prefix), n, "incremental parser differs");
+            assert_eq!(typed_rank(&self.prefix, &n), r, "incremental sponge differs");
+        }
         // Subsequent challenges bind this decoded result and its exact address.
         // Unused raw bits are NEVER read into a future address or transcript.
         frame(&mut self.prefix, 5, 0, &r.to_bytes_be());
@@ -301,6 +408,23 @@ mod candidate_tests {
   let mut a=vec![];for w in [1u64,6,0,0,1] {a.extend_from_slice(&w.to_be_bytes());}
   frame(&mut t.prefix,4,0,&a);
   assert_eq!(registered_cardinality(&t.prefix),BigUint::one());
+ }
+}
+
+#[cfg(test)] mod incremental_tests {
+ use super::*;
+ #[test] fn incremental_queries_equal_full_rehash() {
+  // query() asserts equality with the full-prefix parse and hash under cfg(test).
+  let mut t=MTranscript::new("inc",&[7;64]);
+  for i in 0..50u64 {
+   t.absorb(Item::Other,&(0..(i*37%300)).collect::<Vec<u64>>());
+   if i%3==0 { t.absorb_bytes(Item::Other,&vec![i as u8; (i*1001%5000) as usize]); }
+   if i%5==0 { t.absorb_k(Item::Other,&[K8([i;8])]); }
+   let mut c=t.clone();
+   let _=c.challenge_c0_tuple(Stage::AuthColumn,i,3);
+   let _=t.challenge_k(Stage::LinkRound,0,i);
+   let _=t.challenge_k_bundle(Stage::LinkInit,0,(i%4) as usize);
+  }
  }
 }
 

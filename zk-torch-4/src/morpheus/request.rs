@@ -347,7 +347,9 @@ fn absorb_layout(tr: &mut MTranscript, lay: &Layout) {
 }
 
 fn request_transcript(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model: &[Vec<Vec<u64>>], c_input: &[Vec<Vec<u64>>], c_req: &[Vec<Vec<u64>>]) -> Option<MTranscript> {
+    let t_st = Instant::now();
     let words = super::statement::words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log).ok()?;
+    if o.timing { eprintln!("[transcript] statement words {} ({:.2} s)", words.len(), t_st.elapsed().as_secs_f64()); }
     let mut tr = MTranscript::new(o.profile.name, salt);
     tr.absorb(Item::Statement, &[wire::PROTOCOL_VERSION, 0, o.defer as u64]);
     tr.absorb(Item::Statement, &words);
@@ -365,6 +367,7 @@ fn request_transcript(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model:
     tr.absorb(Item::Statement, &[2]); absorb_model(&mut tr, c_input);
     tr.absorb(Item::Statement, &[3, c_req.len() as u64, j]);
     for c in c_req { for x in c { tr.absorb(Item::SourceCommitment, x); } }
+    if o.timing { eprintln!("[transcript] request prefix {:.1} MB ({:.2} s)", tr.literal_prefix().len() as f64 / 1e6, t_st.elapsed().as_secs_f64()); }
     Some(tr)
 }
 
@@ -546,6 +549,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         let mut walk = Walk::new(g, Some(pd));
         walk.run(&mut ctx);
         lap(&mut times, "piop", t);
+        if o.timing { let u = piop::gpu::UPLOAD.lock().unwrap(); eprintln!("[piop] edge uploads: {} edges, {:.2} GB, {:.2} s", u.0, u.1 as f64 / 1e9, u.2); }
         pd.clear_cache();
         if o.timing { for (k, v) in &ctx.stats { eprintln!("  {k:12} {:6} calls {:.3}s", v.0, v.1); } }
         println!("{}", ctx.census_line());
