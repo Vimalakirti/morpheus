@@ -39,6 +39,7 @@ extern "C" {
         d_blks: *const c_void, nblk: u32, d_rid: *const u32, d_k: *const u32, nrb: u64,
         d_tfold: *const u64, d_efull: *const u64, qbits: i32, coarse: u64, src_base: u32, nsrc: u32,
         d_w: *mut u64, d_q: *mut u64, d_chi: *mut u64) -> i32;
+    pub fn agl_mlink2_b_halve(d_src: *const u64, d_dst: *mut u64, nk: u64, d_off: *const u32, d_pre: *const u64, nseg: u32, total: u64) -> c_int;
     pub fn agl_mlink2_dense_expand(d_af: *const u64, afn: c_int, d_pf: *const u64, d_pf_off: *const u32, pbits: c_int, ybits: c_int,
         ntab: u64, d_out: *mut u64) -> c_int;
     pub fn agl_mlink2_coarse_round(d_w: *const u64, d_q: *const u64, d_chi: *const u64, nsrc: u32, len: u64, d_grange: *const u64, d_gbit: *const u64, d_ealpha: *const u64, d: c_int, h_out: *mut u64) -> c_int;

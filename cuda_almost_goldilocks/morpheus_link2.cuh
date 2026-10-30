@@ -448,6 +448,20 @@ __global__ void dense_expand_kernel(const K8d* __restrict__ af, int afn, const K
     }
 }
 
+/// Index-round step of the per-term B tables: dst[off_s + y] = src[off_s + 2y]
+/// + src[off_s + 2y + 1] for y < len_s (eq tables over the remaining index
+/// bits: summing out the bound bit). pre[s] = Σ_{s' < s} len_{s'}.
+__global__ void b_halve_kernel(const K8d* __restrict__ src, K8d* __restrict__ dst, const uint32_t* __restrict__ off,
+                               const uint64_t* __restrict__ pre, uint32_t nseg, uint64_t total)
+{
+    for (uint64_t g = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; g < total; g += (uint64_t)gridDim.x * blockDim.x) {
+        uint32_t lo = 0, hi = nseg;   // last s with pre[s] <= g
+        while (hi - lo > 1) { const uint32_t m = (lo + hi) >> 1; if (pre[m] <= g) lo = m; else hi = m; }
+        const uint64_t y = g - pre[lo], o = off[lo];
+        dst[o + y] = kcanon(kadd(src[o + 2 * y], src[o + 2 * y + 1]));
+    }
+}
+
 // ------------------------------------------------------------- coarse rounds
 /// One coarse round over len-entry tables per source (pairs k: (2k, 2k+1)).
 __global__ void __launch_bounds__(160) coarse_round_kernel(
@@ -705,17 +719,21 @@ __device__ __forceinline__ K8d shfl_down_seg(const K8d& v, int off, int width) {
 /// Warp per data block; lane (s, par) = (lane & 15, lane >> 4) owns class s
 /// and index parity par; J rows s0 are owned by lanes 0..15.
 constexpr int BIN_P = 4, BIN_NP = 1 << BIN_P;
+constexpr int J5_REP = 8;   // replicas of the round-5 bins (spread hot-bin atomics; summed on the host)
 __device__ unsigned long long g_bin_prof[8];
 #define BPROF(k) do { if (prof && lane == 0) { long long _t = clock64(); atomicAdd(&g_bin_prof[k], (unsigned long long)(_t - _t0)); _t0 = _t; } } while (0)
 __global__ void __launch_bounds__(128) onehot_bin_kernel(
     const int8_t* __restrict__ raw, uint64_t src_len, int b0,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc_oh,
-    const K8d* __restrict__ ea1, const K8d* __restrict__ ea5, const K8d* __restrict__ B5, uint32_t chunk, int prof,
+    const K8d* __restrict__ ea1, const K8d* __restrict__ ea5, const K8d* __restrict__ B5, uint32_t chunk, int prof_dbg,
     u64* __restrict__ GV, u64* __restrict__ U, u64* __restrict__ J, u64* __restrict__ J5)
 {
     extern __shared__ K8d bin_sh[];   // per warp: J (256 K), V (64 K), sel (128 B)
+    // Debug (timing only; results wrong): bit 1 skips round 5, 2 the class loop, 4 the U products, 8 the V products.
+    const int prof = prof_dbg & 1, dbg = prof_dbg >> 1;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int cls = lane & 15, par = lane >> 4;
+    J5 += (size_t)(blockIdx.x % J5_REP) * 2 * 65536 * 16;
     // Warps take interleaved chunks of consecutive blocks.
     const uint64_t gw = blockIdx.x * 4 + warp, nw = (uint64_t)gridDim.x * 4;
     K8d* Jw = bin_sh + (size_t)warp * (BIN_NP * BIN_NP + 64 + 2);
@@ -786,13 +804,13 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
             for (int k = 3; k >= 0; k--) if (wv[k]) s = k * 4 + ((__ffs(wv[k]) - 1) >> 3);
             sel[idx] = (uint8_t)s;
         }
-        const K8d ca = kmul(C.ca_lo[b.id & mlo], C.ca_hi[b.id >> C.ca_lo_bits]);
-        V[lane] = kmul(ca, ea1[lane]);
-        V[lane + 32] = kmul(ca, ea1[lane + 32]);
+        const K8d ca = (dbg & 8) ? C.ca_lo[b.id & mlo] : kmul(C.ca_lo[b.id & mlo], C.ca_hi[b.id >> C.ca_lo_bits]);
+        V[lane] = (dbg & 8) ? ea1[lane] : kmul(ca, ea1[lane]);
+        V[lane + 32] = (dbg & 8) ? ea1[lane + 32] : kmul(ca, ea1[lane + 32]);
         __syncwarp();
         BPROF(1);
         const K8d* o = bc_oh + C.bco[C.oh_base + nblk - 1 - bi];
-        {
+        if (!(dbg & 1)) {
             // Round-5 pair r = lane: quad class of indices 4r..4r+3.
             const int c5 = (sel[4 * lane] << 12) | (sel[4 * lane + 1] << 8) | (sel[4 * lane + 2] << 4) | sel[4 * lane + 3];
             const unsigned peers = __match_any_sync(0xffffffffu, c5);
@@ -846,7 +864,7 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
         const K8d* B50 = ctc > 0 ? B5 + (size_t)(cw + 0) * 32 : nullptr;
         const K8d* B51 = ctc > 1 ? B5 + (size_t)(cw + 1) * 32 : nullptr;
         K8d gvb = kzero(), ub00 = kzero(), ub01 = kzero(), ub10 = kzero(), ub11 = kzero(), js = kzero();
-        if (cls != dom) {
+        if (cls != dom && !(dbg & 2)) {
             #pragma unroll
             for (int c = 0; c < 4; c++) {
                 uint32_t m = mk[c];
@@ -888,8 +906,10 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
         gv = kadd(gv, gvb);
         __syncwarp();
         BPROF(3);
-        if (ctc > 0) { u00 = kadd(u00, kmul(o[2], ub00)); u01 = kadd(u01, kmul(o[2], ub01)); }
-        if (ctc > 1) { u10 = kadd(u10, kmul(o[3], ub10)); u11 = kadd(u11, kmul(o[3], ub11)); }
+        if (!(dbg & 4)) {
+            if (ctc > 0) { u00 = kadd(u00, kmul(o[2], ub00)); u01 = kadd(u01, kmul(o[2], ub01)); }
+            if (ctc > 1) { u10 = kadd(u10, kmul(o[3], ub10)); u11 = kadd(u11, kmul(o[3], ub11)); }
+        }
         __syncwarp();
         BPROF(4);
     }

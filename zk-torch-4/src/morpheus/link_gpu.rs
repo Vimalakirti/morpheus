@@ -508,7 +508,7 @@ fn phases_v2_body<'u>(
                     calo: up_k(calo_h), cahi: up_k(cahi_h), grange: up_k(if gr.is_empty() { &[K8::ZERO][..] } else { &gr }), gbit: up_k(if gb.is_empty() { &[K8::ZERO][..] } else { &gb }),
                     regions: upload(&regions_l), hl: up_k(hl_all), hh: up_k(hh_all),
                     qd: up_k(if qt_g.is_empty() || fac_p.is_some() { &[K8::ZERO] } else { &qt_g }), qdl: None, qdl_len: if fac_p.is_some() { 0 } else { qt_g.len() },
-                    fac: fac_p.map(|_| (qt_g.clone(), tp_g.clone())),
+                    fac: fac_p.map(|_| (qt_g.clone(), tp_g.clone())), bdev: None, b_round: None,
                     qidx: DeviceBuffer::from_slice(if qi_g.is_empty() { &[0u32][..] } else { &qi_g }).unwrap(),
                     gen_base: gen_base.len(), oh: oh_g, gen_all: upload(&gen_all),
                     bc: DeviceBuffer::<u64>::new(bc_len.max(1) * 8).unwrap(), bco: DeviceBuffer::from_slice(if bco.is_empty() { &[0u64][..] } else { &bco }).unwrap(), ca_lo_bits,
@@ -541,6 +541,14 @@ fn phases_v2_body<'u>(
     // Round-5 B tables of the binned terms (eq over index bits 2.., 32 entries), by compact slot.
     let mut b5 = vec![K8::ZERO; (n_ohw as usize).max(1) * 32];
     for &(k, kw) in &bin_terms { b5[kw * 32..(kw + 1) * 32].copy_from_slice(&eq_table(&terms[order[k]].r[2..7])); }
+    // Fixed device offsets of the per-term B tables (round-0 sizes).
+    let mut boff0 = vec![0u32; order.len()];
+    let mut b_total = 0usize;
+    for (k, &t) in order.iter().enumerate() {
+        boff0[k] = b_total as u32;
+        let r = &regs[treg[t]];
+        if !(r.p > DENSE_P || r.terms.len() > 32) { b_total += 1usize << (b0 - r.p); }
+    }
     // Round-1 range sums of the generic blocks from digit classes (`range_bin1_kernel`).
     let rb1 = b0 >= 3 && std::env::var("MORPHEUS_NO_RB1").is_err();
     let mut rb1_bins: Vec<K8> = Vec::new();
@@ -554,15 +562,34 @@ fn phases_v2_body<'u>(
         let t_round = std::time::Instant::now();
         // Rows t = 0, 1 only (weights are linear in t); dense regions' terms
         // live in the dense query tables.
+        // A tables on the host; B tables (eq over the unbound index bits) live
+        // on the device at fixed offsets: built once at round 0, then halved by
+        // pairwise sums when a term's index bit is bound (`b_halve_kernel`).
         let tabs: Vec<(Vec<K8>, Vec<K8>, usize)> = order.par_iter().map(|&t| {
-            if regs[treg[t]].p > DENSE_P || regs[treg[t]].terms.len() > 32 { (Vec::new(), Vec::new(), 0) } else { term_tables(&terms[t], &xi, i, 1, b0) }
+            if regs[treg[t]].p > DENSE_P || regs[treg[t]].terms.len() > 32 { (Vec::new(), Vec::new(), 0) }
+            else if i == 0 { term_tables(&terms[t], &xi, i, 1, b0) } else { let (a, pa) = term_a(&terms[t], &xi, i, 1, b0); (a, Vec::new(), pa) }
         }).collect();
-        let (mut a_all, mut b_all) = (Vec::new(), Vec::new());
+        let mut a_all = Vec::new();
         let mut tc = terms_c.clone();
-        for (k, (a, b, pa)) in tabs.into_iter().enumerate() {
-            tc[k].pa = pa as u32; tc[k].aoff = (a_all.len()) as u32; tc[k].boff = (b_all.len()) as u32;
-            a_all.extend(a); b_all.extend(b);
+        for (k, (a, _, pa)) in tabs.iter().enumerate() {
+            tc[k].pa = *pa as u32; tc[k].aoff = (a_all.len()) as u32; tc[k].boff = boff0[k];
+            a_all.extend_from_slice(a);
         }
+        // Round 0: B tables at their fixed offsets (written in parallel).
+        let mut b_all: Vec<K8> = Vec::new();
+        if i == 0 {
+            b_all = vec![K8::ZERO; b_total.max(1)];
+            let bp = SyncPtr(b_all.as_mut_ptr());
+            tabs.par_iter().enumerate().for_each(|(k, (_, b, _))| unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bp.get().add(boff0[k] as usize), b.len()); });
+        }
+        // Terms whose B halves entering round i (index bit bound in round i − 1).
+        let halve: Vec<(u32, u64)> = if i == 0 { Vec::new() } else {
+            order.iter().enumerate().filter_map(|(k, &t)| {
+                let r = &regs[treg[t]];
+                if r.p > DENSE_P || r.terms.len() > 32 || i < r.p { return None; }
+                Some((boff0[k], 1u64 << (b0 - r.p - 1 - (i - r.p))))
+            }).collect()
+        };
         let t_tab = t_round.elapsed().as_secs_f64() * 1e3;
         let e1 = eq_table(&xi);
         let e2: Vec<K8> = e1.iter().map(|x| x.mul(x)).collect();
@@ -576,7 +603,7 @@ fn phases_v2_body<'u>(
         //   R_{i-1}(r) = (1 − α_i) R_i(0) + α_i R_i(1),  Q_{i-1}(r) = Q_i(0) + Q_i(1).
         let reduced = d == 4 && claims.is_some() && !alpha[i].is_zero() && !no_claim;
         let use_index = reduced && (1usize << (b0 - i)) <= 128 && i >= 4 && b0 >= 9 && std::env::var("MORPHEUS_NO_INDEX").is_err();
-        let rin = RoundIn { i, d, b0, src_len, reduced, use_index, r_prev: xi.last().copied(), full: false, b5: &b5, xi: &xi, fac_p, dense_pw: &dense_pw, skip_range: rb1 && i == 1, rb1, a_all: &a_all, b_all: &b_all, tc: &tc, e1: &e1, e2: &e2, e3: &e3, ea: &ea };
+        let rin = RoundIn { i, d, b0, src_len, reduced, use_index, halve: &halve, b_total, r_prev: xi.last().copied(), full: false, b5: &b5, xi: &xi, fac_p, dense_pw: &dense_pw, skip_range: rb1 && i == 1, rb1, a_all: &a_all, b_all: &b_all, tc: &tc, e1: &e1, e2: &e2, e3: &e3, ea: &ea };
         let outs: Vec<(Vec<K8>, Option<OhSums>, Option<Vec<K8>>)> = std::thread::scope(|sc| {
             let hs: Vec<_> = shards.iter_mut().map(|sh| {
                 let (rin, regions_c, nterms) = (&rin, &regions_c, n_ohw as usize);
@@ -844,25 +871,38 @@ fn onehot_sums(
     let ngv = 2 * 2 * 32;
     let d_gv = DeviceBuffer::from_slice(&vec![0u64; ngv * 16]).unwrap();
     let any_bin = oh.iter().any(|b| regions_c[b.region as usize].flags & 8 != 0);
-    let nj5 = 2 * 65536;
-    let d_j5 = DeviceBuffer::from_slice(&vec![0u64; if any_bin { nj5 * 16 } else { 16 }]).unwrap();
+    let (nj5, j5_rep) = (2 * 65536, 8);
+    let d_j5 = DeviceBuffer::from_slice(&vec![0u64; if any_bin { j5_rep * nj5 * 16 } else { 16 }]).unwrap();
     let bc_oh = d_bc.as_ptr();
     let mut c2 = *consts;
     c2.oh_base = n_gen_base as u64;
     let consts = &c2;
-    let rc = unsafe {
-        ffi::agl_mlink2_onehot_pre(raw_ptr, src_len, b0 as i32, consts as *const ConstsC as *const c_void,
-            d_oh.as_ptr() as *const c_void, oh.len() as u32, bc_oh, dptr(&d_eai) as *const u64, d_eai_off.as_ptr(),
-            d_g.as_ptr() as *mut u64, d_w.as_ptr() as *mut u64)
-    };
-    assert_eq!(rc, 0, "one-hot sums");
+    // Binned blocks are a prefix of `oh` (one_hot_bin_kernel), the rest a
+    // suffix (onehot_pre_kernel); each kernel gets only its range. Block k of
+    // a range starting at s0 (length n) has constants at
+    // bco[oh_base + N − 1 − (s0 + k)] = bco[oh_base' + n − 1 − k], oh_base' = oh_base + N − s0 − n.
+    let nbin = oh.partition_point(|b| regions_c[b.region as usize].flags & 8 != 0);
+    let n_all = oh.len();
+    let blk_sz = std::mem::size_of::<Blk>();
+    if nbin < n_all {
+        let mut c3 = *consts;
+        c3.oh_base = n_gen_base as u64;   // suffix: s0 + n = N
+        let rc = unsafe {
+            ffi::agl_mlink2_onehot_pre(raw_ptr, src_len, b0 as i32, &c3 as *const ConstsC as *const c_void,
+                (d_oh.as_ptr() as *const u8).add(nbin * blk_sz) as *const c_void, (n_all - nbin) as u32, bc_oh, dptr(&d_eai) as *const u64, d_eai_off.as_ptr(),
+                d_g.as_ptr() as *mut u64, d_w.as_ptr() as *mut u64)
+        };
+        assert_eq!(rc, 0, "one-hot sums");
+    }
     if any_bin {
         let d_ea1 = up_k(&eq_table(&alpha[5..b0]));
         let d_ea5 = up_k(&eq_table(&alpha[6..b0]));
         let d_b5 = up_k(b5);
+        let mut c4 = *consts;
+        c4.oh_base = (n_gen_base + n_all - nbin) as u64;   // prefix: s0 = 0, n = nbin
         let rc = unsafe {
-            ffi::agl_mlink2_onehot_bin(raw_ptr, src_len, b0 as i32, consts as *const ConstsC as *const c_void,
-                d_oh.as_ptr() as *const c_void, oh.len() as u32, bc_oh, dptr(&d_ea1) as *const u64, dptr(&d_ea5) as *const u64, dptr(&d_b5) as *const u64,
+            ffi::agl_mlink2_onehot_bin(raw_ptr, src_len, b0 as i32, &c4 as *const ConstsC as *const c_void,
+                d_oh.as_ptr() as *const c_void, nbin as u32, bc_oh, dptr(&d_ea1) as *const u64, dptr(&d_ea5) as *const u64, dptr(&d_b5) as *const u64,
                 d_gv.as_ptr() as *mut u64, d_u.as_ptr() as *mut u64, d_j.as_ptr() as *mut u64, d_j5.as_ptr() as *mut u64)
         };
         assert_eq!(rc, 0, "one-hot bins");
@@ -875,8 +915,35 @@ fn onehot_sums(
         g: halves(d_g.read_slice(0, ng * 16).unwrap()), w: halves(d_w.read_slice(0, nterms.max(1) * 32 * 16).unwrap()),
         u: halves(d_u.read_slice(0, nu * 16).unwrap()), j: halves(d_j.read_slice(0, nj * 16).unwrap()),
         gv: halves(d_gv.read_slice(0, ngv * 16).unwrap()),
-        j5: if any_bin { halves(d_j5.read_slice(0, nj5 * 16).unwrap()) } else { vec![K8::ZERO; nj5] },
+        j5: if any_bin {
+            let all = halves(d_j5.read_slice(0, j5_rep * nj5 * 16).unwrap());
+            (0..nj5).into_par_iter().map(|c| (0..j5_rep).fold(K8::ZERO, |a, r| a.add(&all[r * nj5 + c]))).collect()
+        } else { vec![K8::ZERO; nj5] },
         u4: Vec::new(),
+    }
+}
+
+/// The A table and pa of `term_tables` (its B table is kept on the device).
+fn term_a(t: &TermInfo, r_pre: &[K8], i: usize, d: usize, b0: usize) -> (Vec<K8>, usize) {
+    let p = t.p;
+    if i < p {
+        let pa = p - i - 1;
+        let e = eq_table(r_pre);
+        let mut a = vec![K8::ZERO; (d + 1) << pa];
+        for pr in 0..1usize << pa {
+            let f = |bit: usize| -> K8 { (0..1usize << i).fold(K8::ZERO, |acc, b| acc.add(&e[b].mul(&t.pw[b + (bit << i) + (pr << (i + 1))]))) };
+            let (f0, f1) = (f(0), f(1));
+            for tt in 0..=d { a[(tt << pa) + pr] = f0.add(&K8::from_base(tt as u64).mul(&f1.sub(&f0))); }
+        }
+        (a, pa)
+    } else {
+        let _ = b0;
+        let ep = eq_table(&r_pre[..p]);
+        let pwv = t.pw.iter().zip(&ep).fold(K8::ZERO, |acc, (w, e)| acc.add(&w.mul(e)));
+        let j = i - p;
+        let pre = t.r[..j].iter().zip(&r_pre[p..i]).fold(K8::ONE, |acc, (a, b)| acc.mul(&a.mul(b).add(&K8::ONE.sub(a).mul(&K8::ONE.sub(b)))));
+        let s = pwv.mul(&pre);
+        ((0..=d).map(|tt| s.mul(&eqt_k(&t.r[j], &K8::from_base(tt as u64)))).collect(), 0)
     }
 }
 
@@ -1071,6 +1138,8 @@ struct Shard {
     qd: DeviceBuffer<u64>, qdl: Option<DeviceBuffer<u64>>, qdl_len: usize, qidx: DeviceBuffer<u32>,
     /// Factored dense tables: host a_k tables and, per table, its region's pw index.
     fac: Option<(Vec<K8>, Vec<u32>)>,
+    /// Device B tables (current, scratch) and the round they hold.
+    bdev: Option<(DeviceBuffer<u64>, DeviceBuffer<u64>)>, b_round: Option<usize>,
     gen_base: usize, oh: Vec<Blk>, gen_all: DeviceBuffer<u8>, bc: DeviceBuffer<u64>, bco: DeviceBuffer<u64>, ca_lo_bits: usize,
 }
 
@@ -1092,6 +1161,7 @@ impl Shard {
 struct RoundIn<'a> {
     i: usize, d: usize, b0: usize, src_len: u64, reduced: bool, use_index: bool, r_prev: Option<K8>, full: bool, b5: &'a [K8],
     xi: &'a [K8], fac_p: Option<usize>, dense_pw: &'a [std::sync::Arc<Vec<K8>>], skip_range: bool, rb1: bool,
+    halve: &'a [(u32, u64)], b_total: usize,
     a_all: &'a [K8], b_all: &'a [K8], tc: &'a [TermC], e1: &'a [K8], e2: &'a [K8], e3: &'a [K8], ea: &'a [K8],
 }
 
@@ -1115,7 +1185,23 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
         }
     }
     let raw_ptr = sh.raw_ptr(dev_raw, rin.src_len);
-    let (d_a, d_b, d_t) = (up_k(rin.a_all), up_k(rin.b_all), upload(rin.tc));
+    let (d_a, d_t) = (up_k(rin.a_all), upload(rin.tc));
+    if i == 0 && sh.b_round.is_none() {
+        sh.bdev = Some((up_k(if rin.b_all.is_empty() { &[K8::ZERO][..] } else { rin.b_all }), DeviceBuffer::<u64>::new(rin.b_total.max(1) * 8).unwrap()));
+        sh.b_round = Some(0);
+    } else if sh.b_round.is_some_and(|r| r < i) {
+        let (src, dst) = sh.bdev.as_mut().unwrap();
+        let mut pre = Vec::with_capacity(rin.halve.len());
+        let mut tot = 0u64;
+        for &(_, n) in rin.halve { pre.push(tot); tot += n; }
+        let off: Vec<u32> = rin.halve.iter().map(|x| x.0).collect();
+        let (d_off, d_pre) = (DeviceBuffer::from_slice(if off.is_empty() { &[0u32][..] } else { &off }).unwrap(), DeviceBuffer::from_slice(if pre.is_empty() { &[0u64][..] } else { &pre }).unwrap());
+        let rc = unsafe { ffi::agl_mlink2_b_halve(src.as_ptr(), dst.as_ptr() as *mut u64, rin.b_total.max(1) as u64, d_off.as_ptr(), d_pre.as_ptr(), off.len() as u32, tot) };
+        assert_eq!(rc, 0, "B halving");
+        std::mem::swap(src, dst);
+        sh.b_round = Some(i);
+    }
+    let d_b = &sh.bdev.as_ref().unwrap().0;
     let (d_e1, d_e2, d_e3, d_ea) = (up_k(rin.e1), up_k(rin.e2), up_k(rin.e3), up_k(rin.ea));
     // Generic tail: one-hot blocks with p < i, and p = i unless binned.
     let n_ohb = if rin.full { sh.oh.len() - sh.oh.iter().filter(|b| regions_c[b.region as usize].p as usize <= i).count() } else { sh.oh.partition_point(|b| !in_gen(&regions_c[b.region as usize], i)) };

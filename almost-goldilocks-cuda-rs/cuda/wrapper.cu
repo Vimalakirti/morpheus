@@ -3384,6 +3384,13 @@ int agl_mlink2_range_bin1(const int8_t* d_raw, uint64_t src_len, int b0, const v
     return (int)e;
 }
 
+int agl_mlink2_b_halve(const uint64_t* d_src, uint64_t* d_dst, uint64_t nk, const uint32_t* d_off, const uint64_t* d_pre, uint32_t nseg, uint64_t total) {
+    cudaMemcpyAsync(d_dst, d_src, nk * 64, cudaMemcpyDeviceToDevice, 0);
+    if (nseg && total) mlink2::b_halve_kernel<<<ma_sms() * 16, 256>>>((const mauth::K8d*)d_src, (mauth::K8d*)d_dst, d_off, d_pre, nseg, total);
+    cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
+    return (int)e;
+}
+
 int agl_mlink2_coarse_round(const uint64_t* d_w, const uint64_t* d_q, const uint64_t* d_chi, uint32_t nsrc, uint64_t len,
                             const uint64_t* d_grange, const uint64_t* d_gbit, const uint64_t* d_ealpha, int d, uint64_t* h_out) {
     int sms = ma_sms();
@@ -3462,7 +3469,7 @@ int agl_mlink2_onehot_bin(const int8_t* d_raw, uint64_t src_len, int b0, const v
     const bool prof = getenv("MORPHEUS_BIN_PROF") != nullptr;
     if (prof) { unsigned long long z[8] = {0}; cudaMemcpyToSymbol(mlink2::g_bin_prof, z, sizeof(z)); }
     mlink2::onehot_bin_kernel<<<grid, 128, sh>>>(d_raw, src_len, b0, (const mlink2::Blk*)d_blks, nblk, C, (const mauth::K8d*)d_bc_oh,
-        (const mauth::K8d*)d_ea1, (const mauth::K8d*)d_ea5, (const mauth::K8d*)d_B5, chunk, prof ? 1 : 0,
+        (const mauth::K8d*)d_ea1, (const mauth::K8d*)d_ea5, (const mauth::K8d*)d_B5, chunk, (prof ? 1 : 0) | ((getenv("MORPHEUS_DBG_BIN") ? atoi(getenv("MORPHEUS_DBG_BIN")) : 0) << 1),
         (unsigned long long*)d_GV, (unsigned long long*)d_U, (unsigned long long*)d_J, (unsigned long long*)d_J5);
     cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
     if (prof) {
