@@ -82,6 +82,7 @@ pub struct Instance {
     pub units: usize,
     pub unit: &'static str,
     pub witness_secs: f64,
+    pub ar: Option<super::ar_statement::ArStatement>,
 }
 
 /// Embedding / head patterns of the previous binaries.
@@ -99,7 +100,7 @@ fn emb_data(kind: Emb, rows: usize, hidden: usize) -> Vec<F> {
     data
 }
 
-struct Ar { g: DagBuilder, emb_sel: EdgeId, logits: Vec<EdgeId>, sels: Vec<EdgeId>, ranges: Vec<(usize, usize)> }
+struct Ar { g: DagBuilder, emb_sel: EdgeId, logits: Vec<EdgeId>, sels: Vec<EdgeId>, ranges: Vec<(usize, usize)>, rank_constants: Vec<[usize;3]> }
 
 /// Embedding, body (closure), LM head (tied for GPT-2), argmax check.
 #[allow(clippy::too_many_arguments)]
@@ -117,26 +118,52 @@ fn ar_graph(seq: usize, vocab: usize, hidden: usize, emb: Emb, head: Emb, tied: 
         let lens: Vec<usize> = ranges.iter().map(|&(_, l)| l).collect();
         let ws: Vec<EdgeId> = lens.iter().map(|&l| g.param(Witness::new(vec![l, hidden], emb_data(head, l, hidden), DataType::Float, *SF_LOG, Role::Constant))).collect();
         let lg = g.lm_head_sharded(h_out, &ws, seq, &lens);
+        let first_new = g.num_edges;
         let sels = g.argmax_check_sharded(&lg, &ranges, seq, &init, Role::Input);
-        Ar { g, emb_sel, logits: lg, sels, ranges }
+        let rank_constants = rank_constants(&g, first_new, ranges.len());
+        Ar { g, emb_sel, logits: lg, sels, ranges, rank_constants }
     } else {
         let logits = if tied { g.lm_head_weight_tied(h_out, w_e, seq, vocab) } else {
             let w = g.param(Witness::new(vec![vocab, hidden], emb_data(head, vocab, hidden), DataType::Float, *SF_LOG, Role::Constant));
             g.lm_head(h_out, w, seq, vocab)
         };
+        let first_new = g.num_edges;
         let sel = g.argmax_check(logits, seq, vocab, &init, Role::Input);
-        Ar { g, emb_sel, logits: vec![logits], sels: vec![sel], ranges: vec![(0, vocab)] }
+        let rank_constants = rank_constants(&g, first_new, 1);
+        Ar { g, emb_sel, logits: vec![logits], sels: vec![sel], ranges: vec![(0, vocab)], rank_constants }
     }
 }
 
 /// Run the generation: random input tokens, forward, next tokens = argmax of
 /// the logits, set the argmax selectors, forward again.
+fn rank_constants(g: &DagBuilder, first: usize, shards: usize) -> Vec<[usize;3]> {
+    // Rank constructors emit B,V,index as public inputs before selector inputs.
+    let edges: Vec<usize> = (first..g.num_edges).filter(|&e| g.init_values[e].as_ref().map(|w|w.role==Role::Input).unwrap_or(false)).take(3*shards).collect();
+    assert_eq!(edges.len(),3*shards);
+    edges.chunks_exact(3).map(|e|[e[0],e[1],e[2]]).collect()
+}
+
 fn ar_run(name: &str, ar: Ar, seq: usize, vocab: usize, request: u64) -> Instance {
-    let Ar { g, emb_sel, logits, sels, ranges } = ar;
+    let Ar { g, emb_sel, logits, sels, ranges, rank_constants } = ar;
     let (dag, mut wit) = g.compile();
     let t = Instant::now();
     let mut rng = StdRng::seed_from_u64(42 + request);
-    let tokens: Vec<usize> = (0..seq).map(|_| rng.gen::<usize>() % vocab).collect();
+    assert!(seq > 0);
+    let prompt_len = 16.min(seq);
+    let mut tokens: Vec<usize> = (0..seq).map(|_| rng.gen::<usize>() % vocab).collect();
+    // Generate an actual suffix. This is deliberately outside proof timing.
+    for position in prompt_len..seq {
+        wit[emb_sel] = vec![DagBuilder::build_one_hot_selector_witness(seq, vocab, &tokens, Role::Input)];
+        dag.run(&mut wit, &[]);
+        let (mut best, mut value) = (0usize, i128::MIN);
+        for (k, &(start,len)) in ranges.iter().enumerate() {
+            for off in 0..len {
+                let v=f_to_int(wit[logits[k]][0].get(&[position-1,off]));
+                if v>value { value=v; best=start+off; }
+            }
+        }
+        tokens[position]=best;
+    }
     wit[emb_sel] = vec![DagBuilder::build_one_hot_selector_witness(seq, vocab, &tokens, Role::Input)];
     dag.run(&mut wit, &[]);
     let next: Vec<usize> = (0..seq).map(|i| {
@@ -158,7 +185,9 @@ fn ar_run(name: &str, ar: Ar, seq: usize, vocab: usize, request: u64) -> Instanc
     dag.run(&mut wit, &[]);
     let mut public = vec![emb_sel];
     public.extend(&sels);
-    Instance { name: name.into(), dag, wit, public, units: seq.saturating_sub(16).max(1), unit: "generated token", witness_secs: t.elapsed().as_secs_f64() }
+    public.extend(rank_constants.iter().flatten().copied());
+    let ar = Some(super::ar_statement::ArStatement { prompt_len, seq, vocab, embedding: emb_sel, selectors: sels.clone(), ranges: ranges.clone(), rank_constants, logits: logits.clone(), logit_bound: DagBuilder::first_argmax_budget(vocab).0 });
+    Instance { name: name.into(), dag, wit, public, units: seq.saturating_sub(16).max(1), unit: "generated token", witness_secs: t.elapsed().as_secs_f64(), ar }
 }
 
 pub fn gpt2(request: u64) -> Instance {
@@ -287,7 +316,7 @@ pub fn bert(request: u64) -> Instance {
     let input = Witness::new(vec![1, seq, h], data, DataType::Float, *SF_LOG, Role::Input);
     let t = Instant::now();
     dag.run(&mut wit, &[(x, input)]);
-    Instance { name: "BERT-Large".into(), dag, wit, public: vec![x], units: seq, unit: "input token", witness_secs: t.elapsed().as_secs_f64() }
+    Instance { name: "BERT-Large".into(), dag, wit, public: vec![x], units: seq, unit: "input token", witness_secs: t.elapsed().as_secs_f64(), ar: None }
 }
 
 /// MODEL env: gpt2 | gptj | llama2 | llama3 | bert.

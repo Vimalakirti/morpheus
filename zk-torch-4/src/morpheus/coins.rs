@@ -15,14 +15,19 @@
 //! The packet's profile byte covers PRIMARY64 (0) and causal1024 (1). The
 //! ternary candidate is registered here as profile 2 with the same field
 //! layout. Address uniqueness is structural (addresses are built from loop
-//! indices that never repeat), not a runtime reuse registry, which would not
-//! fit 10^8-10^9 draws per opening.
+//! indices that never repeat). A bounded registry reserves opening IDs and
+//! registration namespaces, not individual draws (10^8-10^9 per opening).
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 pub const TAG: &[u8; 17] = b"MORPHEUS/COIN/v1\0";
 pub const MESSAGE_BYTES: usize = 106;
 pub const OPENINGS: u64 = 1 << 20;
+/// Explicit per-backend budget for registered private-input source suffixes.
+pub const INPUT_SOURCES: u64 = 1 << 20;
+pub const INPUT_OWNER_BASE: u64 = 1 << 62;
 pub const ATTEMPTS: u16 = 512;
 /// Gaussian outer proposals R and raw polar trials H.
 pub const OUTER: u16 = 3072;
@@ -122,23 +127,99 @@ pub trait BitStream {
     fn next_bit(&mut self) -> Result<u8, CoinsExhausted>;
 }
 
+/// Lifecycle failures are fail-closed and contain no private seed material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoinLifecycleError {
+    DuplicateOpening,
+    OpeningLimit,
+    ModelAlreadyRegistered,
+    InputSourceLimit,
+    LifecyclePoisoned,
+}
+
+impl std::fmt::Display for CoinLifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DuplicateOpening => "private-coin opening ID already consumed",
+            Self::OpeningLimit => "private-coin opening lifetime cap exceeded",
+            Self::ModelAlreadyRegistered => "private-coin model registration already consumed",
+            Self::InputSourceLimit => "private-coin input source lifetime cap exceeded",
+            Self::LifecyclePoisoned => "private-coin lifecycle lock poisoned",
+        })
+    }
+}
+impl std::error::Error for CoinLifecycleError {}
+
+#[derive(Default)]
+struct Lifecycle {
+    openings: HashSet<u64>,
+    model_registered: bool,
+    input_sources: u64,
+}
+
 /// The private seed and profile; hands out address streams.
+///
+/// Clones share a single lifecycle. Independently constructing two backends
+/// with the same seed is NOT safe: this in-process guard cannot detect seed
+/// reuse across processes or independent constructors. Production callers
+/// must use fresh OS entropy and retain this backend with registered sources.
+///
+/// The lifecycle guarantee applies to callers that reserve via the registration
+/// and opening methods before drawing (the production request/register APIs).
+/// Low-level `stream`, `block`, and `salt` deliberately permit deterministic
+/// rereads for prefix refinement and GPU/CPU fallback; they are not standalone
+/// opening/registration APIs and must not be used to bypass reservation.
 #[derive(Clone)]
 pub struct Coins {
     seed: [u8; 64],
     pub profile: CoinProfile,
-    /// Openings begun under this seed (shared by clones); at most J_o.
-    opened: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    lifecycle: Arc<Mutex<Lifecycle>>,
 }
 
 impl Coins {
-    pub fn new(seed: [u8; 64], profile: CoinProfile) -> Self { Coins { seed, profile, opened: Default::default() } }
-    /// Start opening `opening` (request or finalization): counts it against
-    /// the lifetime cap J_o = 2^20 of this seed and returns its salt.
-    pub fn begin_opening(&self, opening: u64) -> [u8; 64] {
-        let k = self.opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        assert!(k <= OPENINGS, "seed exhausted: opening {k} exceeds J_o = {OPENINGS}");
-        self.salt(opening)
+    /// Explicit seeds are for deterministic fixtures or externally managed
+    /// unique seed lifetimes; never recreate a production seed to reset limits.
+    pub fn new(seed: [u8; 64], profile: CoinProfile) -> Self {
+        Coins { seed, profile, lifecycle: Arc::new(Mutex::new(Lifecycle::default())) }
+    }
+    /// Reserve an opening ID before sampling any opening-local coins. A
+    /// failed proof still consumes its ID. There is deliberately no rollback.
+    /// The mutex makes duplicate checking and the lifetime cap atomic across
+    /// clones, while holding at most OPENINGS IDs rather than per-draw state.
+    pub fn begin_opening(&self, opening: u64) -> Result<[u8; 64], CoinLifecycleError> {
+        {
+            let mut state = self.lifecycle.lock().map_err(|_| CoinLifecycleError::LifecyclePoisoned)?;
+            if state.openings.contains(&opening) { return Err(CoinLifecycleError::DuplicateOpening); }
+            if state.openings.len() as u64 >= OPENINGS { return Err(CoinLifecycleError::OpeningLimit); }
+            state.openings.insert(opening);
+        }
+        Ok(self.salt(opening))
+    }
+    /// Model source owners are fixed, so permit exactly one registration per
+    /// backend lifetime, even if that registration fails. Repeated proofs of
+    /// the SAME saved raw sources remain valid; they do not call this method.
+    pub fn claim_model_registration(&self) -> Result<(), CoinLifecycleError> {
+        let mut state = self.lifecycle.lock().map_err(|_| CoinLifecycleError::LifecyclePoisoned)?;
+        if state.model_registered { return Err(CoinLifecycleError::ModelAlreadyRegistered); }
+        state.model_registered = true;
+        Ok(())
+    }
+    /// Allocate distinct SourceSecret/SourceError owners for private-input
+    /// registrations. Ranges are burned on issue, including failed commits.
+    /// Empty registrations consume no budget because they draw no coins.
+    ///
+    /// Source-owner domains: request owners ((j+1)<<24)|e with j<2^32-1
+    /// and e<2^24 lie below 2^56; input owners lie in [2^62,2^62+2^20);
+    /// model owners (1<<63)|e with e<2^24 start at 2^63. Hence disjoint
+    /// even though all three use the same source-secret/error purposes.
+    pub fn allocate_input_registration(&self, n_sources: usize) -> Result<std::ops::Range<u64>, CoinLifecycleError> {
+        let n = u64::try_from(n_sources).map_err(|_| CoinLifecycleError::InputSourceLimit)?;
+        let mut state = self.lifecycle.lock().map_err(|_| CoinLifecycleError::LifecyclePoisoned)?;
+        let end = state.input_sources.checked_add(n).filter(|&end| end <= INPUT_SOURCES)
+            .ok_or(CoinLifecycleError::InputSourceLimit)?;
+        let start = state.input_sources;
+        state.input_sources = end;
+        Ok((INPUT_OWNER_BASE + start)..(INPUT_OWNER_BASE + end))
     }
     /// A fresh seed from the OS.
     pub fn from_entropy(profile: CoinProfile) -> Self {
@@ -222,6 +303,117 @@ impl BitStream for FixtureStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opening_ids_are_consumed_across_clones_and_failed_proofs() {
+        let c = Coins::new([1; 64], CoinProfile::Ternary);
+        let clone = c.clone();
+        let salt = c.begin_opening(7).unwrap();
+        assert_eq!(salt, c.salt(7)); // Still private-derived, no public nonce replacement.
+        // Simulate failure after reservation: no completion/rollback is needed.
+        assert_eq!(clone.begin_opening(7), Err(CoinLifecycleError::DuplicateOpening));
+        assert_ne!(salt, clone.begin_opening(8).unwrap());
+    }
+
+    #[test]
+    fn opening_limit_has_no_overflow_or_reset() {
+        let c = Coins::new([2; 64], CoinProfile::Ternary);
+        // Populate consumed IDs directly, avoiding a million SHAKE calls.
+        c.lifecycle.lock().unwrap().openings.extend(0..OPENINGS - 1);
+        c.begin_opening(OPENINGS - 1).unwrap();
+        assert_eq!(c.begin_opening(OPENINGS), Err(CoinLifecycleError::OpeningLimit));
+        assert_eq!(c.clone().begin_opening(u64::MAX), Err(CoinLifecycleError::OpeningLimit));
+        assert_eq!(c.begin_opening(0), Err(CoinLifecycleError::DuplicateOpening));
+        assert_eq!(c.lifecycle.lock().unwrap().openings.len() as u64, OPENINGS);
+    }
+
+    #[test]
+    fn model_registration_once_but_saved_sources_support_multiple_proofs() {
+        let c = Coins::new([3; 64], CoinProfile::Ternary);
+        c.claim_model_registration().unwrap();
+        assert_eq!(c.clone().claim_model_registration(), Err(CoinLifecycleError::ModelAlreadyRegistered));
+        // Reading the same saved suffix is intentional, not a new registration.
+        let a = Address::new(Purpose::SourceSecret, 1 << 63);
+        assert_eq!(c.block(&a, 0), c.clone().block(&a, 0));
+        c.begin_opening(1).unwrap();
+        c.begin_opening(2).unwrap();
+    }
+
+    #[test]
+    fn input_allocations_burn_ranges_and_are_bounded_and_disjoint() {
+        let c = Coins::new([4; 64], CoinProfile::Ternary);
+        assert_eq!(c.allocate_input_registration(0).unwrap(), INPUT_OWNER_BASE..INPUT_OWNER_BASE);
+        let first = c.allocate_input_registration(2).unwrap();
+        // Even if committing first fails, the clone gets a fresh range.
+        let second = c.clone().allocate_input_registration(3).unwrap();
+        assert_eq!(first, INPUT_OWNER_BASE..INPUT_OWNER_BASE + 2);
+        assert_eq!(second, INPUT_OWNER_BASE + 2..INPUT_OWNER_BASE + 5);
+        assert_ne!(c.block(&Address::new(Purpose::SourceSecret, first.start), 0),
+                   c.block(&Address::new(Purpose::SourceSecret, second.start), 0));
+        c.allocate_input_registration((INPUT_SOURCES - 5) as usize).unwrap();
+        assert_eq!(c.allocate_input_registration(1), Err(CoinLifecycleError::InputSourceLimit));
+        assert!(c.allocate_input_registration(0).unwrap().is_empty());
+        assert_eq!(c.allocate_input_registration(usize::MAX), Err(CoinLifecycleError::InputSourceLimit));
+        let max_request = (((1u64 << 32) - 1) << 24) | ((1u64 << 24) - 1);
+        assert!(max_request < INPUT_OWNER_BASE);
+        assert!(INPUT_OWNER_BASE + INPUT_SOURCES <= 1u64 << 63);
+        // Widths in the fixed-width message are unchanged.
+        let a = Address::new(Purpose::SourceSecret, INPUT_OWNER_BASE + INPUT_SOURCES - 1);
+        assert_eq!(&encode(c.profile, &[4; 64], &a, 0)[83..91], &a.owner.to_be_bytes());
+    }
+
+    #[test]
+    fn concurrent_clones_accept_exactly_one_duplicate_id_and_model_claim() {
+        let c = Coins::new([5; 64], CoinProfile::Ternary);
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16).map(|_| {
+            let c = c.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                (c.begin_opening(99).is_ok(), c.claim_model_registration().is_ok(),
+                 c.allocate_input_registration(1).unwrap().start)
+            })
+        }).collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.0).count(), 1);
+        assert_eq!(results.iter().filter(|r| r.1).count(), 1);
+        let owners: HashSet<_> = results.iter().map(|r| r.2).collect();
+        assert_eq!(owners.len(), 16);
+        assert!(owners.iter().all(|&owner| (INPUT_OWNER_BASE..INPUT_OWNER_BASE + 16).contains(&owner)));
+    }
+
+    #[test]
+    fn concurrent_input_allocations_cannot_cross_lifetime_cap() {
+        let c = Coins::new([8; 64], CoinProfile::Ternary);
+        c.allocate_input_registration((INPUT_SOURCES - 1) as usize).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16).map(|_| {
+            let c = c.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                c.allocate_input_registration(1)
+            })
+        }).collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|r| **r == Err(CoinLifecycleError::InputSourceLimit)).count(), 15);
+        assert_eq!(c.lifecycle.lock().unwrap().input_sources, INPUT_SOURCES);
+    }
+
+    #[test]
+    fn poisoned_lifecycle_is_fail_closed() {
+        let c = Coins::new([6; 64], CoinProfile::Ternary);
+        let clone = c.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = clone.lifecycle.lock().unwrap();
+            panic!("simulate interrupted lifecycle mutation");
+        }).join().is_err());
+        assert_eq!(c.begin_opening(0), Err(CoinLifecycleError::LifecyclePoisoned));
+        assert_eq!(c.claim_model_registration(), Err(CoinLifecycleError::LifecyclePoisoned));
+        assert_eq!(c.allocate_input_registration(1), Err(CoinLifecycleError::LifecyclePoisoned));
+    }
+
     #[test]
     fn codec_is_fixed_width_and_streams_are_prefix_stable() {
         let c = Coins::new([7u8; 64], CoinProfile::Ternary);

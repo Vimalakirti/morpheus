@@ -1,15 +1,5 @@
-//! PRG-expanded uniform keys over R (user decision: keys expanded from a
-//! public seed rather than stored). The block function is the ChaCha8 core of
-//! `cuda_almost_goldilocks/ajtai_chacha8.cuh`, ported word for word so CPU and
-//! GPU expand identical keys.
-//!
-//! Key element A_kind[row][col] (one degree-4096 ring element) is drawn from
-//! 512 ChaCha8 blocks, each giving 8 rejection-sampled coefficients < q:
-//!   nonce   = ((kind << 16) | row, col_lo32, col_hi32)
-//!   counter = block + 512 * retry   (retry only on a rejected word)
-//! Columns are laid out [payload | hiding | identity]; the identity block is
-//! not random (A[row][payload + hiding + i] = δ_{row,i}).
-
+//! Candidate SHAKE256 public expansion; CUDA ChaCha kernels are incompatible.
+//! Same 384-bit block address and rejection decoder as the optional ideal setup.
 use super::ring::N;
 use almost_goldilocks_cuda::field::ALMOST_GOLDILOCKS_PRIME as Q;
 
@@ -47,13 +37,33 @@ pub fn chacha8_block(key: &[u32; 8], counter: u32, nonce: &[u32; 3]) -> [u32; 16
     out
 }
 
-/// 8 uniform coefficients in [0, q) for block `b` of key element (kind, row, col).
+
+/// Candidate domain-separated block function. The 48-byte payload is a
+/// bijective serialization of the existing 384-bit oracle address.
+/// Uniformity is an ideal H_key statement, NOT a property proved for SHAKE.
+pub fn shake256_key_block(key: &[u32; 8], counter: u32, nonce: &[u32; 3]) -> [u32; 16] {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    let mut h = sha3::Shake256::default();
+    h.update(b"MORPHEUS/KEY/SHAKE256/v2\0");
+    for &w in key.iter().chain(std::iter::once(&counter)).chain(nonce.iter()) { h.update(&w.to_le_bytes()); }
+    let mut bytes = [0u8;64]; h.finalize_xof().read(&mut bytes);
+    let mut out = [0u32;16];
+    for (w,b) in out.iter_mut().zip(bytes.chunks_exact(4)) { *w = u32::from_le_bytes(b.try_into().unwrap()); }
+    out
+}
+
+/// 8 canonical coefficients (ideal-uniform except the bounded fallback) for block `b` of key element (kind, row, col).
 pub fn key_block(seed: &KeySeed, kind: KeyKind, row: u32, col: u64, b: u32) -> [u64; 8] {
+    assert!(row < 16 && b < 512, "unregistered key address");
     let nonce = [((kind as u32) << 16) | row, col as u32, (col >> 32) as u32];
+    decode_key_block(|retry| shake256_key_block(&seed.0, b + 512 * retry, &nonce))
+}
+
+fn decode_key_block(mut block: impl FnMut(u32) -> [u32;16]) -> [u64;8] {
     let mut out = [0u64; 8];
     let mut written = 0;
     for retry in 0..16u32 {
-        let w = chacha8_block(&seed.0, b + 512 * retry, &nonce);
+        let w = block(retry);
         for k in 0..8 {
             let v = (w[2 * k] as u64) | ((w[2 * k + 1] as u64) << 32);
             if v < Q { out[written] = v; written += 1; if written == 8 { return out; } }
@@ -110,5 +120,27 @@ mod tests {
         // Crude uniformity: the top bit is set about half the time.
         let hi = a.iter().filter(|&&v| v >> 63 == 1).count();
         assert!((1700..2400).contains(&hi), "top-bit count {hi}");
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    #[test] fn python_key_known_answer() {
+      assert_eq!(shake256_key_block(&[1,2,3,4,5,6,7,8],513,&[0x10005,0xdead,0xbeef]), [1718816192, 2174491696, 1665938734, 997474263, 3934092271, 384552652, 1770842527, 2550189609, 2315274332, 1133808957, 1818681556, 3465089802, 714274959, 3351567657, 2489001337, 1454658246]);
+    }
+    #[test] fn decoder_exhaustion_and_order_are_exact() {
+      let mut calls=0;
+      assert_eq!(decode_key_block(|_| { calls+=1; [u32::MAX;16] }),[0;8]);
+      assert_eq!(calls,16);
+      let mut words=[u32::MAX;16];
+      words[2]=7;words[3]=0; words[6]=9;words[7]=0;
+      let out=decode_key_block(|r| if r==0 {words} else {[u32::MAX;16]});
+      assert_eq!(out,[7,9,0,0,0,0,0,0]);
+      let out=decode_key_block(|r| if r==0 {words} else {[0;16]});
+      assert_eq!(out,[7,9,0,0,0,0,0,0]);
+    }
+    #[test] #[should_panic] fn unregistered_row_rejected() {
+      key_block(&KeySeed([0;8]),KeyKind::Source,16,0,0);
     }
 }

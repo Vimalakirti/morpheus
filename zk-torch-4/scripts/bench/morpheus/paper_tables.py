@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """LaTeX table bodies of the S&P'27 evaluation from run_models.sh /
-run_extra.sh logs (wire format v1: proof sizes are serialized lengths).
+run_extra.sh logs (wire format v3: proof sizes are serialized lengths).
 
     python3 paper_tables.py [out_dir] [extra_dir]
 
@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from summarize import ORDER, UNITS  # noqa: E402
+from evidence_admission import admitted
 
 TEX = {"3D-UNet": "3D U-Net"}
 MiB = 1 << 20
@@ -42,6 +43,19 @@ def parse(path):
     t = text(path)
     if not t:
         return None
+    # Reject the complete log before converting any measurement. Keep the
+    # offline-table fields available even for a rejected row.
+    rejected = {"ok": False, "oom": "AllocationFailed" in t or "out of memory" in t.lower(), "witness": None, "reg": None}
+    if not admitted(t):
+        return rejected
+    try:
+        return parse_admitted(t)
+    except (ValueError, OverflowError):
+        # Optional breakdown/registration fields are untrusted too.
+        return rejected
+
+
+def parse_admitted(t):
     reqs = [float(x) for x in re.findall(r"^request \d+ prove: ([\d.]+)s", t, re.M)]
     vers = [float(x) for x in re.findall(r"^request \d+ verify \(true\): ([\d.]+)s", t, re.M)]
     g = lambda pat: (lambda m: float(m.group(1)) if m else None)(re.search(pat, t, re.M))
@@ -52,7 +66,7 @@ def parse(path):
     attempts = [int(a) + 1 for a in re.findall(r"^\[auth[^\]]*\] [\d.]+s, attempt (\d+)", t, re.M)]
     bad = "panicked" in t or "rejected" in t.replace("tampered finalization rejected", "")
     return {
-        "ok": not bad and bool(reqs) and bool(vers),
+        "ok": not bad,
         "oom": "AllocationFailed" in t or "out of memory" in t.lower(),
         "reqs": reqs,
         "prove": sum(reqs) / len(reqs) if reqs else None,

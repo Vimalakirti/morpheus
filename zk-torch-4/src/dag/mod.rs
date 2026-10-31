@@ -11,10 +11,13 @@ pub mod streaming_accumulator;
 pub mod gpt2;
 pub mod gptj;
 pub mod lenet;
+pub mod maxpool;
+pub mod instancenorm;
 pub mod llama;
 pub mod lookups;
 pub mod nanogpt;
 pub mod oneshot;
+pub mod softmax;
 pub mod partition;
 pub mod pointpillar;
 pub mod proving;
@@ -439,6 +442,10 @@ pub struct Node {
 /// tree protocol; the structural plumbing here is shared between zk-torch-3
 /// and zk-torch-4.
 pub struct Dag {
+    /// Four canonical exp domain/remainder range roots per helper.
+    pub(crate) exp_guard_nodes: std::collections::BTreeMap<NodeId, [NodeId; 4]>,
+    /// Verifier-trusted literal values, frozen by the builder (never request data).
+    pub(crate) program_literals: std::collections::BTreeMap<EdgeId, Vec<u64>>,
     pub nodes: Vec<Node>,
     pub num_edges: usize,
     pub topo: Vec<NodeId>,
@@ -1289,3 +1296,26 @@ mod tests {
         assert_eq!(downloaded, vec![0u64, 1, 2, 3]);
     }
 }
+
+#[cfg(test)]
+mod normalization_tests;
+
+#[cfg(test)]
+mod softmax_tests;
+
+#[cfg(test)]
+mod instancenorm_tests;
+
+#[cfg(test)]
+mod cnn_layout_tests;
+
+#[cfg(test)]
+mod cnn_finite_activation_tests;
+
+#[cfg(test)]
+mod maxpool_tests;
+
+pub(crate) mod grid_routing;
+
+#[cfg(test)]
+mod grid_routing_tests;

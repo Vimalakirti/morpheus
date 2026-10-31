@@ -12,53 +12,13 @@
 // Mirrors zk-torch-4/src/morpheus/gaussian_fast.rs line by line.
 #pragma once
 #include <cstdint>
+#include "morpheus_shake.cuh"
 
 namespace mgauss {
 
 typedef unsigned long long u64;
 
-// ---------------------------------------------------------------- Keccak
-__device__ __constant__ u64 KECCAK_RC[24] = {
-    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
-    0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
-    0x000000000000008aULL, 0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
-    0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL, 0x8000000000008003ULL,
-    0x8000000000008002ULL, 0x8000000000000080ULL, 0x000000000000800aULL, 0x800000008000000aULL,
-    0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL};
-
-__device__ __forceinline__ u64 rotl64(u64 x, int s) { return (x << s) | (x >> (64 - s)); }
-
-__device__ __forceinline__ void keccak_f(u64 a[25]) {
-#pragma unroll 1
-    for (int r = 0; r < 24; r++) {
-        u64 c0 = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20];
-        u64 c1 = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21];
-        u64 c2 = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22];
-        u64 c3 = a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23];
-        u64 c4 = a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24];
-        u64 d0 = c4 ^ rotl64(c1, 1), d1 = c0 ^ rotl64(c2, 1), d2 = c1 ^ rotl64(c3, 1);
-        u64 d3 = c2 ^ rotl64(c4, 1), d4 = c3 ^ rotl64(c0, 1);
-#pragma unroll
-        for (int j = 0; j < 25; j += 5) { a[j] ^= d0; a[j + 1] ^= d1; a[j + 2] ^= d2; a[j + 3] ^= d3; a[j + 4] ^= d4; }
-        // rho + pi
-        u64 b[25];
-        b[0] = a[0];
-        b[10] = rotl64(a[1], 1);   b[20] = rotl64(a[2], 62);  b[5] = rotl64(a[3], 28);   b[15] = rotl64(a[4], 27);
-        b[16] = rotl64(a[5], 36);  b[1] = rotl64(a[6], 44);   b[11] = rotl64(a[7], 6);   b[21] = rotl64(a[8], 55);
-        b[6] = rotl64(a[9], 20);   b[7] = rotl64(a[10], 3);   b[17] = rotl64(a[11], 10); b[2] = rotl64(a[12], 43);
-        b[12] = rotl64(a[13], 25); b[22] = rotl64(a[14], 39); b[23] = rotl64(a[15], 41); b[8] = rotl64(a[16], 45);
-        b[18] = rotl64(a[17], 15); b[3] = rotl64(a[18], 21);  b[13] = rotl64(a[19], 8);  b[14] = rotl64(a[20], 18);
-        b[24] = rotl64(a[21], 2);  b[9] = rotl64(a[22], 61);  b[19] = rotl64(a[23], 56); b[4] = rotl64(a[24], 14);
-        // chi
-#pragma unroll
-        for (int j = 0; j < 25; j += 5) {
-            u64 t0 = b[j], t1 = b[j + 1], t2 = b[j + 2], t3 = b[j + 3], t4 = b[j + 4];
-            a[j] = t0 ^ (~t1 & t2); a[j + 1] = t1 ^ (~t2 & t3); a[j + 2] = t2 ^ (~t3 & t4);
-            a[j + 3] = t3 ^ (~t4 & t0); a[j + 4] = t4 ^ (~t0 & t1);
-        }
-        a[0] ^= KECCAK_RC[r];
-    }
-}
+using mshake::keccak_f;
 
 // The 106-byte coin message with padding, as 17 rate lanes. The host fills
 // every fixed field; the kernel patches purpose (byte 82), coordinate
@@ -185,10 +145,27 @@ template <int N> __device__ __forceinline__ double to_double(const U<N>& a) {
     return r;
 }
 
+// Exact bounded fallback: long division of d * 2^128 by den.
+// Precondition: d < 2^128 < den. No floating-point estimate is trusted.
+__device__ __forceinline__ U<2> div_z_exact(const U<2>& d, const U<3>& den, bool& inexact) {
+    U<3> rem = resize<3>(d);
+    U<2> q = uzero<2>();
+    for (int bit = 127; bit >= 0; --bit) {
+        rem = shl(rem, 1);
+        if (cmp(rem, den) >= 0) {
+            rem = sub(rem, den);
+            q.w[bit >> 6] |= 1ULL << (bit & 63);
+        }
+    }
+    inexact = !is_zero(rem);
+    return q;
+}
+
 /// floor and remainder-nonzero of (d * 2^128) / den, d < 2^128 < den < 2^130.
 /// Quotient digits are estimated in double precision, biased low by 2^-46 so
-/// every partial quotient is an underestimate, and the remainder is kept exact;
-/// a final exact correction loop finishes. The result is the exact floor.
+/// an exact product guard validates each estimate before subtraction. Bounded
+/// correction falls back to restoring division; correctness does not rely on
+/// the floating-point underestimate claim. The result is the exact floor.
 __device__ __forceinline__ U<2> div_z(const U<2>& d, const U<3>& den, bool& inexact) {
     U<4> rem = uzero<4>();
     rem.w[2] = d.w[0]; rem.w[3] = d.w[1];
@@ -197,15 +174,22 @@ __device__ __forceinline__ U<2> div_z(const U<2>& d, const U<3>& den, bool& inex
 #pragma unroll
     for (int it = 0; it < 3; it++) {
         double qd = to_double(rem) / dd * (1.0 - 1.4210854715202004e-14);
+        if (!isfinite(qd) || qd >= ldexp(1.0, 128)) return div_z_exact(d, den, inexact);
         if (!(qd >= 1.0)) break;
         U<2> qe;
         if (qd < 18446744073709551616.0) { qe.w[0] = (u64)qd; qe.w[1] = 0; }
         else { double h = floor(qd * 5.421010862427522e-20); qe.w[1] = (u64)h; qe.w[0] = (u64)(qd - h * 18446744073709551616.0); }
-        rem = resize<4>(sub(resize<5>(rem), mul(qe, den)));
+        U<5> product = mul(qe, den);
+        U<5> remainder = resize<5>(rem);
+        if (cmp(product, remainder) > 0) return div_z_exact(d, den, inexact);
+        rem = resize<4>(sub(remainder, product));
         q = add(q, qe);
     }
     U<4> den4 = resize<4>(den);
-    while (cmp(rem, den4) >= 0) { rem = sub(rem, den4); q = add(q, small<2>(1)); }
+    for (int it = 0; it < 2 && cmp(rem, den4) >= 0; ++it) {
+        rem = sub(rem, den4); q = add(q, small<2>(1));
+    }
+    if (cmp(rem, den4) >= 0) return div_z_exact(d, den, inexact);
     inexact = !is_zero(rem);
     return q;
 }

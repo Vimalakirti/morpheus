@@ -189,17 +189,40 @@ impl Layout {
             let key = (std::sync::Arc::as_ptr(pw) as usize, plane0, np);
             SUB.lock().unwrap().entry(key).or_insert_with(|| std::sync::Arc::new(pw[plane0..plane0 + np].to_vec())).clone()
         };
-        t.pieces.iter().map(|pc| {
-            let pwp = sub(pc.plane0, 1usize << pc.region.p);
+        t.pieces.iter().filter_map(|pc| {
             let m = pc.region.m;
-            let (lo, scale) = if m >= t.n {
+            let scale = if m >= t.n { coeff } else { eq_bits(&r[m..], pc.hb).mul(&coeff) };
+            // An exact zero coefficient contributes nothing to the same row.
+            // Test before cloning point/weights: split Boolean W_G slots have
+            // many zero-support pieces. Never approximate a field coefficient.
+            let pwp = sub(pc.plane0, 1usize << pc.region.p);
+            // CUDA v2 derives its bit-region census from retained terms, so
+            // retain the original GPU representation until that path is audited.
+            #[cfg(not(feature = "cuda"))]
+            {
+                // Do not hide malformed metadata by deleting an invalid zero term:
+                // retain it for the same downstream statement-shape rejection.
+                let cap = u32::try_from(self.ell).ok().and_then(|e| 1usize.checked_shl(e));
+                let size = m.checked_add(pc.region.p).filter(|&e| e <= self.ell)
+                    .and_then(|e| u32::try_from(e).ok()).and_then(|e| 1usize.checked_shl(e));
+                let valid_region = match (cap, size) {
+                    (Some(cap), Some(size)) => pc.region.source < self.n_sources
+                        && pc.region.base % size == 0
+                        && pc.region.base.checked_add(size).map_or(false, |end| end <= cap),
+                    _ => false,
+                };
+                if scale.is_zero() && crate::morpheus::wire::canonical_k(&scale) && valid_region
+                    && r[..m.min(t.n)].iter().chain(pwp.iter()).all(crate::morpheus::wire::canonical_k)
+                { return None; }
+            }
+            let lo = if m >= t.n {
                 let mut lo = r.to_vec();
                 lo.resize(m, K8::ZERO);
-                (lo, coeff)
+                lo
             } else {
-                (r[..m].to_vec(), eq_bits(&r[m..], pc.hb).mul(&coeff))
+                r[..m].to_vec()
             };
-            Term { region: pc.region.clone(), r: lo, pw: pwp, scale }
+            Some(Term { region: pc.region.clone(), r: lo, pw: pwp, scale })
         }).collect()
     }
 

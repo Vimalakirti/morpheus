@@ -341,9 +341,33 @@ pub fn prove(
 
 /// Verifies the link and returns the point and the authentication targets
 /// (with the commitments taken from the statement and the proof).
+fn statement_shape_ok(p: &Profile, st: &Statement) -> bool {
+    let ell = p.ell();
+    let Some(cap) = 1usize.checked_shl(ell as u32) else { return false; };
+    let block_ok = |base: usize, lg: usize| -> bool {
+        if lg > ell { return false; }
+        let Some(size) = 1usize.checked_shl(lg as u32) else { return false; };
+        base % size == 0 && base.checked_add(size).map_or(false, |end| end <= cap)
+    };
+    st.n <= p.n_max && st.bits.len() == st.n
+        && st.bits.iter().flatten().all(|&(base, lg)| block_ok(base, lg))
+        && st.rows.iter().all(|row| super::wire::canonical_k(&row.y) && row.terms.iter().all(|t| {
+            let Some(lg) = t.region.m.checked_add(t.region.p) else { return false; };
+            t.region.source < st.n && block_ok(t.region.base, lg)
+                && t.r.len() == t.region.m
+                && 1usize.checked_shl(t.region.p as u32) == Some(t.pw.len())
+                && t.r.iter().chain(t.pw.iter()).all(super::wire::canonical_k)
+                && super::wire::canonical_k(&t.scale)
+        }))
+}
+
 pub fn verify(
     p: &Profile, tr: &mut MTranscript, st: &Statement, c_src: &[Vec<Vec<u64>>], pf: &LinkProof,
 ) -> Option<(Point, Vec<Tuple>, AuxTuple)> {
+    // Validate all externally supplied shapes before indexing or transcript work.
+    if !super::wire::link_shape_ok(p, st.n, pf)
+        || c_src.len() != st.n || !c_src.iter().all(|c| super::wire::commitment_ok(p, c))
+        || !statement_shape_ok(p, st) { return None; }
     let ell = p.ell();
     let n = st.n;
     let degs = p.degs();

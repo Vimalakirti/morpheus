@@ -6,8 +6,11 @@
 //! transformer core, so a full T-token autoregressive generation is
 //! proved in ONE full-sequence circuit (`seq_len = T`, causal-masked)
 //! instead of T per-token proofs. The model's prediction at position `i`
-//! depends only on tokens `0..=i` (causal masking), so a single
-//! full-sequence forward pass reproduces every AR step; the public
+//! uses selected-support normalization that excludes future/padded keys from
+//! BOTH the canonical maximum and the denominator. Given matching finite
+//! arithmetic/layout semantics in the other layers, this yields prefix-only
+//! dependency and the full-sequence/incremental correspondence. This local
+//! repair is not an unconditional whole-model numerical-equivalence proof. The public
 //! shift constraint `argmax(logits[i]) == token[i+1]` (checked by the
 //! verifier on public data) ties each position's prediction to the next
 //! input token.
@@ -30,6 +33,51 @@ use crate::dag::builder::DagBuilder;
 use crate::dag::{DataType, EdgeId, Role, Witness};
 
 impl DagBuilder {
+    /// Public bounded-logit profile. Bounds are enforced by graph range gates,
+    /// not inferred from the honest witness. Reject profiles without a no-wrap lift.
+    pub(crate) fn first_argmax_budget(vocab: usize) -> (u64, usize, usize) {
+        use almost_goldilocks_cuda::field::ALMOST_GOLDILOCKS_PRIME;
+        let b: usize = match std::env::var("ARGMAX_LOGIT_BITS") {
+            Ok(v) => v.parse().expect("ARGMAX_LOGIT_BITS must be an integer"),
+            Err(std::env::VarError::NotPresent) => 16,
+            Err(_) => panic!("ARGMAX_LOGIT_BITS must be valid Unicode"),
+        };
+        assert!(vocab > 0 && b > 0 && b < 62, "invalid argmax profile");
+        let bound = (1u128 << b) - 1;
+        let range_max = (1u128 << (b+1)) - 1;
+        let q = ALMOST_GOLDILOCKS_PRIME as u128;
+        // (x+B)+(B-x)=2B mod q lifts uniquely, since both ranged values
+        // are <=range_max and 2*range_max<q. Thus the decoded logit is in[-B,B].
+        assert!(2*range_max < q, "argmax signed-range lift would wrap");
+        let v = vocab as u128;
+        let difference = bound.checked_mul(2).and_then(|n|n.checked_mul(v)).and_then(|n|n.checked_add(v-1)).expect("argmax bound overflow");
+        let bits = (u128::BITS - difference.leading_zeros()) as usize;
+        assert!(bits < 64, "argmax difference does not fit a lookup index");
+        let lookup_max = (1u128 << bits)-1;
+        // A ranked difference d is in[-difference,difference]; proving
+        // d=t mod q with 0<=t<=lookup_max implies d=t over integers.
+        assert!(difference.checked_add(lookup_max).expect("argmax residual overflow") < q, "argmax comparison residual would wrap");
+        (bound as u64, b+1, bits)
+    }
+
+    /// Integer order embedding: larger logits win; ties select lower global index.
+    fn first_argmax_rank(&mut self, logits: EdgeId, start: usize, vocab: usize, bound: u64, bound_bits: usize) -> EdgeId {
+        let w=self.init_values[logits].as_ref().unwrap();
+        let shape=w.shape.clone(); let sf=w.sf;
+        assert!(start.checked_add(shape[1]).map(|end|end<=vocab).unwrap_or(false), "argmax shard out of bounds");
+        let vp=shape[1].next_power_of_two();
+        let b=self.public_literal(Witness::new(vec![1],vec![AlmostGoldilocksField(bound)],DataType::Float,sf,Role::Input));
+        let lower=self.add(logits,b)[0];
+        let upper=self.sub(b,logits)[0];
+        self.add_nonneg_node_bits(lower,bound_bits);
+        self.add_nonneg_node_bits(upper,bound_bits);
+        let multiplier=self.public_literal(Witness::new(vec![1],vec![AlmostGoldilocksField(vocab as u64)],DataType::Float,0,Role::Input));
+        let scaled=self.einsum("sv,z->sv".into(),vec![logits,multiplier],false)[0];
+        let mut indices=vec![AlmostGoldilocksField(0);vp];
+        for j in 0..shape[1] { indices[j]=AlmostGoldilocksField((start+j) as u64); }
+        let index=self.public_literal(Witness::new(vec![1,shape[1]],indices,DataType::Float,sf,Role::Input));
+        self.sub(scaled,index)[0]
+    }
     /// Build a one-hot selector matrix. `S[i, indices[i]] = 1`, all others
     /// 0. Shape `(len, table_size)`, col-major MLE layout: element `(i, v)`
     /// at flat index `i + v * len_pad` (matches zk-torch-4's 2D tensor
@@ -154,6 +202,8 @@ impl DagBuilder {
         token_ids: &[usize],
         selector_role: Role,
     ) -> EdgeId {
+        let (bound, bound_bits, comparison_bits) = Self::first_argmax_budget(vocab_size);
+        let logits = self.first_argmax_rank(logits, 0, vocab_size, bound, bound_bits);
         // 1. One-hot selector for the claimed next tokens.
         let s = Self::build_one_hot_selector_witness(seq_len, vocab_size, token_ids, selector_role);
         let s_id = if selector_role == Role::Constant {
@@ -181,7 +231,7 @@ impl DagBuilder {
 
         // 4. Range check diffs ≥ 0 ⇒ selected[i] ≥ logits[i,j] ∀j ⇒
         //    token_ids[i] is the argmax of row i.
-        self.add_nonneg_node(diffs);
+        self.add_nonneg_node_bits(diffs, comparison_bits);
 
         s_id
     }
@@ -274,6 +324,10 @@ impl DagBuilder {
     ) -> Vec<EdgeId> {
         assert_eq!(logits_shards.len(), shard_ranges.len());
 
+        let vocab = shard_ranges.iter().map(|&(s,n)|s+n).max().unwrap_or(0);
+        let (bound, bound_bits, comparison_bits) = Self::first_argmax_budget(vocab);
+        let ranked: Vec<EdgeId> = logits_shards.iter().zip(shard_ranges).map(|(&lg,&(start,_))| self.first_argmax_rank(lg,start,vocab,bound,bound_bits)).collect();
+        let logits_shards = &ranked;
         // 1. Per-shard one-hot selectors + per-shard selected logit.
         let mut sel_ids = Vec::with_capacity(shard_ranges.len());
         let mut selected_k_ids = Vec::with_capacity(shard_ranges.len());
@@ -308,7 +362,7 @@ impl DagBuilder {
             // Padded shard columns are not tokens (see argmax_check).
             let shape = self.init_values[lg].as_ref().unwrap().shape.clone();
             let diffs = if shape.iter().all(|d| d.is_power_of_two()) { diffs } else { self.mask(diffs, shape) };
-            self.add_nonneg_node(diffs);
+            self.add_nonneg_node_bits(diffs, comparison_bits);
         }
 
         sel_ids

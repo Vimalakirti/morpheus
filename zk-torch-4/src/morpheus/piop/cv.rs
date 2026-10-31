@@ -19,9 +19,9 @@
 //!      channel of a depthwise conv);
 //!   2. the claim on A at (x_k, x_c) is the index map above with
 //!      T_d(i) = Σ_{(o,k,i)∈R_d} eq(r_o, o)·eq(x_k, k).
-//! The weight claim is on the unflattened kernel (FlattenKernel /
-//! ChangeShape producers are looked through), so no flattened kernel or
-//! full-convolution advice is committed.
+//! A weight producer is bypassed only if its public scatter geometry matches
+//! the consumer and every skipped reshape preserves padded arity. Otherwise
+//! a public tap map binds the actual flat edge, including nonidentity views.
 
 use super::*;
 
@@ -29,7 +29,6 @@ fn lb(n: usize) -> usize { log2_ceil(n.max(1)) }
 
 /// MORPHEUS_CONV=pp: prove Conv2D with the polynomial-product construction
 /// and a committed full convolution (ablation baseline).
-fn kpow(a: &K8, mut e: u64) -> K8 { let (mut r, mut b) = (K8::ONE, *a); while e > 0 { if e & 1 == 1 { r = r.mul(&b); } b = b.mul(&b); e >>= 1; } r }
 
 pub(super) fn conv_pp() -> bool { std::env::var("MORPHEUS_CONV").ok().as_deref() == Some("pp") }
 
@@ -42,7 +41,7 @@ impl Rel {
         Rel { ob, kb: 0, ib, t: pairs.map(|(o, i)| (o, 0, i)).collect() }
     }
     /// T(i) = Σ eq(r_o, o)·eq(r_k, k) over the triples, dense over i.
-    fn table(&self, ro: &[K8], rk: &[K8]) -> Vec<K8> {
+    pub(super) fn table(&self, ro: &[K8], rk: &[K8]) -> Vec<K8> {
         let (eo, ek) = (eq_table(ro), eq_table(rk));
         let mut t = vec![K8::ZERO; 1usize << self.ib];
         for &(o, k, i) in &self.t { t[i] = t[i].add(&eo[o].mul(&ek[k])); }
@@ -87,9 +86,223 @@ fn masked_eq(r: &[K8], y: &[K8], n: usize) -> K8 {
     (0..n).fold(K8::ZERO, |a, c| a.add(&er[c].mul(&ey[c])))
 }
 
+/// Contract one logical axis, ignoring adversarial values in padded slots.
+/// Remaining variables retain their original low-to-high order.
+pub(super) fn masked_axis_fold(v: &[u64], n: usize, off: usize, r: &[K8], logical: usize) -> Vec<K8> {
+    assert_eq!(v.len(), 1usize << n);
+    assert!(off + r.len() <= n && logical > 0 && logical <= 1usize << r.len());
+    if logical == 1usize << r.len() {
+        return partial_eval(v, n, &(0..r.len()).map(|j| (off + j, r[j])).collect::<Vec<_>>());
+    }
+    let e = eq_table(r);
+    let low_mask = (1usize << off) - 1;
+    (0..1usize << (n - r.len())).into_par_iter().map(|i| {
+        let base = (i & low_mask) | ((i >> off) << (off + r.len()));
+        (0..logical).fold(K8::ZERO, |a, c| a.add(&e[c].scale(v[base | (c << off)])))
+    }).collect()
+}
+
+/// Actual normal-reduction patch table, isolated for direct CPU identity tests.
+pub(super) fn conv_patch_table(xv: &[u64], rels: &[Rel], ro: &[Vec<K8>], lci: usize, batch: usize, rb: &[K8]) -> Vec<K8> {
+    let si: usize = rels.iter().map(|d| d.ib).sum();
+    let lbatch = lb(batch);
+    let mut sizes: Vec<usize> = rels.iter().map(|d| d.ib).collect();
+    sizes.push(lci);
+    let mut cur = if lbatch == 0 { None } else {
+        Some(masked_axis_fold(xv, si + lci + lbatch, si + lci, &rb, batch))
+    };
+    for (a, d) in rels.iter().enumerate() {
+        let m = d.kmat(&ro[a]);
+        let pre: usize = 1usize << sizes[..a].iter().sum::<usize>();
+        let post: usize = 1usize << sizes[a + 1..].iter().sum::<usize>();
+        let (ni, nk) = (1usize << d.ib, 1usize << d.kb);
+        let out: Vec<K8> = (0..post * nk).into_par_iter().flat_map_iter(|pk| {
+            let (ph, k) = (pk / nk, pk % nk);
+            let row = &m[k];
+            let cur = &cur;
+            (0..pre).map(move |pl| {
+                let mut acc = K8::ZERO;
+                for &(i, coef) in row {
+                    let idx = (ph * ni + i) * pre + pl;
+                    let v = match cur { Some(t) => t[idx].mul(&coef), None => { let u = xv[idx]; if u == 0 { continue } else { coef.scale(u) } } };
+                    acc = acc.add(&v);
+                }
+                acc
+            })
+        }).collect();
+        sizes[a] = d.kb;
+        cur = Some(out);
+    }
+    cur.expect("conv with no spatial axis")
+}
+
+/// Actual PP exponent masks. Exponents are nonnegative integer indices;
+/// alpha=0 is supported without inverse or modular exponent-index wrapping.
+pub(super) fn conv_pp_powers(cv: &crate::basicblock::conv::Conv2D, alpha: K8) -> (Vec<K8>, Vec<K8>, Vec<K8>) {
+    let (lw, lf, lk) = (lb(cv.input_w), lb(cv.s_in + cv.s_kernel - 1), lb(cv.s_kernel));
+    let pows = |n: usize| -> Vec<K8> {
+        let mut v = Vec::with_capacity(n); let mut a = K8::ONE;
+        for _ in 0..n { v.push(a); a = a.mul(&alpha); } v
+    };
+    let am = pows(1usize << lf);
+    // No inverse: alpha=0 is a well-defined evaluation too.
+    let ap: Vec<K8> = (0..cv.s_in).map(|p| {
+        if (p & ((1 << lw) - 1)) < cv.input_w && (p >> lw) < cv.input_h { am[cv.s_in - 1 - p] } else { K8::ZERO }
+    }).collect();
+    let mut aj = vec![K8::ZERO; 1usize << lk];
+    for h in 0..cv.kernel_h { for w in 0..cv.kernel_w {
+        let j = h * cv.dilation_h * cv.stride_w + w * cv.dilation_w;
+        aj[j] = am[j];
+    } }
+    (am, ap, aj)
+}
+
+/// Build the actual flatten producer map. Scatter collisions are rejected:
+/// CPU last-write and GPU racing writes cannot define one portable relation.
+pub(super) fn flatten_kernel_rel(fk: &crate::basicblock::conv::FlattenKernel, lk: usize) -> Rel {
+    let (lkw, lkh) = (lb(fk.kw), lb(fk.kh));
+    assert!([fk.kh, fk.kw, fk.c_in, fk.c_out, fk.s_w, fk.dilation_h, fk.dilation_w].iter().all(|&v| v > 0), "positive FlattenKernel geometry");
+    let pairs: Vec<_> = (0..fk.kh).flat_map(|h| (0..fk.kw).map(move |w|
+        (h.checked_mul(fk.dilation_h).and_then(|v| v.checked_mul(fk.s_w))
+            .and_then(|v| w.checked_mul(fk.dilation_w).and_then(|u| v.checked_add(u)))
+            .expect("FlattenKernel tap index overflow"), w + (h << lkw)))).collect();
+    let mut seen = std::collections::HashSet::new();
+    assert!(pairs.iter().all(|&(j, _)| j < 1usize << lk && seen.insert(j)),
+        "FlattenKernel tap scatter must be in bounds and injective");
+    Rel::map(lk, lkw + lkh, pairs.into_iter())
+}
+
 /// Conv kinds by weight layout.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum WKind { Normal, Transpose, Depthwise }
+pub(super) enum WKind { Normal, Transpose, Depthwise }
+
+/// Public tap-index layout, lowest spatial axis first. Channel counts are in
+/// storage order [outer, inner, flat taps], NOT necessarily [C_out, C_in].
+struct KernelGeometry { dims: Vec<usize>, strides: Vec<usize>, inner: usize, outer: usize, extent: usize }
+
+fn padded(n: usize) -> usize { n.checked_next_power_of_two().expect("spatial extent overflow") }
+
+/// Validate the descriptor against the same canonical indexing used by the
+/// CPU/GPU forward blocks. These four descriptors have no batch coordinate.
+fn family_geometry(kind: &BasicBlockType) -> KernelGeometry {
+    use crate::basicblock::conv::*;
+    let (ins, dims, steps, outs, transposed, inner, outer, declared_strides, extent, s_in) = match kind {
+        BasicBlockType::Conv3D(Conv3D { c_in,c_out,kernel_d,kernel_h,kernel_w,input_d,input_h,input_w,
+            stride_h,stride_w,s_in,s_kernel,d_out,h_out,w_out,conv_stride_d,conv_stride_h,conv_stride_w }) =>
+            (vec![*input_w,*input_h,*input_d],vec![*kernel_w,*kernel_h,*kernel_d],vec![*conv_stride_w,*conv_stride_h,*conv_stride_d],
+             vec![*w_out,*h_out,*d_out],false,*c_in,*c_out,vec![1,*stride_w,*stride_h],*s_kernel,Some(*s_in)),
+        BasicBlockType::DepthwiseConv2D(DepthwiseConv2D { channels,kernel_h,kernel_w,input_h,input_w,stride_w,s_in,s_kernel,h_out,w_out,conv_stride_h,conv_stride_w }) =>
+            (vec![*input_w,*input_h],vec![*kernel_w,*kernel_h],vec![*conv_stride_w,*conv_stride_h],
+             vec![*w_out,*h_out],false,1,*channels,vec![1,*stride_w],*s_kernel,Some(*s_in)),
+        BasicBlockType::ConvTranspose2D(ConvTranspose2D { c_in,c_out,kernel_h,kernel_w,input_h,input_w,stride_h,stride_w,flat_stride,s_kernel,h_out,w_out }) =>
+            (vec![*input_w,*input_h],vec![*kernel_w,*kernel_h],vec![*stride_w,*stride_h],
+             vec![*w_out,*h_out],true,*c_out,*c_in,vec![1,*flat_stride],*s_kernel,None),
+        BasicBlockType::ConvTranspose3D(ConvTranspose3D { c_in,c_out,kernel_d,kernel_h,kernel_w,input_d,input_h,input_w,
+            stride_d,stride_h,stride_w,flat_stride_h,flat_stride_w,s_kernel,d_out,h_out,w_out }) =>
+            (vec![*input_w,*input_h,*input_d],vec![*kernel_w,*kernel_h,*kernel_d],vec![*stride_w,*stride_h,*stride_d],
+             vec![*w_out,*h_out,*d_out],true,*c_out,*c_in,vec![1,*flat_stride_w,*flat_stride_h],*s_kernel,None),
+        _ => panic!("not an unbatched flat-kernel convolution family"),
+    };
+    assert!(inner > 0 && outer > 0 && ins.iter().chain(&dims).chain(&steps).all(|&v| v > 0), "positive convolution geometry");
+    for a in 0..ins.len() {
+        let out = if transposed { (ins[a]-1).checked_mul(steps[a]).and_then(|v| v.checked_add(dims[a])).expect("transposed output overflow") }
+            else { assert!(dims[a] <= ins[a], "convolution kernel must fit input"); (ins[a]-dims[a])/steps[a]+1 };
+        assert_eq!(outs[a], out, "convolution output geometry");
+    }
+    let grid = if transposed { &outs } else { &ins };
+    let mut stride = 1usize;
+    let mut strides = Vec::new();
+    for &n in grid { strides.push(stride); stride = stride.checked_mul(padded(n)).expect("spatial volume overflow"); }
+    assert_eq!(strides, declared_strides, "convolution flat spatial strides");
+    if let Some(s) = s_in { assert_eq!(s, stride, "convolution padded input volume"); }
+    let want_extent = dims.iter().zip(&strides).try_fold(1usize, |a,(&k,&s)| (k-1).checked_mul(s).and_then(|v| a.checked_add(v))).expect("kernel extent overflow");
+    assert_eq!(extent,want_extent,"convolution flat kernel extent");
+    padded(extent);
+    KernelGeometry { dims,strides,inner,outer,extent }
+}
+
+/// Exact public gather k -> j. Bounds and injectivity reject ambiguous
+/// producer scatters; no finite-word wrapping is accepted as geometry.
+fn kernel_tap_rel(dims: &[usize], strides: &[usize], lk: usize) -> Rel {
+    assert_eq!(dims.len(),strides.len());
+    assert!(dims.iter().chain(strides).all(|&v| v > 0),"positive kernel scatter geometry");
+    let bits: Vec<_> = dims.iter().map(|&d| lb(d)).collect();
+    let sk: usize = bits.iter().sum();
+    let size = 1usize.checked_shl(lk.try_into().expect("kernel bit width")).expect("kernel flat arity overflow");
+    let mut pairs = vec![(0usize,0usize)];
+    let mut off = 0;
+    for ((&d,&stride),&b) in dims.iter().zip(strides).zip(&bits) {
+        let mut next = Vec::new();
+        for &(k,j) in &pairs { for tap in 0..d {
+            let k = tap.checked_shl(off).and_then(|v| k.checked_add(v)).expect("kernel tap arity overflow");
+            let j = tap.checked_mul(stride).and_then(|v| j.checked_add(v)).expect("kernel tap index overflow");
+            next.push((k,j));
+        } }
+        pairs = next; off += b as u32;
+    }
+    let mut seen = std::collections::HashSet::new();
+    assert!(pairs.iter().all(|&(_,j)| j < size && seen.insert(j)),"kernel tap scatter must be in bounds and injective");
+    Rel::map(sk,lk,pairs.into_iter())
+}
+
+pub(super) fn flatten_kernel3d_rel(fk: &crate::basicblock::conv::FlattenKernel3D, lk: usize) -> Rel {
+    assert!(fk.c_in > 0 && fk.c_out > 0,"positive FlattenKernel3D channels");
+    let r = kernel_tap_rel(&[fk.kw,fk.kh,fk.kd],&[1,fk.stride_w,fk.stride_h],lk);
+    Rel::map(r.ib,r.ob,r.t.into_iter().map(|(k,_,j)|(j,k)))
+}
+
+/// Return the raw kernel only when the whole skipped path is an identity on
+/// the taps used by this consumer. A truncation followed by regrowth remains
+/// bound to the actual final edge; matching endpoint arity is insufficient.
+pub(super) fn family_kernel(g: &Graph, edge: usize, kind: &BasicBlockType) -> (usize, Option<Rel>) {
+    let spec = family_geometry(kind);
+    let lk = lb(spec.extent);
+    assert_eq!(g.nvars[edge],lk+lb(spec.inner)+lb(spec.outer),"flat kernel extent/channel layout");
+    let tap = kernel_tap_rel(&spec.dims,&spec.strides,lk);
+    let mut e = edge;
+    loop {
+        match g.dag.producers[e].map(|p| &g.dag.nodes[p]) {
+            Some(n) if matches!(n.kind,BasicBlockType::ChangeShape(_)) && g.nvars[n.inputs[0]] == g.nvars[e] => e=n.inputs[0],
+            Some(n) => {
+                let matches = match &n.kind {
+                    BasicBlockType::FlattenKernel(f) => spec.dims == [f.kw,f.kh] && spec.strides == [f.dilation_w,f.dilation_h.checked_mul(f.s_w).expect("flatten stride overflow")]
+                        && (f.c_in,f.c_out) == (spec.inner,spec.outer),
+                    BasicBlockType::FlattenKernel3D(f) => spec.dims == [f.kw,f.kh,f.kd] && spec.strides == [1,f.stride_w,f.stride_h]
+                        && (f.c_in,f.c_out) == (spec.inner,spec.outer),
+                    _ => false,
+                };
+                if matches {
+                    assert_eq!(g.nvars[n.inputs[0]],tap.ob+lb(spec.inner)+lb(spec.outer),"unflattened source kernel shape");
+                    return (n.inputs[0],None);
+                }
+                break;
+            }
+            None => break,
+        }
+    }
+    (edge,Some(tap))
+}
+
+/// Channel-axis offsets in the actual weight storage, including depthwise's
+/// single shared channel axis and transposed [C_in,C_out,taps] ordering.
+pub(super) fn conv_weight_offsets(kind: WKind, taps: usize, lci: usize, lco: usize) -> (usize,usize,usize) {
+    match kind {
+        WKind::Normal => (taps,taps+lci,taps+lci+lco),
+        WKind::Transpose => (taps+lco,taps,taps+lci+lco),
+        WKind::Depthwise => (taps,taps,taps+lci),
+    }
+}
+
+/// The production stage-1 kernel table, also exercised by CPU identity tests.
+pub(super) fn conv_weight_table(wv: &[u64], nw: usize, sk: usize, lci: usize, kind: WKind, cout_off: usize, rd: &[K8], channels_out: usize, flat: Option<&Rel>) -> Vec<K8> {
+    let folded = if kind == WKind::Depthwise { partial_eval(wv,nw,&[]) }
+        else { masked_axis_fold(wv,nw,cout_off,rd,channels_out) };
+    if let Some(rel) = flat {
+        let mut tab = vec![K8::ZERO;1usize << (sk+lci)];
+        for cc in 0..1usize << lci { for &(k,_,j) in &rel.t { tab[k+(cc<<sk)]=folded[j+(cc<<rel.ib)]; } }
+        tab
+    } else { folded }
+}
 
 impl<'g, 'a> Walk<'g, 'a> {
     /// Index-map reduction of a claim (z0, η0) on X̃(fixed, mapped) where
@@ -140,12 +353,12 @@ impl<'g, 'a> Walk<'g, 'a> {
                 tabs.iter().zip(&offs).zip(&bits).fold(K8::ONE, |acc, ((t, &o), &b)| acc.mul(&t[(x >> o) & ((1usize << b) - 1)]))
             }).collect();
             let pd = self.pd.unwrap();
-            if gpu::enabled() && (1usize << n) >= gpu::threshold() {
+            backend_tables!(gpu::enabled() && (1usize << n) >= gpu::threshold(), {
                 let xp = gpu::partial_eval(&pd.dev(x), nx, &fixed);
                 Some(Tables::Dev(vec![gpu::KTab::from_host(&p), xp]))
-            } else {
+            }, {
                 Some(Tables::Host(vec![p, partial_eval(pd.v(x), nx, &fixed)]))
-            }
+            })
         } else { None };
         if ctx.prover && selfcheck() {
             if let Some(Tables::Host(t)) = tables.as_ref() {
@@ -176,14 +389,6 @@ impl<'g, 'a> Walk<'g, 'a> {
         } else {
             axes.push(MapAxis { off: xoff, rel: Rel::map(nc, nc, (0..channels).map(|c| (c, c))), ro: rc.to_vec(), rk: vec![] });
         }
-    }
-
-    /// Variable offsets of a block-layout tensor (last axis lowest).
-    fn offs(shape: &[usize]) -> Vec<usize> {
-        let mut o = vec![0; shape.len()];
-        let mut acc = 0;
-        for d in (0..shape.len()).rev() { o[d] = acc; acc += lb(shape[d]); }
-        o
     }
 
     pub(super) fn reduce_cv(&mut self, ctx: &mut Ctx, node: usize, c: AClaim) -> Option<&'static str> {
@@ -266,188 +471,209 @@ impl<'g, 'a> Walk<'g, 'a> {
             BasicBlockType::Conv1D(cv) => {
                 let w = nd.inputs[1];
                 let rel = |_| Rel { ob: lb(cv.l_out), kb: lb(cv.kernel_size), ib: lb(cv.input_len), t: trip_conv(cv.l_out, cv.kernel_size, cv.input_len, cv.conv_stride, 1) };
-                self.conv(ctx, x, w, &[cv.c_out, cv.c_in, cv.kernel_size], vec![rel(0)], WKind::Normal, lb(cv.c_in), lb(cv.c_out), c);
+                self.conv(ctx, x, w, &[cv.c_out, cv.c_in, cv.kernel_size], vec![rel(0)], WKind::Normal, lb(cv.c_in), lb(cv.c_out), 1, None, c);
                 Some("conv")
             }
-            BasicBlockType::Conv2D(cv) if conv_pp() && nd.outputs.len() > 1 => {
-                assert_eq!(cv.batch.max(1), 1, "Morpheus conv: batch 1");
+            BasicBlockType::Conv2D(cv) if self.g.protocol_conv_pp && nd.outputs.len() > 1 => {
+                validate_conv2d_geometry(cv);
                 self.conv2d_pp(ctx, &nd, cv, c);
                 Some("conv")
             }
             BasicBlockType::FlattenKernel(fk) => {
-                // W_flat[d, c, kh·s_w + kw] = W[d, c, kh, kw] (reached only by
-                // the polynomial-product conv); W_flat's index splits into the
-                // kw field (low log2 s_w bits) and the kh field.
-                assert!(fk.dilation_h == 1 && fk.dilation_w == 1, "FlattenKernel reduction: no dilation");
-                let (lkw, lkh) = (lb(fk.kw), lb(fk.kh));
-                let lsw = lb(fk.s_w);
-                let lk = self.g.nvars[y] - lb(fk.c_in) - lb(fk.c_out);
-                let (ow, oh) = (lsw.min(lk), lk.saturating_sub(lsw));
-                let fixed: Vec<(usize, K8)> = (0..lb(fk.c_in) + lb(fk.c_out)).map(|j| (lkw + lkh + j, r[lk + j])).collect();
-                let axes = vec![
-                    MapAxis { off: 0, rel: Rel::map(ow, lkw, (0..fk.kw).map(|k| (k, k))), ro: r[..ow].to_vec(), rk: vec![] },
-                    MapAxis { off: lkw, rel: Rel::map(oh, lkh, (0..fk.kh).map(|k| (k, k))), ro: r[lsw.min(lk)..lk].to_vec(), rk: vec![] },
-                ];
+                let (lkw, lkh, lci, lco) = (lb(fk.kw), lb(fk.kh), lb(fk.c_in), lb(fk.c_out));
+                let lk = self.g.nvars[y] - lci - lco;
+                assert_eq!(self.g.nvars[x], lkw + lkh + lci + lco, "shared kernel shape");
+                let mut axes = vec![MapAxis { off: 0, rel: flatten_kernel_rel(fk, lk), ro: r[..lk].to_vec(), rk: vec![] }];
+                let mut fixed = Vec::new();
+                Self::chan_axis(fk.c_in, lkw + lkh, lci, &r[lk..lk + lci], &mut fixed, &mut axes);
+                Self::chan_axis(fk.c_out, lkw + lkh + lci, lco, &r[lk + lci..], &mut fixed, &mut axes);
                 self.map_reduce(ctx, x, fixed, axes, c.z, &c.pad);
                 Some("flatten")
             }
+            BasicBlockType::FlattenKernel3D(fk) => {
+                let (sk,lci,lco) = (lb(fk.kw)+lb(fk.kh)+lb(fk.kd),lb(fk.c_in),lb(fk.c_out));
+                let lk = self.g.nvars[y].checked_sub(lci+lco).expect("FlattenKernel3D channel bits");
+                assert_eq!(self.g.nvars[x],sk+lci+lco,"FlattenKernel3D source shape");
+                let mut axes = vec![MapAxis { off:0,rel:flatten_kernel3d_rel(fk,lk),ro:r[..lk].to_vec(),rk:vec![] }];
+                let mut fixed = Vec::new();
+                Self::chan_axis(fk.c_in,sk,lci,&r[lk..lk+lci],&mut fixed,&mut axes);
+                Self::chan_axis(fk.c_out,sk+lci,lco,&r[lk+lci..],&mut fixed,&mut axes);
+                self.map_reduce(ctx,x,fixed,axes,c.z,&c.pad);
+                Some("flatten")
+            }
             BasicBlockType::Conv2D(cv) => {
-                assert_eq!(cv.batch.max(1), 1, "Morpheus conv: batch 1");
-                let w = self.unflatten(nd.inputs[1]);
+                validate_conv2d_geometry(cv);
+                let (w, flat_kernel) = self.conv2d_kernel(nd.inputs[1], cv);
                 let rw = Rel { ob: lb(cv.w_out), kb: lb(cv.kernel_w), ib: lb(cv.input_w), t: trip_conv(cv.w_out, cv.kernel_w, cv.input_w, cv.conv_stride_w, cv.dilation_w) };
                 let rh = Rel { ob: lb(cv.h_out), kb: lb(cv.kernel_h), ib: lb(cv.input_h), t: trip_conv(cv.h_out, cv.kernel_h, cv.input_h, cv.conv_stride_h, cv.dilation_h) };
-                self.conv(ctx, x, w, &[cv.c_out, cv.c_in, cv.kernel_h, cv.kernel_w], vec![rw, rh], WKind::Normal, lb(cv.c_in), lb(cv.c_out), c);
+                self.conv(ctx, x, w, &[cv.c_out, cv.c_in, cv.kernel_h, cv.kernel_w], vec![rw, rh], WKind::Normal, lb(cv.c_in), lb(cv.c_out), cv.batch, flat_kernel, c);
                 Some("conv")
             }
             BasicBlockType::Conv3D(cv) => {
-                let w = self.unflatten(nd.inputs[1]);
+                let (w,flat_kernel) = family_kernel(self.g,nd.inputs[1],&nd.kind);
                 let rw = Rel { ob: lb(cv.w_out), kb: lb(cv.kernel_w), ib: lb(cv.input_w), t: trip_conv(cv.w_out, cv.kernel_w, cv.input_w, cv.conv_stride_w, 1) };
                 let rh = Rel { ob: lb(cv.h_out), kb: lb(cv.kernel_h), ib: lb(cv.input_h), t: trip_conv(cv.h_out, cv.kernel_h, cv.input_h, cv.conv_stride_h, 1) };
                 let rd = Rel { ob: lb(cv.d_out), kb: lb(cv.kernel_d), ib: lb(cv.input_d), t: trip_conv(cv.d_out, cv.kernel_d, cv.input_d, cv.conv_stride_d, 1) };
-                self.conv(ctx, x, w, &[cv.c_out, cv.c_in, cv.kernel_d, cv.kernel_h, cv.kernel_w], vec![rw, rh, rd], WKind::Normal, lb(cv.c_in), lb(cv.c_out), c);
+                self.conv(ctx, x, w, &[cv.c_out, cv.c_in, cv.kernel_d, cv.kernel_h, cv.kernel_w], vec![rw, rh, rd], WKind::Normal, lb(cv.c_in), lb(cv.c_out), 1, flat_kernel, c);
                 Some("conv")
             }
             BasicBlockType::DepthwiseConv2D(cv) => {
-                let w = self.unflatten(nd.inputs[1]);
+                let (w,flat_kernel) = family_kernel(self.g,nd.inputs[1],&nd.kind);
                 let rw = Rel { ob: lb(cv.w_out), kb: lb(cv.kernel_w), ib: lb(cv.input_w), t: trip_conv(cv.w_out, cv.kernel_w, cv.input_w, cv.conv_stride_w, 1) };
                 let rh = Rel { ob: lb(cv.h_out), kb: lb(cv.kernel_h), ib: lb(cv.input_h), t: trip_conv(cv.h_out, cv.kernel_h, cv.input_h, cv.conv_stride_h, 1) };
-                self.conv(ctx, x, w, &[cv.channels, 1, cv.kernel_h, cv.kernel_w], vec![rw, rh], WKind::Depthwise, lb(cv.channels), lb(cv.channels), c);
+                self.conv(ctx, x, w, &[cv.channels, 1, cv.kernel_h, cv.kernel_w], vec![rw, rh], WKind::Depthwise, lb(cv.channels), lb(cv.channels), 1, flat_kernel, c);
                 Some("conv")
             }
             BasicBlockType::ConvTranspose2D(cv) => {
-                let w = self.unflatten(nd.inputs[1]);
+                let (w,flat_kernel) = family_kernel(self.g,nd.inputs[1],&nd.kind);
                 let rw = Rel { ob: lb(cv.w_out), kb: lb(cv.kernel_w), ib: lb(cv.input_w), t: trip_tconv(cv.w_out, cv.kernel_w, cv.input_w, cv.stride_w) };
                 let rh = Rel { ob: lb(cv.h_out), kb: lb(cv.kernel_h), ib: lb(cv.input_h), t: trip_tconv(cv.h_out, cv.kernel_h, cv.input_h, cv.stride_h) };
-                self.conv(ctx, x, w, &[cv.c_in, cv.c_out, cv.kernel_h, cv.kernel_w], vec![rw, rh], WKind::Transpose, lb(cv.c_in), lb(cv.c_out), c);
+                self.conv(ctx, x, w, &[cv.c_in, cv.c_out, cv.kernel_h, cv.kernel_w], vec![rw, rh], WKind::Transpose, lb(cv.c_in), lb(cv.c_out), 1, flat_kernel, c);
                 Some("conv")
             }
             BasicBlockType::ConvTranspose3D(cv) => {
-                let w = self.unflatten(nd.inputs[1]);
+                let (w,flat_kernel) = family_kernel(self.g,nd.inputs[1],&nd.kind);
                 let rw = Rel { ob: lb(cv.w_out), kb: lb(cv.kernel_w), ib: lb(cv.input_w), t: trip_tconv(cv.w_out, cv.kernel_w, cv.input_w, cv.stride_w) };
                 let rh = Rel { ob: lb(cv.h_out), kb: lb(cv.kernel_h), ib: lb(cv.input_h), t: trip_tconv(cv.h_out, cv.kernel_h, cv.input_h, cv.stride_h) };
                 let rd = Rel { ob: lb(cv.d_out), kb: lb(cv.kernel_d), ib: lb(cv.input_d), t: trip_tconv(cv.d_out, cv.kernel_d, cv.input_d, cv.stride_d) };
-                self.conv(ctx, x, w, &[cv.c_in, cv.c_out, cv.kernel_d, cv.kernel_h, cv.kernel_w], vec![rw, rh, rd], WKind::Transpose, lb(cv.c_in), lb(cv.c_out), c);
+                self.conv(ctx, x, w, &[cv.c_in, cv.c_out, cv.kernel_d, cv.kernel_h, cv.kernel_w], vec![rw, rh, rd], WKind::Transpose, lb(cv.c_in), lb(cv.c_out), 1, flat_kernel, c);
                 Some("conv")
             }
             _ => None,
         }
     }
 
-    /// Polynomial-product convolution (VerfCNN with the output view), the
-    /// ablation baseline (MORPHEUS_CONV=pp): the full convolution Y_full is
-    /// committed advice; the output Y is a bit-affine view of Y_full; and
-    ///   Σ_m α^m Y_full(d, m) = Σ_c X_rev(c, α) · W_flat(d, c, α)
-    /// binds Y_full at a random α and output channel point.
+    /// Polynomial-product convolution with a shared (batch-independent) kernel.
+    /// For every logical b,d, F[b,d,m] is the coefficient of T^m in
+    /// Σ_c (Σ_p X[b,c,p] T^(S-1-p)) (Σ_j W_flat[d,c,j] T^j).
+    /// The public masks exclude padded b,c,d,p and non-tap j. Sampling an
+    /// independent batch point binds every batch slice, not a sum of slices.
     fn conv2d_pp(&mut self, ctx: &mut Ctx, nd: &crate::dag::Node, cv: &crate::basicblock::conv::Conv2D, c: AClaim) {
         let (x, wf, yf) = (nd.inputs[0], nd.inputs[1], nd.outputs[1]);
-        let (lw, lh) = (lb(cv.input_w), lb(cv.input_h));
-        let l_si = lw + lh;
+        assert!(cv.batch > 0, "conv logical batch must be positive");
+        let (lw, lh, lci, lco, lbatch) = (lb(cv.input_w), lb(cv.input_h), lb(cv.c_in), lb(cv.c_out), lb(cv.batch));
         let (lwo, lho) = (lb(cv.w_out), lb(cv.h_out));
-        let lco = lb(cv.c_out);
-        let lci = self.g.nvars[x] - l_si;
-        let lf = self.g.nvars[yf] - lco;
-        let lk = self.g.nvars[wf] - lci - lco;
-        assert!(cv.conv_stride_h.is_power_of_two() && cv.conv_stride_w.is_power_of_two());
-        let wo_shift = cv.conv_stride_w.trailing_zeros() as usize;
-        let ho_shift = lw + cv.conv_stride_h.trailing_zeros() as usize;
-        assert!(wo_shift + lwo <= ho_shift && ho_shift + lho <= l_si && l_si <= lf, "conv view layout");
-        let r = c.point.clone();
-        let (r_wo, r_ho, r_d) = (r[..lwo].to_vec(), r[lwo..lwo + lho].to_vec(), r[lwo + lho..].to_vec());
-        // ---- View: Y(r) = Σ_{wo,ho} eq·[real]·Y_full(r_d, E(wo, ho)).
-        let rw = Rel::map(lwo, lwo, (0..cv.w_out).map(|o| (o, o)));
-        let rh = Rel::map(lho, lho, (0..cv.h_out).map(|o| (o, o)));
-        let (tw, th) = (rw.table(&r_wo, &[]), rh.table(&r_ho, &[]));
-        let nv = lwo + lho;
-        let tables = if ctx.prover {
-            let pd = self.pd.unwrap();
-            let fixed: Vec<(usize, K8)> = (0..lco).map(|j| (lf + j, r_d[j])).collect();
-            let yd = partial_eval(pd.v(yf), lf + lco, &fixed);
-            let p: Vec<K8> = (0..1usize << nv).map(|i| tw[i & ((1 << lwo) - 1)].mul(&th[i >> lwo])).collect();
-            let v: Vec<K8> = (0..1usize << nv).map(|i| { let (wo, ho) = (i & ((1 << lwo) - 1), i >> lwo); yd[(cv.s_in - 1) - (wo << wo_shift) - (ho << ho_shift)] }).collect();
-            Some(Tables::Host(vec![p, v]))
-        } else { None };
-        let (twc, thc) = (tw.clone(), th.clone());
-        let out = ctx.masked_sc(nv, 1, true, c.z, &c.pad, tables, &|xs: &[K8]| tensor::mle_k(&twc, &xs[..lwo]).mul(&tensor::mle_k(&thc, &xs[lwo..])));
-        let rr = out.rho.mul(&out.rho.sub(&K8::ONE));
-        let mut pt = vec![K8::ONE; lf];
-        for b in l_si..lf { pt[b] = K8::ZERO; }
-        for i in 0..lwo { pt[wo_shift + i] = K8::ONE.sub(&out.x[i]); }
-        for i in 0..lho { pt[ho_shift + i] = K8::ONE.sub(&out.x[lwo + i]); }
-        pt.extend_from_slice(&r_d);
-        self.push(ctx, yf, AClaim { point: pt, pad: lin1(out.pads[0], rr), z: out.v[0] });
-        // ---- Polynomial product at (α, r_d2).
+        let l_si = lw + lh;
+        let lf = lb(cv.s_in + cv.s_kernel - 1);
+        let lk = lb(cv.s_kernel);
+        assert_eq!(self.g.nvars[x], l_si + lci + lbatch, "conv input bits");
+        assert_eq!(self.g.nvars[wf], lk + lci + lco, "shared kernel must have no batch variables");
+        assert_eq!(self.g.nvars[yf], lf + lco + lbatch, "full-convolution bits");
+        assert_eq!(c.point.len(), lwo + lho + lco + lbatch, "conv output bits");
+        assert_eq!(cv.s_in, 1usize << l_si, "padded spatial stride");
+        assert_eq!(cv.stride_w, 1usize << lw, "padded width stride");
+        let r = &c.point;
+        // Exact public crop relation. Unlike bit substitution, this also
+        // supports non-power-of-two strides, without a carry-free assumption.
+        let pairs = (0..cv.h_out).flat_map(|h| (0..cv.w_out).map(move |w| {
+            (w + (h << lwo), cv.s_in - 1 - h * cv.conv_stride_h * cv.stride_w - w * cv.conv_stride_w)
+        }));
+        let mut axes = vec![MapAxis { off: 0, rel: Rel::map(lwo + lho, lf, pairs), ro: r[..lwo + lho].to_vec(), rk: vec![] }];
+        let mut fixed = Vec::new();
+        Self::chan_axis(cv.c_out, lf, lco, &r[lwo + lho..lwo + lho + lco], &mut fixed, &mut axes);
+        Self::chan_axis(cv.batch, lf + lco, lbatch, &r[lwo + lho + lco..], &mut fixed, &mut axes);
+        self.map_reduce(ctx, yf, fixed, axes, c.z, &c.pad);
+
         let alpha = ctx.chal();
-        let r_d2 = ctx.chals(lco);
-        let pows = |n: usize, base: &K8| -> Vec<K8> { let mut v = Vec::with_capacity(n); let mut a = K8::ONE; for _ in 0..n { v.push(a); a = a.mul(base); } v };
-        let a_m = pows(1usize << lf, &alpha);
-        let a_j = pows(1usize << lk, &alpha);
-        let ainv = alpha.inv();
-        let (wp, hp) = (1usize << lw, 1usize << lh);
-        // X_rev(c, α) = α^{s_in-1} Σ_p α^{-p}[real p] X(c, p), p = iw + w_pad·ih.
-        let tw_x: Vec<K8> = { let ai = pows(wp, &ainv); (0..wp).map(|i| if i < cv.input_w { ai[i] } else { K8::ZERO }).collect() };
-        let aw = kpow(&ainv, wp as u64);
-        let th_x: Vec<K8> = { let ah = pows(hp, &aw); (0..hp).map(|i| if i < cv.input_h { ah[i] } else { K8::ZERO }).collect() };
-        let lead = kpow(&alpha, (cv.s_in - 1) as u64);
-        let ap: Vec<K8> = (0..1usize << l_si).map(|p| lead.mul(&tw_x[p & (wp - 1)]).mul(&th_x[p >> lw])).collect();
+        let rd = ctx.chals(lco);
+        let rb = ctx.chals(lbatch);
+        let (am, ap, aj) = conv_pp_powers(cv, alpha);
+        let (mut eb, mut ed) = (eq_table(&rb), eq_table(&rd));
+        eb[cv.batch..].fill(K8::ZERO);
+        ed[cv.c_out..].fill(K8::ZERO);
         let (yf2, px, pw, val) = if ctx.prover {
             let pd = self.pd.unwrap();
-            let yf2 = partial_eval(pd.v(yf), lf + lco, &(0..lco).map(|j| (lf + j, r_d2[j])).collect::<Vec<_>>());
-            let xv = pd.v(x);
-            let px: Vec<K8> = (0..1usize << lci).into_par_iter().map(|cc| (0..1usize << l_si).fold(K8::ZERO, |a, p| { let u = xv[p + (cc << l_si)]; if u == 0 { a } else { a.add(&ap[p].scale(u)) } })).collect();
-            let wfix: Vec<(usize, K8)> = (0..lco).map(|j| (lk + lci + j, r_d2[j])).collect();
-            let wd = partial_eval(pd.v(wf), lk + lci + lco, &wfix);
-            let pw: Vec<K8> = (0..1usize << lci).map(|cc| (0..1usize << lk).fold(K8::ZERO, |a, j| a.add(&a_j[j].mul(&wd[j + (cc << lk)])))).collect();
-            let val = a_m.iter().zip(&yf2).fold(K8::ZERO, |a, (u, v)| a.add(&u.mul(v)));
+            // Y_full is NOT masked here: the random-point polynomial identity
+            // also forces all padded batch/channel/coefficient slots to zero.
+            let yf_fixed: Vec<_> = (0..lco).map(|j| (lf + j, rd[j]))
+                .chain((0..lbatch).map(|j| (lf + lco + j, rb[j]))).collect();
+            let yf2 = partial_eval(pd.v(yf), lf + lco + lbatch, &yf_fixed);
+            let xv = masked_axis_fold(pd.v(x), l_si + lci + lbatch, l_si + lci, &rb, cv.batch);
+            let px: Vec<K8> = (0..1usize << lci).into_par_iter().map(|cc|
+                (0..cv.s_in).fold(K8::ZERO, |a,p| a.add(&ap[p].mul(&xv[p + (cc << l_si)])))).collect();
+            let wd = masked_axis_fold(pd.v(wf), lk + lci + lco, lk + lci, &rd, cv.c_out);
+            let pw: Vec<K8> = (0..1usize << lci).map(|cc|
+                (0..1usize << lk).fold(K8::ZERO, |a,j| a.add(&aj[j].mul(&wd[j + (cc << lk)])))).collect();
+            let val = am.iter().zip(&yf2).fold(K8::ZERO, |a,(u,v)| a.add(&u.mul(v)));
             if selfcheck() {
-                let rhs = px.iter().zip(&pw).fold(K8::ZERO, |a, (u, v)| a.add(&u.mul(v)));
-                assert!(val == rhs, "conv polynomial-product identity");
+                let rhs = (0..cv.c_in).fold(K8::ZERO, |a,cc| a.add(&px[cc].mul(&pw[cc])));
+                assert_eq!(val, rhs, "batched conv polynomial-product identity");
             }
             (yf2, px, pw, Some(val))
-        } else { (vec![], vec![], vec![], None) };
+        } else { (vec![],vec![],vec![],None) };
         let a = ctx.alloc("convolution A pad");
         let z = ctx.send(val.map(|v| v.add(&ctx.bank[a as usize])));
         let eta = lin1(a, K8::ONE);
-        // Σ_m α^m Y_full(r_d2, m) = z − a.
-        let am = a_m.clone();
-        let o1 = ctx.masked_sc(lf, 1, true, z, &eta, if ctx.prover { Some(Tables::Host(vec![a_m, yf2])) } else { None }, &|xs: &[K8]| tensor::mle_k(&am, xs));
+        let am_eval = am.clone();
+        let o1 = ctx.masked_sc(lf, 1, true, z, &eta,
+            if ctx.prover { Some(Tables::Host(vec![am, yf2])) } else { None },
+            &|xs: &[K8]| tensor::mle_k(&am_eval, xs));
         let rr1 = o1.rho.mul(&o1.rho.sub(&K8::ONE));
-        let mut p1 = o1.x.clone(); p1.extend_from_slice(&r_d2);
+        let mut p1 = o1.x.clone(); p1.extend_from_slice(&rd); p1.extend_from_slice(&rb);
         self.push(ctx, yf, AClaim { point: p1, pad: lin1(o1.pads[0], rr1), z: o1.v[0] });
-        // Σ_c X_rev(c, α) W_flat(r_d2, c, α) = z − a.
-        let o2 = ctx.masked_sc(lci, 2, false, z, &eta, if ctx.prover { Some(Tables::Host(vec![px, pw])) } else { None }, &|_: &[K8]| K8::ONE);
+        let ci_masked = !cv.c_in.is_power_of_two();
+        let tables2 = if ctx.prover {
+            let mut t = Vec::new();
+            if ci_masked { t.push((0..1usize << lci).map(|cc| if cc < cv.c_in { K8::ONE } else { K8::ZERO }).collect()); }
+            t.push(px); t.push(pw); Some(Tables::Host(t))
+        } else { None };
+        let o2 = ctx.masked_sc(lci, 2, ci_masked, z, &eta, tables2, &|xs: &[K8]| prefix_mle(cv.c_in, xs));
         let rr2 = o2.rho.mul(&o2.rho.sub(&K8::ONE));
-        let xc = o2.x.clone();
-        // X_rev(x_c, α) -> X.
+        let xc = &o2.x;
+        // X_rev(x_c,alpha,r_b): retain batch as an explicit masked variable
+        // in this reduction, so poisoned padded batches cannot enter the fold.
         let tables3 = if ctx.prover {
-            let pd = self.pd.unwrap();
-            Some(Tables::Host(vec![ap.clone(), partial_eval(pd.v(x), l_si + lci, &(0..lci).map(|j| (l_si + j, xc[j])).collect::<Vec<_>>())]))
+            let px: Vec<K8> = (0..1usize << (l_si + lbatch)).map(|i| ap[i & (cv.s_in - 1)].mul(&eb[i >> l_si])).collect();
+            let fixed: Vec<_> = (0..lci).map(|j| (l_si + j, xc[j])).collect();
+            Some(Tables::Host(vec![px, partial_eval(self.pd.unwrap().v(x), l_si + lci + lbatch, &fixed)]))
         } else { None };
-        let (twx, thx) = (tw_x.clone(), th_x.clone());
-        let o3 = ctx.masked_sc(l_si, 1, true, o2.v[0], &lin1(o2.pads[0], rr2), tables3, &|xs: &[K8]| lead.mul(&tensor::mle_k(&twx, &xs[..lw])).mul(&tensor::mle_k(&thx, &xs[lw..])));
+        let o3 = ctx.masked_sc(l_si + lbatch, 1, true, o2.v[0], &lin1(o2.pads[0], rr2), tables3,
+            &|xs: &[K8]| tensor::mle_k(&ap, &xs[..l_si]).mul(&tensor::mle_k(&eb, &xs[l_si..])));
         let rr3 = o3.rho.mul(&o3.rho.sub(&K8::ONE));
-        let mut px_pt = o3.x.clone(); px_pt.extend_from_slice(&xc);
-        self.push(ctx, x, AClaim { point: px_pt, pad: lin1(o3.pads[0], rr3), z: o3.v[0] });
-        // W_flat(r_d2, x_c, α) -> W_flat.
+        let mut xp = o3.x[..l_si].to_vec(); xp.extend_from_slice(xc); xp.extend_from_slice(&o3.x[l_si..]);
+        self.push(ctx, x, AClaim { point: xp, pad: lin1(o3.pads[0], rr3), z: o3.v[0] });
+        // Shared W_flat has only j,c,d variables, never a batch coordinate.
         let tables4 = if ctx.prover {
-            let pd = self.pd.unwrap();
-            let fx: Vec<(usize, K8)> = (0..lci).map(|j| (lk + j, xc[j])).chain((0..lco).map(|j| (lk + lci + j, r_d2[j]))).collect();
-            Some(Tables::Host(vec![a_j.clone(), partial_eval(pd.v(wf), lk + lci + lco, &fx)]))
+            let pw: Vec<K8> = (0..1usize << (lk + lco)).map(|i| aj[i & ((1 << lk) - 1)].mul(&ed[i >> lk])).collect();
+            let fixed: Vec<_> = (0..lci).map(|j| (lk + j, xc[j])).collect();
+            Some(Tables::Host(vec![pw, partial_eval(self.pd.unwrap().v(wf), lk + lci + lco, &fixed)]))
         } else { None };
-        let aj = a_j.clone();
-        let o4 = ctx.masked_sc(lk, 1, true, o2.v[1], &lin1(o2.pads[1], rr2), tables4, &|xs: &[K8]| tensor::mle_k(&aj, xs));
+        let o4 = ctx.masked_sc(lk + lco, 1, true, o2.v[1], &lin1(o2.pads[1], rr2), tables4,
+            &|xs: &[K8]| tensor::mle_k(&aj, &xs[..lk]).mul(&tensor::mle_k(&ed, &xs[lk..])));
         let rr4 = o4.rho.mul(&o4.rho.sub(&K8::ONE));
-        let mut wpt = o4.x.clone(); wpt.extend_from_slice(&xc); wpt.extend_from_slice(&r_d2);
-        self.push(ctx, wf, AClaim { point: wpt, pad: lin1(o4.pads[0], rr4), z: o4.v[0] });
+        let mut wp = o4.x[..lk].to_vec(); wp.extend_from_slice(xc); wp.extend_from_slice(&o4.x[lk..]);
+        self.push(ctx, wf, AClaim { point: wp, pad: lin1(o4.pads[0], rr4), z: o4.v[0] });
     }
 
-    /// The unflattened kernel behind a conv's weight input.
-    fn unflatten(&self, mut e: usize) -> usize {
+    /// Look through a FlattenKernel only when its public geometry agrees
+    /// exactly with this Conv2D. Otherwise bind the ACTUAL flat weight edge
+    /// with a tap map; blindly bypassing a different flatten is unsound.
+    fn conv2d_kernel(&self, edge: usize, cv: &crate::basicblock::conv::Conv2D) -> (usize, Option<Rel>) {
+        assert_eq!(self.g.nvars[edge], lb(cv.s_kernel) + lb(cv.c_in) + lb(cv.c_out),
+            "Conv2D flat kernel extent must match its public indexing strides");
+        let mut e = edge;
         loop {
-            match self.g.dag.producers[e].map(|p| &self.g.dag.nodes[p].kind) {
-                Some(BasicBlockType::FlattenKernel(_)) | Some(BasicBlockType::FlattenKernel3D(_)) | Some(BasicBlockType::ChangeShape(_)) => e = self.g.dag.nodes[self.g.dag.producers[e].unwrap()].inputs[0],
-                _ => return e,
+            match self.g.dag.producers[e].map(|p| &self.g.dag.nodes[p]) {
+                Some(n) if matches!(n.kind, BasicBlockType::ChangeShape(_))
+                    && self.g.nvars[n.inputs[0]] == self.g.nvars[e] => e = n.inputs[0],
+                Some(n) => {
+                    if let BasicBlockType::FlattenKernel(fk) = &n.kind {
+                        if (fk.s_w, fk.kh, fk.kw, fk.c_in, fk.c_out, fk.dilation_h, fk.dilation_w)
+                            == (cv.stride_w, cv.kernel_h, cv.kernel_w, cv.c_in, cv.c_out, cv.dilation_h, cv.dilation_w) {
+                            return (n.inputs[0], None);
+                        }
+                    }
+                    break;
+                }
+                None => break,
             }
         }
+        let sk = lb(cv.kernel_w) + lb(cv.kernel_h);
+        let lk = self.g.nvars[edge].checked_sub(lb(cv.c_in) + lb(cv.c_out)).expect("flat kernel channels");
+        assert_eq!(lk, lb(cv.s_kernel), "flat kernel spatial stride");
+        let pairs = (0..cv.kernel_h).flat_map(|h| (0..cv.kernel_w).map(move |w|
+            (w + (h << lb(cv.kernel_w)), h * cv.dilation_h * cv.stride_w + w * cv.dilation_w)));
+        (edge, Some(Rel::map(sk, lk, pairs)))
     }
 
     /// ZeroPad-style map: Y[c, o_d] = X[c, o_d − off_d] for o_d − off_d < in_d.
@@ -477,60 +703,35 @@ impl<'g, 'a> Walk<'g, 'a> {
     /// shape ([C_out, C_in, k..] normal/depthwise, [C_in, C_out, k..]
     /// transposed); `rels` are the spatial axes, lowest first.
     #[allow(clippy::too_many_arguments)]
-    fn conv(&mut self, ctx: &mut Ctx, x: usize, w: usize, wshape: &[usize], rels: Vec<Rel>, kind: WKind, lci: usize, lco: usize, c: AClaim) {
+    fn conv(&mut self, ctx: &mut Ctx, x: usize, w: usize, wshape: &[usize], rels: Vec<Rel>, kind: WKind, lci: usize, lco: usize, batch: usize, flat_kernel: Option<Rel>, c: AClaim) {
         let r = c.point.clone();
         let so: usize = rels.iter().map(|d| d.ob).sum();
         let si: usize = rels.iter().map(|d| d.ib).sum();
         let sk: usize = rels.iter().map(|d| d.kb).sum();
-        assert_eq!(self.g.nvars[x], si + lci, "conv input bits (edge {x})");
-        assert_eq!(r.len(), so + lco, "conv output bits");
-        assert_eq!(self.g.nvars[w], wshape.iter().map(|&s| lb(s)).sum::<usize>(), "conv weight bits (edge {w})");
+        assert!(batch > 0, "conv logical batch must be positive");
+        let lbatch = lb(batch);
+        assert_eq!(self.g.nvars[x], si + lci + lbatch, "conv input bits (edge {x})");
+        assert_eq!(r.len(), so + lco + lbatch, "conv output bits");
+        let weight_taps = flat_kernel.as_ref().map(|rel| rel.ib).unwrap_or(sk);
+        let (cin_off,cout_off,expected_weight_bits) = conv_weight_offsets(kind,weight_taps,lci,lco);
+        assert_eq!(self.g.nvars[w], expected_weight_bits, "shared conv weight bits (edge {w})");
         let ro: Vec<Vec<K8>> = { let mut off = 0; rels.iter().map(|d| { let v = r[off..off + d.ob].to_vec(); off += d.ob; v }).collect() };
-        let rd = r[so..].to_vec();
-        // Kernel layout: [k (lowest), channel-in-like, channel-out-like].
-        let wo = Self::offs(wshape);
-        let (cin_off, cout_off) = match kind { WKind::Normal | WKind::Depthwise => (wo[1], wo[0]), WKind::Transpose => (wo[0], wo[1]) };
+        let rd = r[so..so + lco].to_vec();
+        let rb = r[so + lco..].to_vec();
+        let (channels_in, channels_out) = match kind {
+            WKind::Normal => (wshape[1], wshape[0]),
+            WKind::Transpose => (wshape[0], wshape[1]),
+            WKind::Depthwise => (wshape[0], wshape[0]),
+        };
         // Stage 1 variables: kernel taps then the summed channel.
-        let lc = lci;
-        let n1 = sk + lc;
+        let n1 = sk + lci;
         let tables = if ctx.prover {
             let pd = self.pd.unwrap();
-            // A(k, c) by contracting the spatial axes of X one by one.
-            let xv = pd.v(x);
-            let mut sizes: Vec<usize> = rels.iter().map(|d| d.ib).collect();
-            sizes.push(lci);
-            let mut cur: Option<Vec<K8>> = None;
-            for (a, d) in rels.iter().enumerate() {
-                let m = d.kmat(&ro[a]);
-                let pre: usize = 1usize << sizes[..a].iter().sum::<usize>();
-                let post: usize = 1usize << sizes[a + 1..].iter().sum::<usize>();
-                let (ni, nk) = (1usize << d.ib, 1usize << d.kb);
-                let out: Vec<K8> = (0..post * nk).into_par_iter().flat_map_iter(|pk| {
-                    let (ph, k) = (pk / nk, pk % nk);
-                    let row = &m[k];
-                    let cur = &cur;
-                    (0..pre).map(move |pl| {
-                        let mut acc = K8::ZERO;
-                        for &(i, coef) in row {
-                            let idx = (ph * ni + i) * pre + pl;
-                            let v = match cur { Some(t) => t[idx].mul(&coef), None => { let u = xv[idx]; if u == 0 { continue } else { coef.scale(u) } } };
-                            acc = acc.add(&v);
-                        }
-                        acc
-                    })
-                }).collect();
-                sizes[a] = d.kb;
-                cur = Some(out);
-            }
-            let a_tab = cur.expect("conv with no spatial axis");
+            let a_tab = conv_patch_table(pd.v(x), &rels, &ro, lci, batch, &rb);
             // W restricted to the output channel point (or kept, depthwise).
             let wv = pd.v(w);
             let nw = self.g.nvars[w];
-            let wfixed: Vec<(usize, K8)> = match kind {
-                WKind::Depthwise => vec![],
-                _ => (0..lco).map(|j| (cout_off + j, rd[j])).collect(),
-            };
-            let w_tab = partial_eval(wv, nw, &wfixed);
+            let w_tab = conv_weight_table(wv,nw,sk,lci,kind,cout_off,&rd,channels_out,flat_kernel.as_ref());
             assert_eq!(w_tab.len(), 1usize << n1, "kernel table size");
             assert_eq!(a_tab.len(), 1usize << n1, "patch table size");
             let mut t = Vec::new();
@@ -540,6 +741,8 @@ impl<'g, 'a> Walk<'g, 'a> {
                 let e = eq_table(&rd);
                 let nch = wshape[0];
                 t.push((0..1usize << n1).map(|i| if (i >> sk) < nch { e[i >> sk] } else { K8::ZERO }).collect::<Vec<_>>());
+            } else if !channels_in.is_power_of_two() {
+                t.push((0..1usize << n1).map(|i| if (i >> sk) < channels_in { K8::ONE } else { K8::ZERO }).collect());
             }
             t.push(w_tab);
             t.push(a_tab);
@@ -548,20 +751,22 @@ impl<'g, 'a> Walk<'g, 'a> {
         let dw = kind == WKind::Depthwise;
         let rd2 = rd.clone();
         let nch = wshape[0];
-        let out = ctx.masked_sc(n1, 2, dw, c.z, &c.pad, tables, &|xs: &[K8]| if dw { masked_eq(&rd2, &xs[sk..], nch) } else { K8::ONE });
+        let out = ctx.masked_sc(n1, 2, dw || !channels_in.is_power_of_two(), c.z, &c.pad, tables,
+            &|xs: &[K8]| if dw { masked_eq(&rd2, &xs[sk..], nch) } else { prefix_mle(channels_in, &xs[sk..]) });
         let rr = out.rho.mul(&out.rho.sub(&K8::ONE));
         let (xk, xc) = (out.x[..sk].to_vec(), out.x[sk..].to_vec());
-        // Kernel claim.
-        let mut wp = vec![K8::ZERO; self.g.nvars[w]];
-        wp[..sk].copy_from_slice(&xk);
-        match kind {
-            WKind::Depthwise => { wp[cout_off..cout_off + lc].copy_from_slice(&xc); }
-            _ => { wp[cin_off..cin_off + lci].copy_from_slice(&xc); wp[cout_off..cout_off + lco].copy_from_slice(&rd); }
-        }
-        let _ = cin_off;
-        self.push(ctx, w, AClaim { point: wp, pad: lin1(out.pads[0], rr), z: out.v[0] });
-        // Patch claim -> input map.
-        let fixed: Vec<(usize, K8)> = (0..lci).map(|j| (si + j, xc[j])).collect();
+        // The kernel has no batch variables: one shared kernel is bound.
+        // Non-power-of-two output channels must be masked, not simply fixed.
+        let channel_off = if dw { cout_off } else { cin_off };
+        let mut fixed: Vec<_> = (0..lci).map(|j| (channel_off+j,xc[j])).collect();
+        let mut axes = Vec::new();
+        if let Some(rel) = flat_kernel {
+            axes.push(MapAxis { off:0,rel,ro:xk.clone(),rk:vec![] });
+        } else { fixed.extend((0..sk).map(|j| (j,xk[j]))); }
+        if !dw { Self::chan_axis(channels_out,cout_off,lco,&rd,&mut fixed,&mut axes); }
+        self.map_reduce(ctx,w,fixed,axes,out.v[0],&lin1(out.pads[0],rr));
+        // Patch claim -> input map, preserving the logical batch identity.
+        let mut fixed: Vec<(usize, K8)> = (0..lci).map(|j| (si + j, xc[j])).collect();
         let (mut xo, mut ko) = (0, 0);
         let mut axes = Vec::new();
         for (a, d) in rels.into_iter().enumerate() {
@@ -569,6 +774,7 @@ impl<'g, 'a> Walk<'g, 'a> {
             axes.push(MapAxis { off: xo, rel: d, ro: ro[a].clone(), rk: xk[ko..ko + kb].to_vec() });
             xo += ib; ko += kb;
         }
+        Self::chan_axis(batch, si + lci, lbatch, &rb, &mut fixed, &mut axes);
         self.map_reduce(ctx, x, fixed, axes, out.v[1], &lin1(out.pads[1], rr));
     }
 
@@ -583,12 +789,12 @@ impl<'g, 'a> Walk<'g, 'a> {
             let r = ctx.chals(n);
             let tables = if ctx.prover {
                 let pd = self.pd.unwrap();
-                if gpu::enabled() && (1usize << n) >= gpu::threshold() {
+                backend_tables!(gpu::enabled() && (1usize << n) >= gpu::threshold(), {
                     Some(Tables::Dev(vec![gpu::eq(&r), gpu::lift(&pd.dev(a), 1 << n), gpu::lift(&pd.dev(b), 1 << n)]))
-                } else {
+                }, {
                     let f = |e: usize| pd.v(e).iter().map(|&v| K8::from_base(v)).collect::<Vec<_>>();
                     Some(Tables::Host(vec![eq_table(&r), f(a), f(b)]))
-                }
+                })
             } else { None };
             let rc = r.clone();
             let out = ctx.masked_sc(n, 2, true, K8::ZERO, &Lin::new(), tables, &|xs: &[K8]| eq_pt(&rc, xs));
@@ -599,8 +805,26 @@ impl<'g, 'a> Walk<'g, 'a> {
     }
 }
 
+/// The public descriptor must encode the same canonical geometry as the
+/// forward block. In particular no inconsistent flatten stride is inferred
+/// from just a total tensor arity.
+fn validate_conv2d_geometry(cv: &crate::basicblock::conv::Conv2D) {
+    assert!([cv.batch, cv.c_in, cv.c_out, cv.kernel_h, cv.kernel_w, cv.input_h, cv.input_w,
+        cv.conv_stride_h, cv.conv_stride_w, cv.dilation_h, cv.dilation_w].iter().all(|&v| v > 0), "positive Conv2D geometry");
+    let eh = (cv.kernel_h - 1).checked_mul(cv.dilation_h).and_then(|v| v.checked_add(1)).expect("Conv2D height overflow");
+    let ew = (cv.kernel_w - 1).checked_mul(cv.dilation_w).and_then(|v| v.checked_add(1)).expect("Conv2D width overflow");
+    assert!(eh <= cv.input_h && ew <= cv.input_w, "Conv2D effective kernel must fit input");
+    let wp = cv.input_w.checked_next_power_of_two().expect("Conv2D width extent");
+    let hp = cv.input_h.checked_next_power_of_two().expect("Conv2D height extent");
+    assert_eq!(cv.stride_w, wp, "Conv2D flat width stride");
+    assert_eq!(cv.s_in, wp.checked_mul(hp).expect("Conv2D spatial extent"));
+    assert_eq!(cv.s_kernel, (eh - 1).checked_mul(wp).and_then(|v| v.checked_add(ew)).expect("Conv2D kernel extent"));
+    assert_eq!(cv.h_out, (cv.input_h - eh) / cv.conv_stride_h + 1);
+    assert_eq!(cv.w_out, (cv.input_w - ew) / cv.conv_stride_w + 1);
+}
+
 /// Convolution relation along one axis: i = s·o + δ·k (o < O, k < K, i < I).
-fn trip_conv(o_n: usize, k_n: usize, i_n: usize, s: usize, dl: usize) -> Vec<(usize, usize, usize)> {
+pub(super) fn trip_conv(o_n: usize, k_n: usize, i_n: usize, s: usize, dl: usize) -> Vec<(usize, usize, usize)> {
     let mut v = Vec::new();
     for o in 0..o_n { for k in 0..k_n { let i = o * s + dl * k; if i < i_n { v.push((o, k, i)); } } }
     v
@@ -626,3 +850,7 @@ mod prefix_tests {
         }
     }
 }
+
+#[cfg(any(test, feature = "cpu-replay"))]
+#[path = "cv_family_tests.rs"]
+pub mod family_tests;

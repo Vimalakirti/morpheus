@@ -464,6 +464,12 @@ pub fn verify(p: &Profile, keys: &Keys, tr: &MTranscript, pt: &Point, targets: &
     use super::auth::{act_tuple, add_ring, add_tuple};
     use super::pcs_maps::{act_c0_a, act_c0_ring_q};
     use rayon::prelude::*;
+    if !super::wire::auth_shape_ok(p, pf) || targets.len() > p.n_max
+        || pt.xi.len() != p.ell() || !pt.xi.iter().all(super::wire::canonical_k)
+        || !super::wire::canonical_k(&pt.rho) || pt.rho == K8::ZERO || pt.rho == K8::ONE
+        || !targets.iter().all(|t| super::wire::commitment_ok(p, &t.c)
+            && super::wire::commitment_ok(p, &t.g) && super::wire::endpoint_ok(&t.a))
+        || !super::wire::commitment_ok(p, &target_o.c) || !super::wire::endpoint_ok(&target_o.t) { return false; }
     let (sw, sl, so) = (p.source_cols(), p.link_cols(), p.aux_cols());
     if (pf.attempt as usize) >= p.attempts || pf.d.len() != p.tau || pf.d_o.len() != p.tau {
         return false;

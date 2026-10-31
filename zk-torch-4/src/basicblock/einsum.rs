@@ -95,6 +95,11 @@ pub struct Einsum {
 }
 
 impl Einsum {
+    /// Public cached index schedule (never tensor payloads).
+    pub(crate) fn public_schedule(&self) -> (&[Vec<(usize, usize)>], usize) {
+        (&self.permute_vecs, self.summation_round)
+    }
+
     pub fn new(equation: &str, input_shapes: Vec<Vec<usize>>, output_shape: Vec<usize>) -> Self {
         let mut all_shapes = input_shapes.clone();
         all_shapes.push(output_shape.clone());

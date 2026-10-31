@@ -204,13 +204,20 @@ impl LinkServices for CpuServices {
         Masks { u, r_cols, a_aux, s_o }
     }
     fn commit_link(&mut self, p: &Profile, seed: &KeySeed, r_cols: &[Vec<Vec<i64>>]) -> Vec<Vec<Vec<u64>>> {
-        r_cols.iter().map(|r| super::auth::lin(p, seed, super::keys::KeyKind::Link, A_ENC_COLS, r)).collect()
+        let indices: Vec<usize> = (0..p.link_cols()).collect();
+        r_cols.iter().map(|r| super::auth_compact::lin_indexed(p, seed, super::keys::KeyKind::Link, A_ENC_COLS, &indices, &|c| r[c].clone())).collect()
     }
     fn commit_aux(&mut self, p: &Profile, seed: &KeySeed, s_o: &[Vec<i64>]) -> Vec<Vec<u64>> {
-        super::auth::lin(p, seed, super::keys::KeyKind::Aux, A_ENC_COLS * p.aux_coeffs, s_o)
+        super::auth_compact::lin_indexed(p, seed, super::keys::KeyKind::Aux, A_ENC_COLS * p.aux_coeffs, &(0..p.aux_cols()).collect::<Vec<_>>(), &|c| s_o[c].clone())
     }
-    fn ev(&mut self, _p: &Profile, raw: &[Vec<i8>], xi: &[K8]) -> Vec<AElem> {
-        raw.iter().map(|r| super::pcs_maps::ev_raw(&raw_to_cols(r), xi)).collect()
+    fn ev(&mut self, p: &Profile, raw: &[Vec<i8>], xi: &[K8]) -> Vec<AElem> {
+        // Stream the ORIGINAL full-domain columns. This changes neither the
+        // public Gaussian support nor the endpoint: no i64 source materializes.
+        let indices: Vec<usize> = (0..p.source_cols()).collect();
+        raw.iter().map(|r| {
+            assert_eq!(r.len(), p.source_cols() * super::ring::N);
+            super::auth_compact::ev_indexed(xi, &indices, &|c| super::auth_compact::raw_column(r, c))
+        }).collect()
     }
 }
 
@@ -254,6 +261,96 @@ pub(crate) fn term_tables(t: &TermInfo, r_pre: &[K8], i: usize, d: usize, b0: us
     }
 }
 
+/// Deterministic scalar-array preflight for the block CPU route. These counts
+/// are allocated payload bytes, NOT an RSS ceiling (hash-map/vector metadata,
+/// caller-owned raw digits, masks, allocator and thread stacks are additional).
+#[derive(Clone, Debug)]
+pub struct CpuMemoryPlan {
+    pub coarse_tables_bytes: usize,
+    pub coarse_fold_scratch_bytes: usize,
+    pub coarse_eq_scratch_bytes: usize,
+    pub max_round_tables_bytes: usize,
+    pub dense_query_bytes: usize,
+    pub block_term_entries: usize,
+    pub declared_bit_blocks: usize,
+}
+/// Check the structural block preconditions and count the actual fixed tables
+/// without allocating source-sized K tables. No witness digits are inspected.
+pub fn cpu_memory_plan(p: &Profile, st: &Statement, b0: usize) -> Option<CpuMemoryPlan> {
+    // Count unions of block intervals, not one allocation per domain block.
+    fn union_count(mut spans: Vec<(usize, usize, usize)>) -> Option<usize> {
+        spans.sort_unstable();
+        let mut total = 0usize;
+        let mut current: Option<(usize, usize, usize)> = None;
+        for (source, start, end) in spans {
+            match current {
+                Some((s,a,b)) if s == source && start <= b => current = Some((s,a,b.max(end))),
+                Some((s,a,b)) => { let _=s; total=total.checked_add(b-a)?;current=Some((source,start,end)); },
+                None => current=Some((source,start,end)),
+            }
+        }
+        if let Some((_,a,b))=current {total=total.checked_add(b-a)?;}
+        Some(total)
+    }
+    let ell = p.ell();
+    if b0 > ell || st.n == 0 || st.n > p.n_max || st.bits.len() != st.n { return None; }
+    let pow = |k: usize| 1usize.checked_shl(u32::try_from(k).ok()?);
+    let domain = pow(ell)?;
+    let coarse = pow(ell - b0)?;
+    let mut dense_blocks = Vec::new();
+    let mut bit_blocks = Vec::new();
+    let mut round_counts = vec![0usize; b0];
+    let mut block_term_entries = 0usize;
+    for row in &st.rows { for t in &row.terms {
+        let r = &t.region;
+        let lg = r.m.checked_add(r.p)?;
+        let size = pow(lg)?;
+        if lg < b0 || lg > ell || r.p > b0 || r.source >= st.n || r.base % size != 0
+            || r.base.checked_add(size)? > domain || t.r.len() != r.m || t.pw.len() != pow(r.p)? { return None; }
+        let nb = pow(lg - b0)?;
+        if r.p > DENSE_P {
+            let idx_bits = b0-r.p;
+            let high = &t.r[idx_bits..];
+            if high.iter().all(|x| *x == K8::ZERO || *x == K8::ONE) {
+                let k = high.iter().enumerate().fold(0usize, |a,(j,x)| a | (((*x == K8::ONE) as usize) << j));
+                dense_blocks.push((r.source, (r.base >> b0)+k, (r.base >> b0)+k+1));
+            } else { dense_blocks.push((r.source, r.base >> b0, (r.base >> b0).checked_add(nb)?)); }
+        } else {
+            // Exact public support of eq(high, k). Boolean coordinates fix a bit;
+            // other field coordinates have two nonzero factors. Scale zero has
+            // empty support. Challenge-dependent zero coefficients may further
+            // reduce execution entries, so this remains a public upper bound.
+            let free = t.r[b0-r.p..].iter().filter(|x| **x != K8::ZERO && **x != K8::ONE).count();
+            let supported = if t.scale.is_zero() { 0 } else { pow(free)? };
+            block_term_entries = block_term_entries.checked_add(supported)?;
+            for i in 0..b0 {
+                let d = p.deg_old;
+                let (a,b) = if i < r.p { ((d+1).checked_mul(pow(r.p-i-1)?)?, pow(b0-r.p)?) }
+                    else { (d+1,pow(b0-i-1)?) };
+                round_counts[i] = round_counts[i].checked_add(a.checked_add(b)?)?;
+            }
+        }
+    }}
+    for (source, blocks) in st.bits.iter().enumerate() { for &(base,lg) in blocks {
+        let size=pow(lg)?;
+        if lg < b0 || lg > ell || base % size != 0 || base.checked_add(size)? > domain { return None; }
+        bit_blocks.push((source,base>>b0,(base>>b0).checked_add(pow(lg-b0)?)?));
+    }}
+    let mut max_round = 0usize;
+    for (i,count) in round_counts.into_iter().enumerate() {
+        max_round=max_round.max(count.checked_add(pow(i)?)?.checked_add(pow(b0-i-1)?)?);
+    }
+    Some(CpuMemoryPlan {
+        coarse_tables_bytes: 3usize.checked_mul(st.n)?.checked_mul(coarse)?.checked_mul(std::mem::size_of::<K8>())?,
+        coarse_fold_scratch_bytes: (coarse/2).checked_mul(std::mem::size_of::<K8>())?,
+        coarse_eq_scratch_bytes: (coarse/2).checked_mul(std::mem::size_of::<K8>())?,
+        max_round_tables_bytes: max_round.checked_mul(std::mem::size_of::<K8>())?,
+        dense_query_bytes: union_count(dense_blocks)?.checked_mul(pow(b0)?)?.checked_mul(std::mem::size_of::<K8>())?,
+        block_term_entries,
+        declared_bit_blocks: union_count(bit_blocks)?,
+    })
+}
+
 /// Structured prover; identical output to `link::prove`.
 #[allow(clippy::too_many_arguments)]
 pub fn prove(
@@ -270,6 +367,11 @@ pub fn prove_with(
     st: &Statement, raw: &[Vec<i8>], b0: usize, backend: &BackendFactory,
     svc: &mut dyn LinkServices, c_src: Option<&[Vec<Vec<u64>>]>, v2: bool,
 ) -> LinkOutput {
+    if !v2 {
+        let _plan = cpu_memory_plan(p, st, b0).expect("invalid block CPU statement/layout preflight");
+        assert_eq!(raw.len(), st.n, "one raw source per statement source");
+        assert!(raw.iter().all(|r| r.len() == p.source_cols() * super::ring::N), "full logical source domains required");
+    }
     p.check_caps(raw);
     let tm = std::env::var("MORPHEUS_TIMING").is_ok();
     let mut t0 = std::time::Instant::now();
@@ -290,9 +392,14 @@ pub fn prove_with(
     lap("aux commitment + coins");
     let a_coef: Vec<Vec<K8>> = { let mut v = Vec::new(); let mut idx = 0; for &d in &degs { v.push((0..d).map(|k| a_aux[idx + k].0[0]).collect()); idx += d; } v };
     let (rounds, xi, w, q, chi, pre_alpha, mo_prefix) = if v2 {
+        #[cfg(not(feature = "cuda"))]
+        panic!("CUDA link v2 requested in CPU-only build");
+        #[cfg(feature = "cuda")]
+        {
         let o = super::link_gpu::phases_v2(p, st, raw, b0, &alpha, &eta, &gp, &degs, &a_coef, tr, svc.dev_raw(), svc.kept());
         lap("v2 phases");
         (o.0, o.1, o.2.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.3.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.4.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.5, o.6)
+        }
     } else {
     // Terms and blocks.
     let mut terms: Vec<TermInfo> = Vec::new();
@@ -329,12 +436,26 @@ pub fn prove_with(
             terms.push(TermInfo { p: pp, pw: t.pw.clone(), r: t.r.clone() });
             let idx_bits = b0 - pp;
             let nb = 1usize << (m + pp - b0);
+            // Preserve every TermInfo (and its tables/validation), omitting
+            // only algebraically zero block coefficients. Do not alter declared
+            // bit blocks: their chi obligations are independent of query support.
+            let mut fixed_mask = 0usize;
+            let mut fixed_value = 0usize;
+            for (j, x) in t.r[idx_bits..].iter().enumerate() {
+                if *x == K8::ZERO || *x == K8::ONE {
+                    fixed_mask |= 1usize << j;
+                    if *x == K8::ONE { fixed_value |= 1usize << j; }
+                }
+            }
             for k in 0..nb {
+                if (k & fixed_mask) != fixed_value { continue; }
                 // Block k of the region covers index high bits k.
                 let hi = t.r[idx_bits..].iter().enumerate().fold(K8::ONE, |a, (jj, x)| a.mul(&eqb(x, (k >> jj) & 1)));
                 let c = coef.mul(&t.scale).mul(&hi);
                 let id = (t.region.base >> b0) + k;
-                by_block.entry((t.region.source, id)).or_default().push(BlockTerm { term: ti, c });
+                if !c.is_zero() {
+                    by_block.entry((t.region.source, id)).or_default().push(BlockTerm { term: ti, c });
+                }
             }
         }
     }
@@ -353,9 +474,13 @@ pub fn prove_with(
         let mut ids: std::collections::BTreeSet<usize> = nz.into_iter().collect();
         for &(ss, id) in by_block.keys().chain(dense.keys()) { if ss == s { ids.insert(id); } }
         for id in ids {
-            blocks.push(Block { source: s, id, chi: bit_block.contains_key(&(s, id)), c_alpha: c_alpha(id), terms: by_block.get(&(s, id)).cloned().unwrap_or_default(), qd: dense.remove(&(s, id)).map(std::sync::Arc::new) });
+            blocks.push(Block { source: s, id, chi: bit_block.contains_key(&(s, id)), c_alpha: c_alpha(id), terms: by_block.remove(&(s, id)).unwrap_or_default(), qd: dense.remove(&(s, id)).map(std::sync::Arc::new) });
         }
     }
+    // BlockTerm vectors are moved into blocks, never duplicated at assembly.
+    // Dense payloads have been moved into Arcs.
+    drop(by_block);
+    drop(dense);
     lap("terms + blocks");
 
     let nvars = ell + 1;
@@ -390,6 +515,12 @@ pub fn prove_with(
     let mut w: Vec<Vec<K8>> = vec![vec![K8::ZERO; coarse]; n];
     let mut q: Vec<Vec<K8>> = vec![vec![K8::ZERO; coarse]; n];
     let mut chi: Vec<Vec<K8>> = vec![vec![K8::ZERO; coarse]; n];
+    // The bit indicator is public and independent of witness support. A zero
+    // declared bit block can be absent from sparse `blocks`, but still affects
+    // the final masked polynomial after adding rho(1-rho)*u. Preserve it.
+    for (&(source, id), &is_bit) in &bit_block {
+        if is_bit { chi[source][id] = K8::ONE; }
+    }
     let tfold: Vec<K8> = terms.iter().map(|t| {
         let ep = eq_table(&xi[..t.p]);
         let pwv = t.pw.iter().zip(&ep).fold(K8::ZERO, |acc, (a, b)| acc.add(&a.mul(b)));
@@ -403,7 +534,6 @@ pub fn prove_with(
         w[blk.source][blk.id] = wf;
         let qd = blk.qd.as_ref().map(|t| t.iter().zip(&e_full).fold(K8::ZERO, |a, (x, e)| a.add(&x.mul(e)))).unwrap_or(K8::ZERO);
         q[blk.source][blk.id] = blk.terms.iter().fold(qd, |a, bt| a.add(&bt.c.mul(&tfold[bt.term])));
-        if blk.chi { chi[blk.source][blk.id] = K8::ONE; }
     }
     for i in b0..ell {
         let d = degs[i];
@@ -496,4 +626,42 @@ pub(crate) fn finish_round(sum: &[K8], pre: &K8, a_i: &K8, d: usize, nvars: usiz
         let tk = K8::from_base(t as u64);
         pre.mul(&eqt(a_i, t)).mul(&sum[t]).add(&sum[d + 1 + t]).add(&scale.mul(&mo.add(&m_term(ac, &tk))))
     }).collect()
+}
+
+#[cfg(any(test, feature = "cpu-replay"))]
+pub mod bounded_cpu_tests {
+    use super::*;
+    use super::super::{coins::CoinProfile, keys::KeyKind, ring::N};
+    #[cfg_attr(test, test)]
+    pub fn streaming_services_equal_dense_and_public_preflight() {
+        let p=Profile::toy(); let seed=KeySeed([81;8]);
+        let raw=vec![(0..p.source_cols()*N).map(|i|(i%3) as i8-1).collect::<Vec<_>>()];
+        let xi=vec![K8::from_base(11);p.ell()]; let mut svc=CpuServices;
+        assert_eq!(svc.ev(&p,&raw,&xi),vec![super::super::pcs_maps::ev_raw(&raw_to_cols(&raw[0]),&xi)]);
+        let link=vec![vec![vec![1;N];p.link_cols()]];
+        assert_eq!(svc.commit_link(&p,&seed,&link),vec![super::super::auth::lin(&p,&seed,KeyKind::Link,A_ENC_COLS,&link[0])]);
+        let st=Statement{n:3,bits:vec![vec![(0,20)],vec![],vec![]],rows:vec![]};
+        let selected=Profile::ternary();let plan=cpu_memory_plan(&selected,&st,9).unwrap();
+        assert_eq!(plan.coarse_tables_bytes,150_994_944);
+        assert_eq!(plan.coarse_fold_scratch_bytes,8_388_608);
+        assert_eq!(plan.declared_bit_blocks,2048);
+        assert_eq!(plan.dense_query_bytes,0);
+        assert!(cpu_memory_plan(&selected,&st,28).is_none());
+        let mut malformed=st;malformed.bits[0][0].0=1;
+        assert!(cpu_memory_plan(&selected,&malformed,9).is_none());
+    }
+    #[cfg_attr(test, test)]
+    pub fn bounded_link_preserves_zero_query_free_binary_chi_and_transcript() {
+        let p=Profile::toy();let seed=KeySeed([82;8]);let coins=Coins::new([41;64],CoinProfile::Ternary);
+        let mut raw=vec![vec![0i8;p.source_cols()*N]];
+        super::super::link::fill_source_suffix(&p,&coins,3,&mut raw[0]);
+        let st=Statement{n:1,bits:vec![vec![(0,9)]],rows:vec![]};
+        let cs=vec![super::super::auth::lin(&p,&seed,KeyKind::Source,p.source_payload_cols,&raw_to_cols(&raw[0]))];
+        let tr=MTranscript::new(p.name,&coins.salt(3));let mut dense_tr=tr.clone();
+        let dense=super::super::link::prove(&p,&seed,&coins,3,&mut dense_tr,&st,&raw);
+        let mut fast_tr=tr.clone();let fast=prove_with(&p,&seed,&coins,3,&mut fast_tr,&st,&raw,9,&cpu_backend,&mut CpuServices,Some(&cs),false);
+        assert_eq!(dense.proof,fast.proof);assert_eq!(dense.point.xi,fast.point.xi);assert_eq!(dense.point.rho,fast.point.rho);
+        assert_eq!(dense_tr.challenge_k(Stage::LinkRound,17,23),fast_tr.challenge_k(Stage::LinkRound,17,23));
+        let mut verifier_tr=tr;assert!(super::super::link::verify(&p,&mut verifier_tr,&st,&cs,&fast.proof).is_some());
+    }
 }

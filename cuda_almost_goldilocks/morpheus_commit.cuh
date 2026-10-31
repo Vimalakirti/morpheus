@@ -8,7 +8,7 @@
 // commit.rs::commit, including the Kyber-style twiddle order).
 //
 // Pipeline:
-//   keygen   : PRG key elements (ChaCha8, as keys.rs) -> centered -> mod p_i
+//   keygen   : public key elements (SHAKE256 v2, as keys.rs) -> centered -> mod p_i
 //              -> forward NTT, cached as key[prime][col][row][4096] (u32);
 //   inputs   : int8 or int64 columns -> mod p_i -> forward NTT;
 //   mac      : NTT-domain multiply-accumulate over column chunks into
@@ -17,7 +17,7 @@
 //              NTT, Garner CRT, + identity error, mod q.
 #pragma once
 #include <cstdint>
-#include "ajtai_chacha8.cuh"
+#include "morpheus_shake.cuh"
 
 namespace mcommit {
 
@@ -133,7 +133,7 @@ __global__ void keygen_kernel(const uint32_t* __restrict__ seed, uint32_t kind, 
         int written = 0;
         for (uint32_t retry = 0; retry < 16 && written < 8; retry++) {
             uint32_t w[16];
-            chacha8_block(sd, (uint32_t)b + 512u * retry, nonce, w);
+            mshake::key_block(sd, (uint32_t)b + 512u * retry, nonce, w);
             for (int t = 0; t < 8 && written < 8; t++) {
                 u64 v = (u64)w[2 * t] | ((u64)w[2 * t + 1] << 32);
                 if (v < Q) vals[written++] = v;

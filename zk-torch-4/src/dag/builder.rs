@@ -15,6 +15,7 @@ fn letters(a: usize) -> String {
 
 /// DagBuilder: DSL for constructing the computation graph.
 pub struct DagBuilder {
+    pub(crate) program_literals: std::collections::BTreeMap<EdgeId, Vec<u64>>,
     pub nodes: Vec<Node>,
     pub num_edges: usize,
     pub init_values: Vec<Option<Witness>>,
@@ -30,6 +31,7 @@ pub struct DagBuilder {
 impl DagBuilder {
     pub fn new() -> Self {
         Self {
+            program_literals: Default::default(),
             nodes: Vec::new(),
             num_edges: 0,
             init_values: Vec::new(),
@@ -61,6 +63,45 @@ impl DagBuilder {
         assert_eq!(t.role, Role::Constant, "Parameters must be constants");
         self.init_values.push(Some(t));
         e
+    }
+
+    /// Immutable public program data, NOT a private model weight or request input.
+    /// Its canonical values are frozen into both program and request identities.
+    pub fn public_literal(&mut self, mut t: Witness) -> EdgeId {
+        assert_eq!(t.poly_type, crate::dag::PolyType::Dense, "literal must be dense");
+        let values = t.data.as_ref().expect("literal requires data").evaluations()
+            .iter().map(|x| x.reduce().0).collect();
+        t.role = Role::Input;
+        let e = self.committed_input(t);
+        self.program_literals.insert(e, values);
+        e
+    }
+
+    /// Dense full-padded literal used for integer range constraints.
+    pub(crate) fn integer_literal(&mut self, shape: Vec<usize>, value: i128, sf: usize) -> EdgeId {
+        let n = shape.iter().map(|s| s.next_power_of_two()).product();
+        self.public_literal(Witness::new(shape, vec![int_to_f(value); n], DataType::Float, sf, Role::Input))
+    }
+
+    /// Integer interval certificate. Both sides are lookup roots, with a
+    /// common authenticated small sum; the field relation therefore lifts.
+    pub(crate) fn integer_interval(&mut self, a: EdgeId, lo: i128, hi: i128) {
+        assert!(lo <= hi && hi-lo < (1i128<<62), "unsupported interval budget");
+        let w=self.init_values[a].as_ref().unwrap();
+        let shape=w.shape.clone(); let sf=w.sf;
+        let low=self.integer_literal(shape.clone(),lo,sf);
+        let high=self.integer_literal(shape,hi,sf);
+        let above=self.sub(a,low)[0];
+        let below=self.sub(high,a)[0];
+        self.init_values[above].as_mut().unwrap().role=Role::Output;
+        self.init_values[below].as_mut().unwrap().role=Role::Output;
+        let bits=(128-((hi-lo) as u128).leading_zeros() as usize).max(1);
+        let row_bits=crate::util::arith::get_n(&self.init_values[a].as_ref().unwrap().shape);
+        assert!(bits+row_bits < usize::BITS as usize ||
+            (std::env::var("NO_SPARSE_SPLIT").is_err() && bits>*crate::TABLE_COMMIT_LOG),
+            "wide normalization ranges require split sparse representation");
+        self.add_nonneg_node_bits(above,bits);
+        self.add_nonneg_node_bits(below,bits);
     }
 
     /// Create a leaf edge with a known value but a NON-`Constant` role
@@ -104,7 +145,35 @@ impl DagBuilder {
         let data_type = inp.data_type;
         let out = Witness::new_wo_data(shape, data_type, sf, Role::Output);
         self.init_values.push(Some(out));
-        self.add_gkr_node(vec![a], block)
+        let y = self.add_gkr_node(vec![a], block)[0];
+        vec![y]
+    }
+
+    fn division_guards(&mut self,a: EdgeId,y: EdgeId,c: usize) {
+        let input=self.init_values[a].as_ref().unwrap();
+        let output=self.init_values[y].as_ref().unwrap();
+        assert_eq!(input.shape,output.shape,"division advice shape mismatch");
+        assert_eq!(input.sf,output.sf,"division advice scale mismatch");
+        assert!(input.shape.iter().all(|&d| d>0),"invalid division shape");
+        let sf=self.init_values[a].as_ref().unwrap().sf;
+        // Exact integer division on a public bounded domain. The registered
+        // DAG includes these roots; advice alone is never the specification.
+        assert!((1..=(1 << 24)).contains(&c), "unsupported divisor");
+        const B: i128 = (1i128 << 54) - 1;
+        self.integer_interval(a, -B, B);
+        self.integer_interval(y, -((B / c as i128) + 1), (B / c as i128) + 1);
+        let shape=self.init_values[a].as_ref().unwrap().shape.clone();
+        let n=shape.iter().map(|x| x.next_power_of_two()).product();
+        let af=self.change_shape(a,vec![n]);
+        let yf=self.change_shape(y,vec![n]);
+        let divisor=self.integer_literal(vec![n],c as i128,0);
+        let cy=self.einsum("i,i->i".into(),vec![yf,divisor],false)[0];
+        let rem=self.sub(af,cy)[0];
+        // rho = a-c*y+floor(c/2) lies in [0,c-1]. Unlike the old
+        // symmetric interval this has exactly one allowed half-tie answer.
+        let half=self.integer_literal(vec![n],(c/2) as i128,sf);
+        let rho=self.add(rem,half)[0];
+        self.integer_interval(rho,0,c as i128-1);
     }
 
     pub fn add_nonneg_node(&mut self, a: EdgeId) {
@@ -140,6 +209,54 @@ impl DagBuilder {
             Role::Output,
         )));
         outs[0]
+    }
+
+    /// Compact the logical entries of a row-major tensor into a vector.
+    /// `change_shape` only reinterprets/truncates padded storage and is NOT a
+    /// logical flatten. Each public factor selects one mixed-radix coordinate;
+    /// their product selects exactly one logical input, and none for output
+    /// padding. All maps are immutable program literals, authenticated by the
+    /// existing Einsum reduction (no private preprocessing or advice).
+    pub fn flatten_row_major(&mut self, a: EdgeId) -> EdgeId {
+        let shape = self.init_values[a].as_ref().unwrap().shape.clone();
+        assert!(!shape.is_empty() && shape.len() <= 16 && shape.iter().all(|&d| d > 0),
+            "logical flatten requires 1..16 nonzero axes");
+        let count = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+            .expect("logical flatten size overflow");
+        if shape.iter().all(|d| d.is_power_of_two()) {
+            return self.change_shape(a, vec![count]);
+        }
+        let out_pad = count.checked_next_power_of_two().expect("logical flatten padding overflow");
+        let reversed: Vec<_> = shape.iter().rev().copied().collect();
+        // Reversing shape metadata makes the same raw row-major buffer a
+        // column-major Einsum operand. No data transpose is performed.
+        let mut view = self.change_shape(a, reversed.clone());
+        let mut input_term = letters(reversed.len());
+        let mut stride = 1usize;
+        for (axis, &dim) in reversed.iter().enumerate() {
+            let size = out_pad.checked_mul(dim.checked_next_power_of_two().unwrap())
+                .expect("logical flatten map size overflow");
+            let mut values = vec![AlmostGoldilocksField(0); size];
+            for i in 0..count {
+                let coordinate = (i / stride) % dim;
+                values[i + out_pad * coordinate] = AlmostGoldilocksField(1);
+            }
+            let map = self.public_literal(Witness::new(vec![count, dim], values,
+                DataType::Bool, 0, Role::Input));
+            let axis_char = (b'a' + axis as u8) as char;
+            let remaining = ((axis+1)..reversed.len())
+                .map(|j| (b'a'+j as u8) as char).collect::<String>();
+            let output_term = format!("z{remaining}");
+            // One binary gather per axis avoids expanding all public factors
+            // over the full joint sumcheck cube. Intermediate tensors are
+            // derived, not committed advice. Missing axes are free-once and
+            // are partially evaluated before the binary Einsum sumcheck.
+            view = self.einsum(format!("{input_term},z{axis_char}->{output_term}"),
+                vec![view, map], false)[0];
+            input_term = output_term;
+            stride = stride.checked_mul(dim).unwrap();
+        }
+        view
     }
 
     pub fn reshape(&mut self, a: EdgeId, shape: Vec<usize>) -> Vec<EdgeId> {
@@ -187,59 +304,16 @@ impl DagBuilder {
         let pad_val_arr = pad_to_pow_of_two(&val_arr, &AlmostGoldilocksField(0));
         let col_major_output: Vec<_> = pad_val_arr.view().reversed_axes().iter().cloned().collect();
         let mask = Witness::new(raw_mask_shape, col_major_output, DataType::Float, 0, Role::Constant);
-        let e = self.param(mask);
+        let e = self.public_literal(mask);
         let out = self.einsum(format!("{},{}->{}", s, s, s), vec![a, e], false);
         out[0]
     }
 
-    /// Create a causal attention mask and add it to scores.
-    /// scores shape must end with [..., seq_len, seq_len].
-    /// Adds a large negative value to positions where key > query (future tokens).
-    /// The mask is created with the same full shape as scores so that `add` broadcasting works.
-    pub fn causal_mask(&mut self, scores: EdgeId, seq_len: usize) -> EdgeId {
-        let scores_shape = self.init_values[scores].as_ref().unwrap().shape.clone();
-        let sf = self.init_values[scores].as_ref().unwrap().sf;
-        let padded: Vec<usize> = scores_shape.iter().map(|&s| s.next_power_of_two()).collect();
-        let total_padded: usize = padded.iter().product();
-
-        // Large negative value: exp(-100) ≈ 0
-        let big_neg = int_to_f(-100 * (1i128 << sf));
-
-        // Build mask in little-endian layout matching scores shape.
-        // Last two dims are [s, t] where s=query, t=key.
-        // s has stride = product of all padded dims before it
-        // t has stride = s_stride * s_pad
-        let ndim = scores_shape.len();
-        let s_pad = padded[ndim - 2];
-        let t_pad = padded[ndim - 1];
-        let s_stride: usize = padded[..ndim - 2].iter().product();
-        let t_stride = s_stride * s_pad;
-
-        let mut mask_data = vec![AlmostGoldilocksField(0); total_padded];
-        // For each group (batch, head, ...) replicate the same causal pattern
-        let num_groups: usize = padded[..ndim - 2].iter().product();
-        for g in 0..num_groups {
-            for t in 0..t_pad {
-                for s in 0..s_pad {
-                    let idx = g + s * s_stride + t * t_stride;
-                    if t < seq_len && s < seq_len && t > s {
-                        // Future position: large negative
-                        mask_data[idx] = big_neg;
-                    }
-                    // else: 0 (valid position or padding)
-                }
-            }
-        }
-
-        let mask = Witness::new(
-            scores_shape.clone(),
-            mask_data,
-            DataType::Float,
-            sf,
-            Role::Constant,
-        );
-        let mask_id = self.param(mask);
-        self.add(scores, mask_id)[0]
+    /// Additive causal sentinels are deliberately unsupported: they do not
+    /// exclude future keys from either the max or the denominator.
+    #[deprecated(note="use causal_softmax on the unmodified scores")]
+    pub fn causal_mask(&mut self, _scores: EdgeId, _seq_len: usize) -> EdgeId {
+        panic!("additive causal_mask is unsupported; use causal_softmax")
     }
 
     pub fn add(&mut self, a: EdgeId, b: EdgeId) -> Vec<EdgeId> {
@@ -266,7 +340,12 @@ impl DagBuilder {
                 self.init_values[b].as_ref().unwrap(),
             ];
             let mut out = add_basicblock.run(inps_values.as_slice()).first().unwrap().to_owned();
-            out.role = Role::Constant;
+            // Having eager data does not make a request-dependent edge a
+            // model parameter. Only model-only precomputation may be shared.
+            out.role = if self.init_values[a].as_ref().unwrap().role == Role::Constant
+                && self.init_values[b].as_ref().unwrap().role == Role::Constant {
+                Role::Constant
+            } else { Role::Output };
             out
         };
         self.init_values.push(Some(out_value));
@@ -298,7 +377,12 @@ impl DagBuilder {
                 self.init_values[b].as_ref().unwrap(),
             ];
             let mut out = sub_basicblock.run(inps_values.as_slice()).first().unwrap().to_owned();
-            out.role = Role::Constant;
+            // Having eager data does not make a request-dependent edge a
+            // model parameter. Only model-only precomputation may be shared.
+            out.role = if self.init_values[a].as_ref().unwrap().role == Role::Constant
+                && self.init_values[b].as_ref().unwrap().role == Role::Constant {
+                Role::Constant
+            } else { Role::Output };
             out
         };
         self.init_values.push(Some(out_value));
@@ -372,10 +456,7 @@ impl DagBuilder {
     }
 
     pub fn sigmoid(&mut self, a: EdgeId) -> Vec<EdgeId> {
-        let sigmoid_c = self.sigmoid_const(a)[0];
-        let scores = self.add(a, sigmoid_c)[0];
-        let scores = self.exp(scores)[0];
-        vec![scores]
+        vec![self.finite_sigmoid(a)]
     }
 
     pub fn scale(&mut self, a: EdgeId, input_sf: usize, output_sf: usize) -> Vec<EdgeId> {
@@ -403,21 +484,30 @@ impl DagBuilder {
         self.add_gkr_node(vec![a], scale_basicblock)
     }
 
+    /// Canonical unclipped exp on logical coordinates, zero on padding.
+    /// The input/output masks are immutable program literals derived from the
+    /// registered logical shape; this is an explicit padding-profile repair.
+    /// Downstream reductions can change if they previously consumed bad pads.
     pub fn exp(&mut self, a: EdgeId) -> Vec<EdgeId> {
-        let _nid = self.nodes.len();
         let shape = self.init_values[a].as_ref().unwrap().shape.clone();
-        let flat_shape = vec![shape
-            .iter()
-            .map(|s| next_pow(*s as u32) as usize)
-            .product()];
+        assert!(!shape.is_empty() && shape.len()<=26 && shape.iter().all(|&s| s>0),
+            "exp requires explicit nonzero supported logical extents");
+        let padded_len = shape.iter().try_fold(1usize, |n,&s| {
+            let d=u32::try_from(s).ok()?.checked_next_power_of_two()? as usize;
+            n.checked_mul(d)
+        }).expect("exp padded shape exceeds supported indexing domain");
+        let padded = shape.iter().any(|s| !s.is_power_of_two());
+        // Mask BEFORE helper domain checks: shifts from SoftmaxConst can put
+        // positive numbers in padded cells even when all logical cells are <=0.
+        let a = if padded { self.mask(a,shape.clone()) } else { a };
+        let flat_shape = vec![padded_len];
         let data_type = self.init_values[a].as_ref().unwrap().data_type;
 
-        let exp_basicblock =
-            // K_BITS = 4 matches the 16-entry TwoPow table (`2^(15-k)` for k ∈ [0, 16)).
-            // The previous `num_bits: 16` was a typo: it created an aux of arity
-            // `input_n + 16` instead of `input_n + 4`, blowing up the fold-tree
-            // bucket for ExpHelper by 4096× at hidden=768.
-            BasicBlockType::ExpHelper(ExpHelper { num_bits: crate::basicblock::exp::exp_bits() });
+        let sf = *SF_LOG;
+        assert_eq!(self.init_values[a].as_ref().unwrap().sf, sf, "exp activation scale mismatch");
+        let bits = crate::basicblock::exp::exp_bits();
+        let _ = crate::basicblock::exp::exp_ln2(sf);
+        let exp_basicblock = BasicBlockType::ExpHelper(ExpHelper { num_bits: bits });
         self.init_values.push(Some(Witness::new_wo_data(
             shape.clone(),
             data_type,
@@ -436,6 +526,10 @@ impl DagBuilder {
         let k = outs[1]; // sparse poly
 
         r = self.scale(r, *SF_LOG, 15)[0];
+        // ScaleDown alone is a field quotient relation, not integer rounding.
+        // Bound every rounded quotient before using it: together with the
+        // bounded numerator this excludes nonzero multiples of p in residuals.
+        self.integer_interval(r, -(1<<14), 1<<14);
 
         // A. compute 2^(-k)
         let nid = self.nodes.len();
@@ -467,7 +561,7 @@ impl DagBuilder {
             15,
             Role::Constant,
         );
-        let one_sixth = self.param(one_sixth);
+        let one_sixth = self.public_literal(one_sixth);
 
         // B2. compute 1/2
         let vals_half: Vec<AlmostGoldilocksField> =
@@ -483,11 +577,12 @@ impl DagBuilder {
             15,
             Role::Constant,
         );
-        let half = self.param(half);
+        let half = self.public_literal(half);
 
-        // B3. compute 1
+        // B3. compute fixed-point 1 at sf=15. Witness::new stores raw
+        // coefficients: integer 1 here would represent 2^-15, not one.
         let vals_one: Vec<AlmostGoldilocksField> =
-            (0..val_num).map(|_| AlmostGoldilocksField(1)).collect();
+            (0..val_num).map(|_| AlmostGoldilocksField(1 << 15)).collect();
         let vals_one = ArrayD::from_shape_vec(shape.clone(), vals_one).unwrap();
         let pad_vals_one = pad_to_pow_of_two(&vals_one, &AlmostGoldilocksField(0));
         let col_major_one: Vec<_> = pad_vals_one.view().reversed_axes().iter().cloned().collect();
@@ -498,18 +593,21 @@ impl DagBuilder {
             15,
             Role::Constant,
         );
-        let one = self.param(one);
+        let one = self.public_literal(one);
 
         // B4. compute exp(r) by Taylor series
         r = self.change_shape(r, flat_shape);
         let r_square = self.einsum("a,a->a".to_string(), vec![r, r], true);
+        self.integer_interval(r_square[0], 0, 8192);
         let r_one_sixth = self.einsum("a,a->a".to_string(), vec![r, one_sixth], true);
+        self.integer_interval(r_one_sixth[0], -2731, 2731);
         let r_one_sixth_plus_half = self.add(r_one_sixth[0], half)[0];
         let deg_two_plus_deg_three = self.einsum(
             "a,a->a".to_string(),
             vec![r_one_sixth_plus_half, r_square[0]],
             true,
         );
+        self.integer_interval(deg_two_plus_deg_three[0], 0, 4779);
         let deg_one_plus_deg_two_plus_deg_three =
             self.add(deg_two_plus_deg_three[0], r);
         let exp_r = self.add(deg_one_plus_deg_two_plus_deg_three[0], one)[0];
@@ -517,7 +615,15 @@ impl DagBuilder {
         // C. compute 2^(-k) * exp(r)
         let exp_x = self.einsum("a,a->a".to_string(), vec![two_pow_out, exp_r], false);
         let exp_x = self.scale(exp_x[0], 30, *SF_LOG)[0];
-        let exp = self.change_shape(exp_x, shape);
+        // The signed bound remains a conservative integer-lifting certificate.
+        // Logical outputs are nonnegative; the explicit output mask below
+        // makes every padding coordinate exactly zero.
+        self.integer_interval(exp_x, -(2i128 << *SF_LOG), 2i128 << *SF_LOG);
+        // All internal products are <2^31. With these quotient bounds,
+        // every ScaleDown residual interval is <2^33 << p, including the
+        // final (30-sf)-bit divisor and sf>15 remainder conversion.
+        let exp = self.change_shape(exp_x, shape.clone());
+        let exp = if padded { self.mask(exp,shape) } else { exp };
         vec![exp]
     }
 
@@ -558,12 +664,81 @@ impl DagBuilder {
         vec![channels, h, w]
     }
 
+    /// Add a channel bias to a row-major CNN tensor. Generic Add broadcasts
+    /// column-major axes, so applying [C,1,1] directly to [C,H,W] incorrectly
+    /// varies the bias over low spatial bits. The same raw buffers are viewed
+    /// as [W,H,(D),C,B] here; no data-dependent transpose or private map exists.
+    /// Accepts [C], [C,1,..], a full single-image row-major bias, or a full
+    /// tensor bias matching x. Explicit batch padding is retained and masked.
+    pub fn add_channel_bias_row_major(
+        &mut self, x: EdgeId, bias: EdgeId, channels: usize, spatial_axes: usize,
+    ) -> EdgeId {
+        assert!((1..=3).contains(&spatial_axes) && channels > 0);
+        let shape = self.init_values[x].as_ref().unwrap().shape.clone();
+        let bs = self.init_values[bias].as_ref().unwrap().shape.clone();
+        assert!(shape.len() == spatial_axes + 1 || shape.len() == spatial_axes + 2);
+        assert!(shape.iter().all(|&d| d > 0));
+        let cp = channels.next_power_of_two();
+        let batch = if shape.len() == spatial_axes + 2 {
+            assert_eq!(shape[1], channels); shape[0]
+        } else if shape[0] == channels { 1 } else {
+            assert_eq!(shape[0] % cp, 0, "invalid folded CNN channel extent");
+            shape[0] / cp
+        };
+        let spatial = shape[shape.len()-spatial_axes..].to_vec();
+        let mut view_shape = spatial.iter().rev().copied().collect::<Vec<_>>();
+        view_shape.extend([channels, batch]);
+        let view = self.change_shape(x, view_shape.clone());
+        let mut vector_shape = vec![channels]; vector_shape.extend(vec![1; spatial_axes]);
+        let mut image_shape = vec![channels]; image_shape.extend(spatial);
+        let bias_view = if bs == shape {
+            self.change_shape(bias, view_shape.clone())
+        } else if bs == vec![channels] || bs == vector_shape {
+            let mut target = vec![1; spatial_axes]; target.extend([channels, 1]);
+            self.change_shape(bias, target)
+        } else if bs == image_shape {
+            let mut target = view_shape.clone(); *target.last_mut().unwrap() = 1;
+            self.change_shape(bias, target)
+        } else {
+            panic!("unsupported row-major CNN bias {:?} for input {:?} and C={channels}", bs, shape)
+        };
+        let sum = self.add(view, bias_view)[0];
+        let masked = self.mask(sum, view_shape);
+        self.change_shape(masked, shape)
+    }
+
+    /// Per-channel kernels use folded raw storage. Preserve an explicit
+    /// logical batch with registered views and mask its padding before any
+    /// advice/range predicate can observe it. A folded 3D caller retains the
+    /// historical convention that every represented channel is logical.
+    fn fold_per_channel2d_input(&mut self, x: EdgeId) -> (EdgeId, Vec<usize>, usize, usize, usize) {
+        let shape = self.init_values[x].as_ref().unwrap().shape.clone();
+        assert!(shape.iter().all(|&d|d>0),"CNN extents must be positive");
+        shape.iter().try_fold(1usize,|n,&d|n.checked_mul(d.checked_next_power_of_two().expect("CNN extent overflow"))).expect("CNN size overflow");
+        let (channels, _, _) = Self::per_channel_lead(&shape);
+        let h = shape[shape.len()-2]; let w = shape[shape.len()-1];
+        let x = if shape.len() == 4 {
+            let reversed = shape.iter().rev().copied().collect::<Vec<_>>();
+            let view = self.change_shape(x, reversed.clone());
+            let masked = self.mask(view, reversed);
+            self.change_shape(masked, vec![channels,h,w])
+        } else { x };
+        (x, shape, channels, h, w)
+    }
+
+    fn restore_per_channel2d_output(&mut self, y: EdgeId, original: &[usize], h: usize, w: usize) -> EdgeId {
+        if original.len() == 4 {
+            // Advice such as maxpool is not intrinsically zero on padded B/C.
+            // Bind output padding to zero explicitly, not just by honest run.
+            let reversed = vec![w,h,original[1],original[0]];
+            let view = self.change_shape(y, reversed.clone());
+            let masked = self.mask(view, reversed);
+            self.change_shape(masked, vec![original[0],original[1],h,w])
+        } else { y }
+    }
+
     pub fn pad(&mut self, x: EdgeId, pad_h: usize, pad_w: usize) -> EdgeId {
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let (channels, _batch, _logical_c) = Self::per_channel_lead(x_shape);
-        let off = x_shape.len() - 3;
-        let input_h = x_shape[off + 1];
-        let input_w = x_shape[off + 2];
+        let (x, original_shape, channels, input_h, input_w) = self.fold_per_channel2d_input(x);
 
         let h_out = input_h + 2 * pad_h;
         let w_out = input_w + 2 * pad_w;
@@ -573,67 +748,32 @@ impl DagBuilder {
         self.init_values.push(Some(Witness::new_wo_data(
             Self::per_channel_out(channels, h_out, w_out),
             DataType::Uint,
-            0,
+            self.init_values[x].as_ref().unwrap().sf,
             Role::Output,
         )));
-        outs[0]
+        self.restore_per_channel2d_output(outs[0], &original_shape, h_out, w_out)
     }
 
-    /// 2×2 max pooling: X[C, H, W] → Y[C, H/pool_h, W/pool_w].
-    /// Composes: MaxPoolHelper → Replicate2x2 → Sub → NonNeg (dominance).
+    /// Nonoverlapping max pooling, with floor output dimensions. Only complete
+    /// logical windows participate; `compile` attaches exact attainment roots.
     pub fn maxpool2d(&mut self, x: EdgeId, pool_h: usize, pool_w: usize) -> EdgeId {
-        use crate::basicblock::maxpool::{MaxPoolHelper, Replicate2x2};
-
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let (channels, _batch, _logical_c) = Self::per_channel_lead(x_shape);
-        let off = x_shape.len() - 3;
-        let input_h = x_shape[off + 1];
-        let input_w = x_shape[off + 2];
-
-        assert_eq!(input_h % pool_h, 0, "H must be divisible by pool_h");
-        assert_eq!(input_w % pool_w, 0, "W must be divisible by pool_w");
-
-        let h_out = input_h / pool_h;
-        let w_out = input_w / pool_w;
-        let out_shape = Self::per_channel_out(channels, h_out, w_out);
-
-        // 1. MaxPoolHelper(x) → y
-        let maxpool = BasicBlockType::MaxPoolHelper(MaxPoolHelper {
-            channels, input_h, input_w, pool_h, pool_w,
-        });
-        let y_outs = self.add_gkr_node(vec![x], maxpool);
-        let y = y_outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            out_shape, DataType::Uint, 0, Role::Output,
-        )));
-
-        // 2. Replicate2x2(y) → y_rep
-        let replicate = BasicBlockType::Replicate2x2(Replicate2x2 {
-            channels, out_h: input_h, out_w: input_w,
-        });
-        let rep_outs = self.add_gkr_node(vec![y], replicate);
-        let y_rep = rep_outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            Self::per_channel_out(channels, input_h, input_w),
-            DataType::Uint,
-            0,
-            Role::Output,
-        )));
-
-        // 3. Dominance: sub(y_rep, x) → diff ≥ 0 (y ≥ every input in pool window)
-        let diff_outs = self.sub(y_rep, x);
-        let diff = diff_outs[0];
-        self.add_nonneg_node(diff);
-
-        y
+        let (x, original_shape, channels, input_h, input_w) = self.fold_per_channel2d_input(x);
+        let p=GeneralMaxPoolHelper {channels,input_h,input_w,kernel_h:pool_h,kernel_w:pool_w,stride_h:pool_h,stride_w:pool_w};
+        let shape=p.output_shape();let sf=self.init_values[x].as_ref().unwrap().sf;
+        let y=self.add_gkr_node(vec![x],BasicBlockType::MaxPoolHelper(MaxPoolHelper {
+            channels,input_h,input_w,pool_h,pool_w,
+        }))[0];
+        self.init_values.push(Some(Witness::new_wo_data(shape.clone(),DataType::Uint,sf,Role::Output)));
+        let out=self.restore_per_channel2d_output(y,&original_shape,shape[1],shape[2]);
+        // Return a computed edge so standalone maxpool has a public root even
+        // though the helper itself is committed advice consumed by its guards.
+        let out_shape=self.init_values[out].as_ref().unwrap().shape.clone();
+        self.change_shape(out,out_shape)
     }
 
     /// Asymmetric zero-pad: X[C, H, W] → Y[C, H+pt+pb, W+pl+pr].
     pub fn pad_asym(&mut self, x: EdgeId, pad_h_top: usize, pad_h_bottom: usize, pad_w_left: usize, pad_w_right: usize) -> EdgeId {
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let channels = x_shape[0];
-        let input_h = x_shape[1];
-        let input_w = x_shape[2];
+        let (x,original_shape,channels,input_h,input_w)=self.fold_per_channel2d_input(x);
 
         let h_out = input_h + pad_h_top + pad_h_bottom;
         let w_out = input_w + pad_w_left + pad_w_right;
@@ -645,10 +785,10 @@ impl DagBuilder {
         self.init_values.push(Some(Witness::new_wo_data(
             vec![channels, h_out, w_out],
             DataType::Uint,
-            0,
+            self.init_values[x].as_ref().unwrap().sf,
             Role::Output,
         )));
-        outs[0]
+        self.restore_per_channel2d_output(outs[0],&original_shape,h_out,w_out)
     }
 
     /// SubSample2D: X[C, H, W] → SV[C, out_h, out_w] at strided+offset positions.
@@ -679,26 +819,20 @@ impl DagBuilder {
         let x_shape = &self.init_values[x].as_ref().unwrap().shape;
         let w_shape = &self.init_values[w].as_ref().unwrap().shape;
 
-        // C_in comes from the WEIGHT, which is unambiguous, and the batch is
-        // whatever leading extent is left over. A folded input
-        // [b_pad*c_in_pad, H, W] and an explicit [B, C_in, H, W] both work, and
-        // neither depends on a convention the caller has to remember.
+        assert_eq!(w_shape.len(), 4, "Conv2D requires one shared [D,C,KH,KW] kernel");
+        assert!(x_shape.len() == 3 || x_shape.len() == 4, "Conv2D input must be [C,H,W], [B,C,H,W], or folded [Bp*Cp,H,W]");
+        let explicit_batch = x_shape.len() == 4;
         let c_in = w_shape[1];
-        let lead: usize = x_shape[..x_shape.len() - 2].iter().product();
-        let c_in_pad = c_in.next_power_of_two();
-        // An unbatched tensor carries the LOGICAL channel count (RGB is 3, not
-        // 4), so `lead == c_in` is the single-image case and need not divide
-        // c_in_pad. Only a folded batch uses padded channel strides.
-        let batch = if lead == c_in {
-            1
-        } else {
-            assert!(
-                lead % c_in_pad == 0,
-                "conv2d: leading extent {} is neither C_in {} nor a multiple of \
-                 padded C_in {} (X {:?}, W {:?})",
-                lead, c_in, c_in_pad, x_shape, w_shape
-            );
-            lead / c_in_pad
+        let batch = if explicit_batch {
+            assert_eq!(x_shape[1], c_in, "Conv2D explicit input channel count");
+            assert!(x_shape[0] > 0, "Conv2D logical batch must be positive");
+            x_shape[0]
+        } else if x_shape[0] == c_in { 1 } else {
+            // A folded extent cannot recover a hidden non-power-of-two B.
+            // Preserve explicit [B,C,H,W] to carry that logical metadata.
+            let cp = c_in.next_power_of_two();
+            assert!(x_shape[0] > 0 && x_shape[0] % cp == 0, "Conv2D folded channel/batch extent");
+            x_shape[0] / cp
         };
         let input_h = x_shape[x_shape.len() - 2];
         let input_w = x_shape[x_shape.len() - 1];
@@ -763,7 +897,9 @@ impl DagBuilder {
         }
 
         self.self_claim_edges.push(y_edge);
-        vec![y_edge]
+        if explicit_batch {
+            vec![self.change_shape(y_edge, vec![batch, c_out, h_out, w_out])]
+        } else { vec![y_edge] }
     }
 
     /// Conv2D with stride and dilation: FlattenKernel(W) → W_flat, Conv2D(X, W_flat) → Y.
@@ -772,26 +908,20 @@ impl DagBuilder {
         let x_shape = &self.init_values[x].as_ref().unwrap().shape;
         let w_shape = &self.init_values[w].as_ref().unwrap().shape;
 
-        // C_in comes from the WEIGHT, which is unambiguous, and the batch is
-        // whatever leading extent is left over. A folded input
-        // [b_pad*c_in_pad, H, W] and an explicit [B, C_in, H, W] both work, and
-        // neither depends on a convention the caller has to remember.
+        assert_eq!(w_shape.len(), 4, "Conv2D requires one shared [D,C,KH,KW] kernel");
+        assert!(x_shape.len() == 3 || x_shape.len() == 4, "Conv2D input must be [C,H,W], [B,C,H,W], or folded [Bp*Cp,H,W]");
+        let explicit_batch = x_shape.len() == 4;
         let c_in = w_shape[1];
-        let lead: usize = x_shape[..x_shape.len() - 2].iter().product();
-        let c_in_pad = c_in.next_power_of_two();
-        // An unbatched tensor carries the LOGICAL channel count (RGB is 3, not
-        // 4), so `lead == c_in` is the single-image case and need not divide
-        // c_in_pad. Only a folded batch uses padded channel strides.
-        let batch = if lead == c_in {
-            1
-        } else {
-            assert!(
-                lead % c_in_pad == 0,
-                "conv2d: leading extent {} is neither C_in {} nor a multiple of \
-                 padded C_in {} (X {:?}, W {:?})",
-                lead, c_in, c_in_pad, x_shape, w_shape
-            );
-            lead / c_in_pad
+        let batch = if explicit_batch {
+            assert_eq!(x_shape[1], c_in, "Conv2D explicit input channel count");
+            assert!(x_shape[0] > 0, "Conv2D logical batch must be positive");
+            x_shape[0]
+        } else if x_shape[0] == c_in { 1 } else {
+            // A folded extent cannot recover a hidden non-power-of-two B.
+            // Preserve explicit [B,C,H,W] to carry that logical metadata.
+            let cp = c_in.next_power_of_two();
+            assert!(x_shape[0] > 0 && x_shape[0] % cp == 0, "Conv2D folded channel/batch extent");
+            x_shape[0] / cp
         };
         let input_h = x_shape[x_shape.len() - 2];
         let input_w = x_shape[x_shape.len() - 1];
@@ -858,11 +988,13 @@ impl DagBuilder {
         }
 
         self.self_claim_edges.push(y_edge);
-        vec![y_edge]
+        if explicit_batch {
+            vec![self.change_shape(y_edge, vec![batch, c_out, h_out, w_out])]
+        } else { vec![y_edge] }
     }
 
     /// SubSample2D with explicit output size.
-    fn subsample2d_sized(&mut self, x: EdgeId, stride_h: usize, stride_w: usize, offset_h: usize, offset_w: usize, out_h: usize, out_w: usize) -> EdgeId {
+    pub(crate) fn subsample2d_sized(&mut self, x: EdgeId, stride_h: usize, stride_w: usize, offset_h: usize, offset_w: usize, out_h: usize, out_w: usize) -> EdgeId {
         let x_shape = &self.init_values[x].as_ref().unwrap().shape;
         let (channels, _batch, _logical_c) = Self::per_channel_lead(x_shape);
         let off = x_shape.len() - 3;
@@ -880,39 +1012,42 @@ impl DagBuilder {
         outs[0]
     }
 
-    /// General max pooling: X[C, H, W] → Y[C, H_out, W_out] with arbitrary kernel and stride.
-    /// Uses GeneralMaxPoolHelper advice node + SubSample2D + Sub + NonNeg for dominance.
+    /// General max pooling over full logical windows, including overlap and
+    /// floor/truncated trailing windows. Explicit zero padding is a real value;
+    /// it is NOT implicit negative-infinity padding. Storage padding is excluded.
     pub fn maxpool_general(&mut self, x: EdgeId, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize) -> EdgeId {
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let (channels, _batch, _logical_c) = Self::per_channel_lead(x_shape);
-        let off = x_shape.len() - 3;
-        let input_h = x_shape[off + 1];
-        let input_w = x_shape[off + 2];
+        let (x, original_shape, channels, input_h, input_w) = self.fold_per_channel2d_input(x);
+        let p=GeneralMaxPoolHelper {channels,input_h,input_w,kernel_h,kernel_w,stride_h,stride_w};
+        let shape=p.output_shape();let sf=self.init_values[x].as_ref().unwrap().sf;
+        let y=self.add_gkr_node(vec![x],BasicBlockType::GeneralMaxPoolHelper(p))[0];
+        self.init_values.push(Some(Witness::new_wo_data(shape.clone(),DataType::Uint,sf,Role::Output)));
+        let out=self.restore_per_channel2d_output(y,&original_shape,shape[1],shape[2]);
+        // Return a computed edge so standalone maxpool has a public root even
+        // though the helper itself is committed advice consumed by its guards.
+        let out_shape=self.init_values[out].as_ref().unwrap().shape.clone();
+        self.change_shape(out,out_shape)
+    }
 
-        let out_h = (input_h - kernel_h) / stride_h + 1;
-        let out_w = (input_w - kernel_w) / stride_w + 1;
-        let out_shape = Self::per_channel_out(channels, out_h, out_w);
-
-        // 1. Advice node: compute Y = maxpool(X)
-        let gmp = BasicBlockType::GeneralMaxPoolHelper(GeneralMaxPoolHelper {
-            channels, input_h, input_w, kernel_h, kernel_w, stride_h, stride_w,
+    /// Symmetrically padded max pooling with implicit negative-infinity
+    /// semantics, implemented by authenticated exclusion, not a finite sentinel.
+    /// Every logical output must retain at least one real input; otherwise this
+    /// public geometry is rejected. Right/bottom partial windows are discarded.
+    pub fn maxpool_general_padded(&mut self,x:EdgeId,kernel_h:usize,kernel_w:usize,
+        stride_h:usize,stride_w:usize,pad_h:usize,pad_w:usize)->EdgeId {
+        let (x,original,channels,input_h,input_w)=self.fold_per_channel2d_input(x);
+        let ph=input_h.checked_add(pad_h.checked_mul(2).expect("pool padding overflow")).expect("pool padding overflow");
+        let pw=input_w.checked_add(pad_w.checked_mul(2).expect("pool padding overflow")).expect("pool padding overflow");
+        let p=GeneralMaxPoolHelper {channels,input_h:ph,input_w:pw,kernel_h,kernel_w,stride_h,stride_w};
+        let shape=p.output_shape();
+        let support=crate::dag::maxpool::window_support(self,&p,|oh,ow,kh,kw| {
+            let ih=oh*stride_h+kh;let iw=ow*stride_w+kw;
+            ih>=pad_h && ih-pad_h<input_h && iw>=pad_w && iw-pad_w<input_w
         });
-        let y_outs = self.add_gkr_node(vec![x], gmp);
-        let y = y_outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            out_shape, DataType::Uint, 0, Role::Output,
-        )));
-
-        // 2. Dominance: for each kernel position, prove Y >= SubSample(X, stride, offset)
-        for kh in 0..kernel_h {
-            for kw in 0..kernel_w {
-                let sv = self.subsample2d_sized(x, stride_h, stride_w, kh, kw, out_h, out_w);
-                let diff = self.sub(y, sv);
-                self.add_nonneg_node(diff[0]);
-            }
-        }
-
-        y
+        let x=self.pad(x,pad_h,pad_w);let sf=self.init_values[x].as_ref().unwrap().sf;
+        let y=self.add_gkr_node(vec![x,support],BasicBlockType::MaskedMaxPoolHelper(MaskedMaxPoolHelper{pool:p}))[0];
+        self.init_values.push(Some(Witness::new_wo_data(shape.clone(),DataType::Uint,sf,Role::Output)));
+        let y=self.restore_per_channel2d_output(y,&original,shape[1],shape[2]);
+        let shape=self.init_values[y].as_ref().unwrap().shape.clone();self.change_shape(y,shape)
     }
 
     /// ReLU: y = max(0, x).
@@ -951,6 +1086,16 @@ impl DagBuilder {
         y
     }
 
+    /// Logical reduction inputs have explicit signed lifts before summation.
+    /// Padding is authenticated and excluded before, rather than after, a mean.
+    pub(crate) fn mean_input(&mut self, x: EdgeId, count: usize) -> EdgeId {
+        assert!((1..=(1<<20)).contains(&count), "unsupported mean reduction size");
+        let shape=self.init_values[x].as_ref().unwrap().shape.clone();
+        let x=self.mask(x,shape);
+        self.integer_interval(x,-((1i128<<30)-1),(1i128<<30)-1);
+        x
+    }
+
     /// ReduceMean over one or more axes.
     /// E.g. reduce_mean(x, &[1, 2]) on shape [B, S, D] computes mean over axes 1,2 → shape [B].
     pub fn reduce_mean(&mut self, x: EdgeId, axes: &[usize]) -> EdgeId {
@@ -961,7 +1106,9 @@ impl DagBuilder {
             assert!(ax < ndim, "axis {ax} out of bounds for {ndim}-dim tensor");
         }
 
-        let n: usize = axes.iter().map(|&ax| shape[ax]).product();
+        assert!(axes.iter().collect::<std::collections::HashSet<_>>().len()==axes.len(), "duplicate mean axis");
+        let n=axes.iter().try_fold(1usize,|n,&ax|n.checked_mul(shape[ax])).expect("mean reduction size overflow");
+        let x=self.mean_input(x,n);
 
         let in_chars: String = (0..ndim).map(|i| (b'a' + i as u8) as char).collect();
         let out_chars: String = (0..ndim)
@@ -1086,26 +1233,20 @@ impl DagBuilder {
         let x_shape = &self.init_values[x].as_ref().unwrap().shape;
         let w_shape = &self.init_values[w].as_ref().unwrap().shape;
 
-        // C_in comes from the WEIGHT, which is unambiguous, and the batch is
-        // whatever leading extent is left over. A folded input
-        // [b_pad*c_in_pad, H, W] and an explicit [B, C_in, H, W] both work, and
-        // neither depends on a convention the caller has to remember.
+        assert_eq!(w_shape.len(), 4, "Conv2D requires one shared [D,C,KH,KW] kernel");
+        assert!(x_shape.len() == 3 || x_shape.len() == 4, "Conv2D input must be [C,H,W], [B,C,H,W], or folded [Bp*Cp,H,W]");
+        let explicit_batch = x_shape.len() == 4;
         let c_in = w_shape[1];
-        let lead: usize = x_shape[..x_shape.len() - 2].iter().product();
-        let c_in_pad = c_in.next_power_of_two();
-        // An unbatched tensor carries the LOGICAL channel count (RGB is 3, not
-        // 4), so `lead == c_in` is the single-image case and need not divide
-        // c_in_pad. Only a folded batch uses padded channel strides.
-        let batch = if lead == c_in {
-            1
-        } else {
-            assert!(
-                lead % c_in_pad == 0,
-                "conv2d: leading extent {} is neither C_in {} nor a multiple of \
-                 padded C_in {} (X {:?}, W {:?})",
-                lead, c_in, c_in_pad, x_shape, w_shape
-            );
-            lead / c_in_pad
+        let batch = if explicit_batch {
+            assert_eq!(x_shape[1], c_in, "Conv2D explicit input channel count");
+            assert!(x_shape[0] > 0, "Conv2D logical batch must be positive");
+            x_shape[0]
+        } else if x_shape[0] == c_in { 1 } else {
+            // A folded extent cannot recover a hidden non-power-of-two B.
+            // Preserve explicit [B,C,H,W] to carry that logical metadata.
+            let cp = c_in.next_power_of_two();
+            assert!(x_shape[0] > 0 && x_shape[0] % cp == 0, "Conv2D folded channel/batch extent");
+            x_shape[0] / cp
         };
         let input_h = x_shape[x_shape.len() - 2];
         let input_w = x_shape[x_shape.len() - 1];
@@ -1186,7 +1327,9 @@ impl DagBuilder {
         // Track Conv2D output as self-claim edge
         self.self_claim_edges.push(y_edge);
 
-        vec![y_edge]
+        if explicit_batch {
+            vec![self.change_shape(y_edge, vec![batch, c_out, h_out, w_out])]
+        } else { vec![y_edge] }
     }
 
     /// Create a conv3d subgraph: FlattenKernel3D(W) → W_flat, Conv3D(X, W_flat) → Y.
@@ -1675,6 +1818,17 @@ impl DagBuilder {
         self.einsum(equation, vec![x, sig], true)[0]
     }
 
+    /// CNN SiLU with row-major logical padding. The generic sigmoid/exp
+    /// profile uses column-major axes; reverse metadata on entry and restore
+    /// it on exit so those public masks address the same logical coordinates.
+    pub fn silu_row_major(&mut self, x: EdgeId) -> EdgeId {
+        let shape = self.init_values[x].as_ref().unwrap().shape.clone();
+        assert!(!shape.is_empty());
+        let view = self.change_shape(x, shape.iter().rev().copied().collect());
+        let out = self.silu(view);
+        self.change_shape(out, shape)
+    }
+
     /// Nearest-neighbor 2x upsample: X[C, H, W] → Y[C, 2H, 2W].
     /// Uses Replicate2x2 block.
     pub fn upsample_nearest_2x(&mut self, x: EdgeId) -> EdgeId {
@@ -1694,53 +1848,6 @@ impl DagBuilder {
             DataType::Uint, 0, Role::Output,
         )));
         outs[0]
-    }
-
-    /// InstanceNorm3D: X[C,D,H,W], gamma[C], beta[C] → Y[C,D,H,W].
-    /// Decomposed: InstanceNormHelper (advice) → packed[2,C] (scale+offset),
-    /// then Y = Einsum("c,cdhw->cdhw", scale, X) + offset (proven).
-    pub fn instancenorm3d(&mut self, x: EdgeId, gamma: EdgeId, beta: EdgeId, eps: f64) -> EdgeId {
-        let x_shape = &self.init_values[x].as_ref().unwrap().shape;
-        let channels = x_shape[0];
-        let depth = x_shape[1];
-        let height = x_shape[2];
-        let width = x_shape[3];
-        let sf = self.init_values[x].as_ref().unwrap().sf;
-        let data_type = self.init_values[x].as_ref().unwrap().data_type;
-
-        // 1. InstanceNormHelper(X, gamma, beta) → packed[2, C] (advice, single output)
-        //    Group 0 = scale, Group 1 = offset
-        let norm = BasicBlockType::InstanceNorm3D(InstanceNormHelper {
-            channels, depth, height, width, eps,
-        });
-        let helper_outs = self.add_gkr_node(vec![x, gamma, beta], norm);
-        let packed = helper_outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            vec![2, channels], data_type, sf, Role::Output,
-        )));
-
-        // 2. Unpack via ChannelSlice: packed[2, C] → scale_1c[1, C] → scale[C]
-        let scale_1c = self.channel_slice(packed, 0, 1);
-        let scale = self.change_shape(scale_1c, vec![channels]);
-
-        // 3. Unpack via ChannelSlice: packed[2, C] → offset_1c[1, C] → offset[C]
-        let offset_1c = self.channel_slice(packed, 1, 1);
-        let offset = self.change_shape(offset_1c, vec![channels]);
-
-        // 4. z = Einsum("a,abcd->abcd", scale, X) — proven multiply
-        let z = self.einsum("a,abcd->abcd".to_string(), vec![scale, x], true)[0];
-
-        // 5. Y = Add(z, offset_4d) — proven broadcast add
-        //    offset has shape [C], but broadcast_shape right-aligns to [1,1,1,C].
-        //    We need left-alignment [C,1,1,1] so channel dim broadcasts correctly.
-        let offset_4d = self.change_shape(offset, vec![channels, 1, 1, 1]);
-        let y = self.add(z, offset_4d)[0];
-
-        // 6. Mask padding channels if non-power-of-2 channel count.
-        //    Add broadcasting may introduce non-zero values in padding region.
-        let y = self.mask_channels(y, 4);
-
-        y
     }
 
     /// Mask non-power-of-2 channel dimensions by multiplying with a binary mask.
@@ -1778,63 +1885,126 @@ impl DagBuilder {
         self.einsum(eq, vec![mask_edge, x], false)[0]
     }
 
-    /// PillarMaxPool: X[N_pillars, max_points, D] → Y[N_pillars, D].
-    /// With dominance (Y ≥ X_t for each t).
+    /// Exact maximum over the logical point axis, with private attainment.
+    /// Storage padding is excluded; every declared point remains a real member.
     pub fn pillar_maxpool(&mut self, x: EdgeId, n_pillars: usize, max_points: usize, features: usize) -> EdgeId {
-        let out_shape = vec![n_pillars, features];
-
-        // 1. PillarMaxPool(X) → Y (advice)
-        let block = BasicBlockType::PillarMaxPool(PillarMaxPool {
-            n_pillars, max_points, features,
-        });
-        let outs = self.add_gkr_node(vec![x], block);
-        let y = outs[0];
-        self.init_values.push(Some(Witness::new_wo_data(
-            out_shape, DataType::Uint, 0, Role::Output,
-        )));
-
-        // 2. Dominance: Y ≥ X[:, t, :] for each t.
-        //    X has shape [N_pillars, max_points, D] — treat as [C=N, H=T, W=D].
-        //    SubSample2D(X, stride_h=1, stride_w=1, offset_h=t, offset_w=0, out_h=1, out_w=D)
-        //    gives X_t[N, 1, D]. ChangeShape to [N, D], then sub(Y, X_t) ≥ 0.
-        for t in 0..max_points {
-            let x_t = self.subsample2d_sized(x, 1, 1, t, 0, 1, features);
-            let x_t_flat = self.change_shape(x_t, vec![n_pillars, features]);
-            let diff = self.sub(y, x_t_flat);
-            self.add_nonneg_node(diff[0]);
-        }
-
-        y
+        let geometry=GeneralMaxPoolHelper {channels:n_pillars,input_h:max_points,input_w:features,
+            kernel_h:max_points,kernel_w:1,stride_h:max_points,stride_w:1};
+        geometry.output_shape();
+        let input=self.init_values[x].as_ref().unwrap();
+        assert_eq!(input.shape,vec![n_pillars,max_points,features]);
+        let sf=input.sf;
+        let y=self.add_gkr_node(vec![x],BasicBlockType::PillarMaxPool(PillarMaxPool {
+            n_pillars,max_points,features,
+        }))[0];
+        self.init_values.push(Some(Witness::new_wo_data(vec![n_pillars,features],DataType::Uint,sf,Role::Output)));
+        // A consumed committed helper is not a standalone public terminal root.
+        self.change_shape(y,vec![n_pillars,features])
     }
 
     /// ScatterToBEV: X[N_pillars, D] + coords[N_pillars, 2] → Y[D, ny, nx].
     pub fn scatter_to_bev(&mut self, x: EdgeId, coords: EdgeId, n_pillars: usize, features: usize, ny: usize, nx: usize) -> EdgeId {
-        let block = BasicBlockType::ScatterToBEV(ScatterToBEV {
-            n_pillars, features, ny, nx,
-        });
-        let outs = self.add_gkr_node(vec![x, coords], block);
-        self.init_values.push(Some(Witness::new_wo_data(
-            vec![features, ny, nx],
-            DataType::Uint, 0, Role::Output,
-        )));
-        outs[0]
+        let sf=self.init_values[x].as_ref().unwrap().sf;
+        let outs=self.add_gkr_node(vec![x,coords],BasicBlockType::ScatterToBEV(ScatterToBEV{n_pillars,features,ny,nx}));
+        self.init_values.push(Some(Witness::new_wo_data(vec![features,ny,nx],DataType::Uint,sf,Role::Output)));
+        self.change_shape(outs[0],vec![features,ny,nx])
+    }
+    pub fn gather_from_grid(&mut self, grid: EdgeId, coords: EdgeId, n_points: usize, channels: usize, grid_h: usize, grid_w: usize) -> EdgeId {
+        let sf=self.init_values[grid].as_ref().unwrap().sf;
+        let outs=self.add_gkr_node(vec![grid,coords],BasicBlockType::GatherFromGrid(GatherFromGrid{n_points,channels,grid_h,grid_w}));
+        self.init_values.push(Some(Witness::new_wo_data(vec![n_points,channels],DataType::Uint,sf,Role::Output)));
+        self.change_shape(outs[0],vec![n_points,channels])
     }
 
-    pub fn gather_from_grid(&mut self, grid: EdgeId, coords: EdgeId, n_points: usize, channels: usize, grid_h: usize, grid_w: usize) -> EdgeId {
-        let block = BasicBlockType::GatherFromGrid(GatherFromGrid {
-            n_points, channels, grid_h, grid_w,
-        });
-        let outs = self.add_gkr_node(vec![grid, coords], block);
-        self.init_values.push(Some(Witness::new_wo_data(
-            vec![n_points, channels],
-            DataType::Uint, 0, Role::Output,
-        )));
-        outs[0]
+    /// Attach canonical domain gates even for standalone raw ExpHelper nodes.
+    fn exp_guards(&mut self, a: EdgeId, r: EdgeId, bits: usize) -> [NodeId; 4] {
+        assert!((1..=8).contains(&bits), "unsupported exp selector width");
+        let sf = *SF_LOG;
+        let shape = self.init_values[a].as_ref().unwrap().shape.clone();
+        assert_eq!(self.init_values[a].as_ref().unwrap().sf, sf);
+        let l = crate::basicblock::exp::exp_ln2(sf);
+        let mut ids = [0; 4];
+        // Canonical remainder and nonpositive finite-domain roots. These are
+        // real NonNegative gates consumed by the PIOP, not witness assertions.
+        // max(-x) = 2^bits L - floor(L/2) - 1 gives k < 2^bits.
+        // All range sums and the full x = r-Lk interval are < 2^40 << p
+        // for sf<=30, bits<=8, so no nonzero field multiple can counterfeit it.
+        let bound = (1i128 << bits) * l - l / 2 - 1;
+        let range_bits = |v: i128| -> usize { (128 - (v as u128).leading_zeros() as usize).max(1) };
+        let zero = self.integer_literal(shape.clone(), 0, sf);
+        let hi = self.integer_literal(shape.clone(), bound, sf);
+        let neg_x = self.sub(zero, a)[0];
+        self.init_values[neg_x].as_mut().unwrap().role = Role::Output;
+        let slack = self.sub(hi, neg_x)[0];
+        self.init_values[slack].as_mut().unwrap().role = Role::Output;
+        ids[0] = self.nodes.len();
+        self.add_nonneg_node_bits(neg_x, range_bits(bound));
+        ids[1] = self.nodes.len();
+        self.add_nonneg_node_bits(slack, range_bits(bound));
+        let half = self.integer_literal(shape.clone(), l / 2, sf);
+        let lm1 = self.integer_literal(shape.clone(), l - 1, sf);
+        let rho = self.sub(half, r)[0];
+        self.init_values[rho].as_mut().unwrap().role = Role::Output;
+        let rho_slack = self.sub(lm1, rho)[0];
+        self.init_values[rho_slack].as_mut().unwrap().role = Role::Output;
+        ids[2] = self.nodes.len();
+        self.add_nonneg_node_bits(rho, range_bits(l - 1));
+        ids[3] = self.nodes.len();
+        self.add_nonneg_node_bits(rho_slack, range_bits(l - 1));
+
+        ids
     }
 
     /// Compile: build consumers/producers, ports, and topological order.
-    pub fn compile(self) -> (Dag, Vec<Vec<Witness>>) {
+    pub fn compile(mut self) -> (Dag, Vec<Vec<Witness>>) {
+        // Every division/RMS advice primitive receives defining constraints, including raw
+        // add_gkr_node users. Legacy row-f64 reciprocal advice is unsupported.
+        // The queue is intentionally live: RMS guards themselves create an
+        // exact quarter division and a private bucket advice node.
+        let mut cursor=0;
+        while cursor<self.nodes.len() {
+            let node=self.nodes[cursor].clone();cursor+=1;
+            match node.kind {
+                BasicBlockType::SoftmaxConst(_) | BasicBlockType::SigmoidConst(_)=>panic!("unconstrained log normalization advice is unsupported; use selected finite normalization"),
+                BasicBlockType::MaxPoolHelper(p)=>{
+                    let p=GeneralMaxPoolHelper {channels:p.channels,input_h:p.input_h,input_w:p.input_w,
+                        kernel_h:p.pool_h,kernel_w:p.pool_w,stride_h:p.pool_h,stride_w:p.pool_w};
+                    crate::dag::maxpool::attach_selector(&mut self,node.inputs[0],node.outputs[0],p,None);
+                },
+                BasicBlockType::GeneralMaxPoolHelper(p)=>crate::dag::maxpool::attach_selector(&mut self,node.inputs[0],node.outputs[0],p,None),
+                BasicBlockType::MaskedMaxPoolHelper(p)=>crate::dag::maxpool::attach_selector(&mut self,node.inputs[0],node.outputs[0],p.pool,Some(node.inputs[1])),
+                BasicBlockType::ScatterToBEV(p)=>crate::dag::grid_routing::attach_scatter(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],p.n_pillars,p.features,p.ny,p.nx),
+                BasicBlockType::GatherFromGrid(p)=>crate::dag::grid_routing::attach_gather(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],p.n_points,p.channels,p.grid_h,p.grid_w),
+                BasicBlockType::PillarMaxPool(p)=>{
+                    let g=GeneralMaxPoolHelper {channels:p.n_pillars,input_h:p.max_points,input_w:p.features,
+                        kernel_h:p.max_points,kernel_w:1,stride_h:p.max_points,stride_w:1};
+                    g.output_shape();
+                    assert_eq!(self.init_values[node.outputs[0]].as_ref().unwrap().shape,vec![p.n_pillars,p.features]);
+                    let y=self.change_shape(node.outputs[0],vec![p.n_pillars,1,p.features]);
+                    crate::dag::maxpool::attach_selector(&mut self,node.inputs[0],y,g,None);
+                },
+                BasicBlockType::MaxPoolSelector(p)=>crate::dag::maxpool::selector_constraints(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],node.inputs[2],p.pool),
+                BasicBlockType::MaskedMaxSelector(_)=>crate::dag::softmax::max_selector_constraints(&mut self,node.inputs[0],node.inputs[1],node.outputs[0]),
+                BasicBlockType::NormalizedRatio(b)=>crate::dag::softmax::ratio_constraints(&mut self,node.inputs[0],node.inputs[1],node.outputs[0],b.max_terms),
+                BasicBlockType::InstanceNorm3D(_)=>panic!("unconstrained legacy InstanceNorm advice is unsupported; use instancenorm3d"),
+                BasicBlockType::DivConst(b)=>self.division_guards(node.inputs[0],node.outputs[0],usize::try_from(b.divisor).expect("divisor too large")),
+                BasicBlockType::RMSReciprocal(b)=>{
+                    assert_eq!(b.dim,0,"legacy unconstrained RMS advice is unsupported; use the exact mean gate");
+                    crate::dag::llama::rms_reciprocal_constraints(&mut self,node.inputs[0],node.outputs[0]);
+                },
+                BasicBlockType::RMSBucket(_)=>crate::dag::llama::rms_bucket_constraints(&mut self,node.inputs[0],node.outputs[0]),
+                _=>{},
+            }
+        }
+        let helpers: Vec<_> = self.nodes.iter().filter_map(|n| {
+            if let BasicBlockType::ExpHelper(h) = &n.kind {
+                Some((n.id, n.inputs[0], n.outputs[0], h.num_bits))
+            } else { None }
+        }).collect();
+        let exp_guard_nodes = helpers.into_iter().map(|(n,x,r,bits)|
+            (n, self.exp_guards(x,r,bits))).collect();
         let DagBuilder {
+            program_literals,
             nodes,
             num_edges,
             init_values,
@@ -1951,6 +2121,8 @@ impl DagBuilder {
         }
 
         let dag = Dag {
+            exp_guard_nodes,
+            program_literals,
             nodes,
             num_edges,
             topo,
@@ -1991,6 +2163,89 @@ impl DagBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exp_zero_is_one_at_output_scale_cpu_forward() {
+        // Execute the actual graph's CPU operators directly, avoiding the
+        // benchmark run hook and any GPU backend environment override.
+        let mut g = DagBuilder::new();
+        let x = g.committed_input(Witness::new(
+            vec![2], vec![AlmostGoldilocksField(0); 2],
+            DataType::Float, *SF_LOG, Role::Input,
+        ));
+        let out = g.exp(x)[0];
+        let (dag, mut witnesses) = g.compile();
+        for &nid in &dag.topo {
+            let node = &dag.nodes[nid];
+            let inputs: Vec<&Witness> = node.inputs.iter().map(|&e| &witnesses[e][0]).collect();
+            let outputs = node.kind.run(&inputs);
+            assert_eq!(outputs.len(), node.outputs.len());
+            for (&edge, value) in node.outputs.iter().zip(outputs) {
+                witnesses[edge] = vec![value];
+            }
+        }
+        let result = &witnesses[out][0];
+        assert_eq!(result.sf, *SF_LOG);
+        assert!(result.data.as_ref().unwrap().evaluations_ref().iter()
+            .all(|v| *v == AlmostGoldilocksField(1u64 << *SF_LOG)));
+    }
+
+    #[test]
+    fn exp_logical_values_ignore_padding_and_padded_outputs_are_zero() {
+        let evaluate = |shape: Vec<usize>, values: Vec<i128>| {
+            let mut b=DagBuilder::new();
+            let x=b.committed_input(Witness::new(shape,values.into_iter().map(int_to_f).collect(),DataType::Float,*SF_LOG,Role::Input));
+            let y=b.exp(x)[0]; let (d,mut w)=b.compile();
+            for &n in &d.topo {
+                let nd=&d.nodes[n]; let inputs=nd.inputs.iter().map(|&e|&w[e][0]).collect::<Vec<_>>();
+                let outputs=nd.kind.run(&inputs);
+                for (&e,v) in nd.outputs.iter().zip(outputs) {w[e]=vec![v];}
+            }
+            w[y][0].data.as_ref().unwrap().evaluations().iter().map(|v|v.reduce().0).collect::<Vec<_>>()
+        };
+        let logical=-(1i128<<*SF_LOG);
+        let expected=evaluate(vec![1],vec![logical])[0];
+        for pad in [400,-5000,10000] {
+            let mut v=vec![logical;5]; v.extend([pad;3]);
+            let out=evaluate(vec![5],v);
+            assert_eq!(&out[..5],&[expected;5]); assert_eq!(&out[5..],&[0;3]);
+        }
+        // Multi-axis, column-major layout: axis0 varies fastest.
+        let mut v=vec![400;16];
+        for j in 0..3 {for i in 0..3 {v[i+4*j]=logical;}}
+        let out=evaluate(vec![3,3],v);
+        for j in 0..4 {for i in 0..4 {
+            assert_eq!(out[i+4*j],if i<3 && j<3 {expected} else {0});
+        }}
+    }
+
+    #[test]
+    fn eager_request_arithmetic_is_not_a_model_parameter() {
+        for v in [3,19] {
+            let mut b=DagBuilder::new();
+            let x=b.committed_input(Witness::new(vec![1],vec![int_to_f(v)],DataType::Int,0,Role::Input));
+            let literal=b.public_literal(Witness::new(vec![1],vec![int_to_f(7)],DataType::Int,0,Role::Constant));
+            let a=b.add(x,literal)[0]; let z=b.sub(a,literal)[0];
+            assert_eq!(b.init_values[a].as_ref().unwrap().role,Role::Output);
+            assert_eq!(b.init_values[z].as_ref().unwrap().role,Role::Output);
+            assert_eq!(crate::util::arith::f_to_int(b.init_values[z].as_ref().unwrap().data.as_ref().unwrap().index(0)),v);
+            let (d,w)=b.compile();
+            let g=crate::morpheus::piop::Graph::new(&d,&w,crate::morpheus::piop::Config::default());
+            assert!(!g.model[a] && !g.model[z] && !g.committed[a] && !g.committed[z]);
+        }
+    }
+
+    #[test]
+    fn eager_model_only_arithmetic_remains_trusted_precomputation() {
+        let mut b=DagBuilder::new();
+        let a=b.param(Witness::new(vec![1],vec![int_to_f(3)],DataType::Int,0,Role::Constant));
+        let c=b.param(Witness::new(vec![1],vec![int_to_f(7)],DataType::Int,0,Role::Constant));
+        let sum=b.add(a,c)[0]; let difference=b.sub(sum,c)[0];
+        assert_eq!(b.init_values[sum].as_ref().unwrap().role,Role::Constant);
+        assert_eq!(b.init_values[difference].as_ref().unwrap().role,Role::Constant);
+        // Such values belong to the trusted model-registration preprocessing;
+        // this is not a proof of their relationship to separate weight leaves.
+    }
 
     #[test]
     fn test_dag_builder_simple_add() {

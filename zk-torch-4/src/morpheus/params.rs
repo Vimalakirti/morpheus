@@ -43,7 +43,7 @@ impl Profile {
     /// The ternary-hiding candidate (production).
     pub fn ternary() -> Self {
         Profile {
-            name: "morpheus-ternary-v1",
+            name: "morpheus-ternary-shake256-v2",
             rank: 16,
             tau: 2,
             hiding: 648,
@@ -66,13 +66,13 @@ impl Profile {
         // 3 + 3 + 2 = 8 source columns (ℓ = 15). The link degree caps stay
         // 4 / 6 (they must cover the link polynomial's true degrees), so the
         // auxiliary block has 15·4 + 6 = 66 coefficients.
-        Profile { name: "morpheus-toy", rank: 2, hiding: 3, source_payload_cols: 3, aux_coeffs: 66, ..Self::ternary() }
+        Profile { name: "morpheus-toy-shake256-v2", rank: 2, hiding: 3, source_payload_cols: 3, aux_coeffs: 66, ..Self::ternary() }
     }
 
     /// Mid-size test profile: 2^20 coordinates per source (251 + 3 + 2
     /// columns), true link degree caps (20·4 + 6 = 86 aux coefficients).
     pub fn mini() -> Self {
-        Profile { name: "morpheus-mini", rank: 2, hiding: 3, source_payload_cols: 251, aux_coeffs: 86, ..Self::ternary() }
+        Profile { name: "morpheus-mini-shake256-v2", rank: 2, hiding: 3, source_payload_cols: 251, aux_coeffs: 86, ..Self::ternary() }
     }
 
     /// Identity-error ring columns = rank.

@@ -50,6 +50,7 @@ fn find_cuda_paths() -> (String, String) {
 }
 
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_CUDA").is_none() { return; }
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 

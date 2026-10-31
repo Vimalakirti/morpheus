@@ -7,7 +7,7 @@
 
 use std::os::raw::{c_int, c_void};
 
-#[link(name = "almost_goldilocks_cuda_wrapper", kind = "static")]
+#[cfg_attr(feature = "cuda", link(name = "almost_goldilocks_cuda_wrapper", kind = "static"))]
 extern "C" {
     // -------------------- init / memory --------------------
     pub fn almost_goldilocks_cuda_init() -> c_int;
