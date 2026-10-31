@@ -189,7 +189,10 @@ fn remap(rows: &[Row], map: &(dyn Fn(usize) -> usize + Sync)) -> Vec<Row> {
 }
 
 fn fill_suffixes(p: &Profile, coins: &Coins, raw: &mut [Vec<i8>], owner: &dyn Fn(usize) -> u64) {
-    for (e, r) in raw.iter_mut().enumerate() { link::fill_source_suffix_gpu(p, coins, owner(e), r); }
+    // Sources are independent (own coin owner); a few in flight at once.
+    let owners: Vec<u64> = (0..raw.len()).map(owner).collect();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().expect("suffix pool");
+    pool.install(|| raw.par_iter_mut().zip(&owners).for_each(|(r, &w)| link::fill_source_suffix_gpu(p, coins, w, r)));
 }
 
 // ---------------------------------------------------------------- model registration
@@ -578,7 +581,11 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         // Authentication masks of the first attempts, drawn while the PIOP
         // leaves the device mostly idle (MORPHEUS_PRESAMPLE attempts, default 3).
         if o.auth {
-            let n: u16 = std::env::var("MORPHEUS_PRESAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+            // Default: 3 attempts when one attempt's masks are large (>= 2^27
+            // coordinates, ~0.5 s to sample); smaller masks are cheaper to
+            // draw on demand than the PIOP slowdown of drawing them alongside.
+            let coords = o.profile.tau * (support.len() + o.profile.link_cols() + o.profile.aux_cols()) * super::ring::N;
+            let n: u16 = std::env::var("MORPHEUS_PRESAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(if coords >= 1 << 27 { 3 } else { 0 });
             let (prof, coins, runs) = (&o.profile, &o.coins, &runs);
             if n > 0 { sc.spawn(move || auth_gpu::presample(prof, coins, opening, n, Some(runs))); }
         }

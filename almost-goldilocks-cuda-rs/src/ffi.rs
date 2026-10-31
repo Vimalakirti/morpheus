@@ -56,6 +56,7 @@ extern "C" {
     pub fn agl_cached_bytes() -> usize;
     pub fn agl_gauss_low_priority(on: c_int) -> c_int;
     pub fn agl_d2h_staged(h_dst: *mut c_void, d_src: *const c_void, bytes: usize) -> c_int;
+    pub fn agl_h2d_staged(d_dst: *mut c_void, h_src: *const c_void, bytes: usize) -> c_int;
     pub fn agl_mpiop_mle(d_vals: *const u64, h_point: *const u64, n: c_int, h_out: *mut u64) -> c_int;
     pub fn agl_mpiop_sel_lookup(d_sel: *const u64, n: u64, shift: c_int, mask: u64, d_table: *const u64, d_out: *mut u64) -> c_int;
     pub fn agl_mpiop_eq_outer(d_lo: *const u64, nlo: c_int, d_hi: *const u64, nhi: c_int, d_out: *mut u64) -> c_int;

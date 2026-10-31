@@ -14,6 +14,12 @@ pub fn threshold() -> usize {
     *T
 }
 /// Smallest table evaluated by `mle` on the device (one kernel, one readback).
+/// Device sumcheck tables at most this long finish on the host
+/// (MORPHEUS_SC_HOST_LEN, default 256; 0 keeps them on the device).
+pub fn sc_host_len() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MORPHEUS_SC_HOST_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(256))
+}
 pub fn mle_threshold() -> usize {
     static T: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| std::env::var("MORPHEUS_MLE_GPU_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 9));
     *T

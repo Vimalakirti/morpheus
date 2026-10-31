@@ -243,12 +243,17 @@ fn encode(g: &Graph, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_
     // Registry membership and VALUES belong to program identity, unlike request
     // inputs. Refuse even request-time replacement of an immutable literal.
     w.us(d.program_literals.len())?;
-    for (&e, v) in &d.program_literals {
-        if e >= ne || d.producers[e].is_some() || g.edge_meta[e].3 != Role::Input
-            || g.public.get(&e).map(|x| x.as_slice()) != Some(v.as_slice()) {
-            return Err("program literal missing, overwritten, or not an input leaf".into());
-        }
-        public_array(&mut w,g,e,v,true)?;
+    {
+        use rayon::prelude::*;
+        let lits: Vec<_> = d.program_literals.iter().collect();
+        let enc: Vec<Result<Vec<u64>, String>> = lits.par_iter().map(|&(&e, v)| {
+            if e >= ne || d.producers[e].is_some() || g.edge_meta[e].3 != Role::Input
+                || g.public.get(&e).map(|x| x.as_slice()) != Some(v.as_slice()) {
+                return Err("program literal missing, overwritten, or not an input leaf".into());
+            }
+            let mut a = Words::default(); public_array(&mut a,g,e,v,true)?; Ok(a.0)
+        }).collect();
+        for x in enc { w.0.extend(x?); }
     }
     let mut public: Vec<_> = g.public.iter().collect(); public.sort_unstable_by_key(|(e,_)| **e);
     w.us(public.len())?;

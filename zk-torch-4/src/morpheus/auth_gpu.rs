@@ -380,7 +380,12 @@ fn run_attempt_sharded(
                 let narrow = |b: &DeviceBuffer<i64>| -> Vec<i32> {
                     let mut d = DeviceBuffer::<i32>::new(b.len()).unwrap();
                     assert_eq!(unsafe { ffi::agl_i64_to_i32(b.as_ptr(), d.as_mut_ptr(), b.len() as u64) }, 0);
-                    d.to_vec().unwrap()
+                    // Pinned staged readback into pre-faulted pages.
+                    let mut v: Vec<i32> = Vec::with_capacity(b.len());
+                    unsafe { v.set_len(b.len()); }
+                    { use rayon::prelude::*; v.par_chunks_mut(1 << 18).for_each(|c| { let mut i = 0; while i < c.len() { c[i] = 0; i += 1024; } }); }
+                    assert_eq!(unsafe { ffi::agl_d2h_staged(v.as_mut_ptr() as *mut c_void, d.as_ptr() as *const c_void, v.len() * 4) }, 0);
+                    v
                 };
                 (narrow(&pw), narrow(&pl))
             })
@@ -392,7 +397,8 @@ fn run_attempt_sharded(
     almost_goldilocks_cuda::set_device(0).expect("set device");
     for (pw, pl) in &parts {
         for (dst, src) in [(&mut zw, pw), (&mut zl, pl)] {
-            let d = DeviceBuffer::from_slice(src).unwrap();
+            let mut d = DeviceBuffer::<i32>::new(src.len()).unwrap();
+            assert_eq!(unsafe { ffi::agl_h2d_staged(d.as_mut_ptr() as *mut c_void, src.as_ptr() as *const c_void, src.len() * 4) }, 0);
             assert_eq!(unsafe { ffi::agl_add_i32_i64(dst.as_mut_ptr(), d.as_ptr(), src.len() as u64) }, 0);
         }
     }

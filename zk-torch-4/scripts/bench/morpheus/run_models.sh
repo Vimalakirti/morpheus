@@ -139,6 +139,18 @@ done
 CNNFX=${CNNFX:-/scratch/bjchen4_icgpu/goldilocks/deepprove_src/cnn_fixtures}
 { want_x dp1 || want_x dp1cnn; } && MODES=mono run CIFAR-LeNet_g1 hook:bench_deepprove_cnn:cv_config.yaml:1 "${G1[@]}" CNN_FIXTURE=$CNNFX/cifar.json ZK4_TABLE_SIZE_LOG=16
 { want_x dp1 || want_x dp1cnn; } && MODES=mono run COVID-CNN_g1 hook:bench_deepprove_cnn:cv_config.yaml:1 "${G1[@]}" CNN_FIXTURE=$CNNFX/covid10.json ZK4_TABLE_SIZE_LOG=20 REQ_PLANES_LOG=5
+# Source-sharding scaling: the same monolithic requests on one GPU (models
+# whose sources fit one device; the LLMs need the memory of four).
+want_x g1 && MODES=mono && {
+  run GPT-2_g1 e2e "${TW[@]}" "${G1[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=gpt2 NUM_LAYERS=12 SEQ_LEN=128 VOCAB_SIZE=50257
+  run BERT-Large_g1 e2e "${TW[@]}" "${G1[@]}" ZK4_TABLE_SIZE_LOG=10 MODEL=bert NUM_LAYERS=24 SEQ_LEN=128
+  run ResNet-50_g1 hook:bench_streaming_resnet:cv_config.yaml:1 "${G1[@]}" NUM_LAYERS=53 INPUT_SIZE=224 ZK4_TABLE_SIZE_LOG=12
+  run VGG-16_g1 hook:bench_streaming_vgg:cv_config.yaml:1 "${G1[@]}" VGG_VARIANT=16 NUM_LAYERS=13 INPUT_SIZE=32 ZK4_TABLE_SIZE_LOG=12
+  run YOLOv11n_g1 hook:bench_streaming_yolo:cv_config.yaml:1 "${G1[@]}" NUM_STAGES=8 INPUT_SIZE=640 ZK4_TABLE_SIZE_LOG=12
+  run 3D-UNet_g1 hook:bench_streaming_unet3d:cv_config.yaml:1 "${G1[@]}" NUM_LAYERS=6 INPUT_D=64 INPUT_H=64 INPUT_W=64 ZK4_TABLE_SIZE_LOG=12
+  run PointPillars_g1 hook:bench_streaming_pointpillar:cv_config.yaml:1 "${G1[@]}" NX=432 NY=496 N_PILLARS=12000 MAX_POINTS=32 NUM_ANCHORS=2 NUM_CLASSES=3 ZK4_TABLE_SIZE_LOG=12
+  run Whisper_g1 hook:bench_streaming_whisper:llama2_config.yaml:1 "${G1[@]}" NUM_ENC_LAYERS=4 NUM_DEC_LAYERS=4 N_MELS=80 N_AUDIO_CTX=1500 N_TEXT_CTX=448 N_STATE=384 N_HEAD=6 ZK4_TABLE_SIZE_LOG=24
+}
 # EZKL's two reference circuits at their exported shapes, one GPU.
 want_x ezkl && MORPHEUS_GPUS=1 MORPHEUS_AUTH_GPUS=1 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*} \
   run LeNet-5 hook:bench_streaming_lenet:llama2_config.yaml:1 MORPHEUS_GPUS=1 MORPHEUS_AUTH_GPUS=1

@@ -336,13 +336,13 @@ int cuda_peek_at_last_error() { return (int)cudaPeekAtLastError(); }
 int agl_d2h_staged(void* h_dst, const void* d_src, size_t bytes) {
     if (bytes == 0) return 0;
     const size_t CH = (size_t)64 << 20;
-    static std::mutex mx;
+    static std::mutex mx[AGL_MAX_DEV];   // per device: devices copy concurrently
     static void* buf[AGL_MAX_DEV][2] = {};
     static cudaStream_t st[AGL_MAX_DEV] = {};
     static cudaEvent_t ev[AGL_MAX_DEV][2] = {};
     int dev = 0; cudaGetDevice(&dev);
     if (dev < 0 || dev >= AGL_MAX_DEV) return (cudaMemcpy(h_dst, d_src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess) ? 0 : -1;
-    std::lock_guard<std::mutex> lk(mx);
+    std::lock_guard<std::mutex> lk(mx[dev]);
     if (!buf[dev][0]) {
         for (int k = 0; k < 2; k++) {
             if (cudaMallocHost(&buf[dev][k], CH) != cudaSuccess) return -1;
@@ -366,6 +366,39 @@ int agl_d2h_staged(void* h_dst, const void* d_src, size_t bytes) {
         memcpy((char*)h_dst + off, buf[dev][c & 1], len);
     }
     return 0;
+}
+
+/// Host-to-device copy through two pinned 64 MB staging buffers (pageable
+/// sources otherwise copy at a fraction of the bus rate). Returns once the
+/// data is on the device.
+int agl_h2d_staged(void* d_dst, const void* h_src, size_t bytes) {
+    if (bytes == 0) return 0;
+    const size_t CH = (size_t)64 << 20;
+    static std::mutex mx[AGL_MAX_DEV];
+    static void* buf[AGL_MAX_DEV][2] = {};
+    static cudaStream_t st[AGL_MAX_DEV] = {};
+    static cudaEvent_t ev[AGL_MAX_DEV][2] = {};
+    int dev = 0; cudaGetDevice(&dev);
+    if (dev < 0 || dev >= AGL_MAX_DEV) return (cudaMemcpy(d_dst, h_src, bytes, cudaMemcpyHostToDevice) == cudaSuccess) ? 0 : -1;
+    std::lock_guard<std::mutex> lk(mx[dev]);
+    if (!buf[dev][0]) {
+        for (int k = 0; k < 2; k++) {
+            if (cudaMallocHost(&buf[dev][k], CH) != cudaSuccess) return -1;
+            cudaEventCreateWithFlags(&ev[dev][k], cudaEventDisableTiming);
+        }
+        cudaStreamCreateWithFlags(&st[dev], cudaStreamNonBlocking);
+    }
+    const size_t n = (bytes + CH - 1) / CH;
+    agl_sync_mine();
+    for (size_t c = 0; c < n; c++) {
+        const size_t off = c * CH, len = bytes - off < CH ? bytes - off : CH;
+        // Buffer c & 1 is free once its previous copy (chunk c − 2) is done.
+        if (c >= 2 && cudaEventSynchronize(ev[dev][c & 1]) != cudaSuccess) return -1;
+        memcpy(buf[dev][c & 1], (const char*)h_src + off, len);
+        cudaMemcpyAsync((char*)d_dst + off, buf[dev][c & 1], len, cudaMemcpyHostToDevice, st[dev]);
+        cudaEventRecord(ev[dev][c & 1], st[dev]);
+    }
+    return cudaStreamSynchronize(st[dev]) == cudaSuccess ? 0 : -1;
 }
 
 /// Bytes held in the caching allocator's free lists for the current device.

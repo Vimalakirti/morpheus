@@ -67,7 +67,23 @@ pub struct MTranscript {
 
 /// `registered_cardinality`'s parser, resumable over appended frames.
 #[derive(Clone)]
-struct ParseState { parsed: usize, frame_number: usize, pending: Option<BigUint>, failed: bool }
+struct ParseState { parsed: usize, frame_number: usize, pending: Option<Card>, failed: bool }
+
+/// A pending query cardinality: q^8 (the K challenge, by far the most frequent,
+/// kept symbolic so no big integer is built per query) or any other value.
+#[derive(Clone)]
+enum Card { Q8, Big(BigUint) }
+impl Card {
+    /// rank >= cardinality for a minimal big-endian rank encoding.
+    fn le_rank(&self, bytes: &[u8]) -> bool {
+        match self {
+            Card::Q8 => { let n = &krank().q8_be; if bytes.len() != n.len() { bytes.len() > n.len() } else { bytes >= &n[..] } }
+            Card::Big(n) => BigUint::from_bytes_be(bytes) >= *n,
+        }
+    }
+    fn value(&self) -> BigUint { match self { Card::Q8 => krank().q8.clone(), Card::Big(n) => n.clone() } }
+    fn is_q8(&self) -> bool { match self { Card::Q8 => true, Card::Big(n) => *n == krank().q8 } }
+}
 
 impl ParseState {
     fn new() -> Self { ParseState { parsed: 0, frame_number: 0, pending: None, failed: false } }
@@ -89,12 +105,16 @@ impl ParseState {
     }
     fn cardinality(&self) -> BigUint {
         if self.failed || self.frame_number < 3 { return BigUint::one(); }
-        self.pending.clone().unwrap_or_else(BigUint::one)
+        self.pending.as_ref().map(Card::value).unwrap_or_else(BigUint::one)
+    }
+    /// cardinality() == q^8, without building it.
+    fn is_q8(&self) -> bool {
+        !self.failed && self.frame_number >= 3 && self.pending.as_ref().map_or(false, Card::is_q8)
     }
 }
 
 /// One frame of the registered-domain parser: bytes used, or None if malformed.
-fn parse_frame(rest: &[u8], frame_number: usize, pending: &mut Option<BigUint>) -> Option<usize> {
+fn parse_frame(rest: &[u8], frame_number: usize, pending: &mut Option<Card>) -> Option<usize> {
     if rest.len()<17 { return None; }
     let enc=rest[0];
     let item=u64::from_be_bytes(rest[1..9].try_into().ok()?);
@@ -106,7 +126,7 @@ fn parse_frame(rest: &[u8], frame_number: usize, pending: &mut Option<BigUint>) 
     } else if frame_number==1 {
         if enc!=2 || item!=Item::Salt as u64 || len!=64 { return None; }
     } else if let Some(n)=pending.take() {
-        if enc!=5 || item!=0 || bytes.is_empty() || (bytes.len()>1 && bytes[0]==0) || BigUint::from_bytes_be(bytes)>=n { return None; }
+        if enc!=5 || item!=0 || bytes.is_empty() || (bytes.len()>1 && bytes[0]==0) || n.le_rank(bytes) { return None; }
     } else {
         match enc {
             1|2|3|6 => {
@@ -121,7 +141,7 @@ fn parse_frame(rest: &[u8], frame_number: usize, pending: &mut Option<BigUint>) 
                 if matches!(ty,4|5) && index!=0 { return None; }
                 if !(1..=8).contains(&stage) { return None; }
                 let n=match ty {
-                    1 if arity==1=>krank().q8.clone(),
+                    1 if arity==1=>{ *pending=Some(Card::Q8); return Some(end); },
                     2 if arity==1=>&krank().q8-2u32,
                     4=> {
                         let exp=arity.checked_mul(8)?;
@@ -135,7 +155,7 @@ fn parse_frame(rest: &[u8], frame_number: usize, pending: &mut Option<BigUint>) 
                     },
                     _=>return None
                 };
-                *pending=Some(n);
+                *pending=Some(Card::Big(n));
             },
             _=>return None
         }
@@ -249,7 +269,7 @@ pub fn registered_cardinality(address: &[u8]) -> BigUint {
 /// digits, then carried in base Q; the low 8 base-Q digits of X are the K8
 /// limbs of X mod Q^8 (digits beyond Q^8 are dropped). Same result as
 /// `typed_rank_from` + `unrank_k` without big-integer division.
-struct KRank { q8: BigUint, nbytes: usize, t: Vec<[u64; 8]> }
+struct KRank { q8: BigUint, q8_be: Vec<u8>, nbytes: usize, t: Vec<[u64; 8]> }
 fn krank() -> &'static KRank {
     static K: std::sync::OnceLock<KRank> = std::sync::OnceLock::new();
     K.get_or_init(|| {
@@ -264,8 +284,23 @@ fn krank() -> &'static KRank {
             for x in &mut d { *x = (&v % &q).to_u64().unwrap(); v /= &q; }
             d
         }).collect();
-        KRank { q8, nbytes, t }
+        let q8_be = q8.to_bytes_be();
+        KRank { q8, q8_be, nbytes, t }
     })
+}
+/// Minimal big-endian bytes of Σ_k d[k]·q^k (BigUint::to_bytes_be), in
+/// fixed-width limbs.
+fn rank_be(d: &[u64; 8]) -> Vec<u8> {
+    let mut acc = [0u64; 9];   // little-endian limbs
+    for &x in d.iter().rev() {
+        let mut carry = x as u128;
+        for l in acc.iter_mut() { let v = (*l as u128) * (Q as u128) + carry; *l = v as u64; carry = v >> 64; }
+        debug_assert_eq!(carry, 0);
+    }
+    let mut out: Vec<u8> = acc.iter().rev().flat_map(|l| l.to_be_bytes()).collect();
+    let nz = out.iter().position(|&b| b != 0).unwrap_or(out.len() - 1);
+    out.drain(..nz);
+    out
 }
 fn k_from_sponge(h: sha3::Shake256) -> [u64; 8] {
     let kr = krank();
@@ -388,19 +423,19 @@ impl MTranscript {
         frame(&mut self.prefix, 4, 0, &a);
         assert!(u64::try_from(self.prefix.len()).unwrap() <= MAX_ADDRESS_BYTES, "address cap exceeded");
         self.parse.advance(&self.prefix);
-        assert!(self.parse.cardinality() == krank().q8, "builder/parser mismatch");
+        assert!(self.parse.is_q8(), "builder/parser mismatch");
         self.sponge.update(&self.prefix[self.absorbed..]);
         self.absorbed = self.prefix.len();
         let d = k_from_sponge(self.sponge.clone());
-        let r = d.iter().rev().fold(BigUint::zero(), |acc, &x| acc * Q + x);
+        let r_be = rank_be(&d);
         #[cfg(test)]
         {
             let n = krank().q8.clone();
             assert_eq!(registered_cardinality(&self.prefix), n, "incremental parser differs");
             let slow = typed_rank(&self.prefix, &n);
-            assert_eq!(slow, r, "fixed-width rank differs");
+            assert_eq!(slow.to_bytes_be(), r_be, "fixed-width rank differs");
         }
-        frame(&mut self.prefix, 5, 0, &r.to_bytes_be());
+        frame(&mut self.prefix, 5, 0, &r_be);
         K8(d)
     }
     pub fn challenge_k_not01(&mut self, stage: Stage, attempt: u64, index: u64) -> K8 {
@@ -432,6 +467,21 @@ fn unrank_k(mut r: BigUint, count: usize) -> Vec<K8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rank_be_equals_biguint() {
+        let mut x = 1u64;
+        let mut cases: Vec<[u64; 8]> = vec![[0; 8], [Q - 1; 8], [1, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 1]];
+        for _ in 0..2000 { cases.push(std::array::from_fn(|_| { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); x % Q })); }
+        for d in cases {
+            let r = d.iter().rev().fold(BigUint::zero(), |acc, &v| acc * Q + v);
+            assert_eq!(rank_be(&d), r.to_bytes_be());
+            // The parser's q^8 comparison equals the big-integer one.
+            assert_eq!(Card::Q8.le_rank(&r.to_bytes_be()), r >= krank().q8);
+        }
+        for b in [krank().q8_be.clone(), (&krank().q8 - 1u32).to_bytes_be(), (&krank().q8 + 1u32).to_bytes_be(), vec![0]] {
+            assert_eq!(Card::Q8.le_rank(&b), BigUint::from_bytes_be(&b) >= krank().q8);
+        }
+    }
     #[test]
     fn framed_encodings_cannot_alias() {
         let mut a = MTranscript::new("test", &[0;64]);

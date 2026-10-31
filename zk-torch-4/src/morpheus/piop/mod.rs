@@ -717,6 +717,10 @@ impl<'a> Ctx<'a> {
                 let s: Vec<K8> = match tables.as_ref().unwrap() {
                 #[cfg(feature = "cuda")] Tables::Dev(t) => next_sums.take().unwrap_or_else(|| gpu::sc_round(t, d)),
                 Tables::Host(tabs) => {
+                // Sums already returned by the last device fold, if any.
+                #[cfg(feature = "cuda")] let pre = next_sums.take();
+                #[cfg(not(feature = "cuda"))] let pre: Option<Vec<K8>> = None;
+                if let Some(s) = pre { s } else {
                 let len = tabs[0].len();
                 (0..len / 2).into_par_iter().with_min_len(512).fold(|| vec![K8::ZERO; d + 1], |mut acc, k| {
                     let mut vals: Vec<K8> = tabs.iter().map(|t| t[2 * k]).collect();
@@ -728,7 +732,7 @@ impl<'a> Ctx<'a> {
                     }
                     acc
                 }).reduce(|| vec![K8::ZERO; d + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x.add(y)).collect())
-                }};
+                }}};
                 let scale = K8::from_base(1u64 << (nn - 1 - i));
                 Some((0..=d).map(|t| {
                     let tk = K8::from_base(t as u64);
@@ -759,6 +763,16 @@ impl<'a> Ctx<'a> {
                         } else {
                             for t in ts.iter_mut() { *t = gpu::sc_fold(t, &r); }
                         }
+                    }
+                }
+                // Small device tables finish on the host: a host round over a
+                // few hundred entries beats a device round trip.
+                #[cfg(feature = "cuda")]
+                if let Some(Tables::Dev(ts)) = tables.as_ref() {
+                    if i + 1 < n && ts[0].len <= gpu::sc_host_len() {
+                        let host: Vec<Vec<K8>> = ts.iter().map(|t| t.to_host()).collect();
+                        tables = Some(Tables::Host(host));
+                        spare.clear();
                     }
                 }
             }
@@ -883,17 +897,17 @@ impl<'g, 'a> Walk<'g, 'a> {
     /// Roots: NonNegative gates, selector row-sum-one, public inputs.
     pub fn roots(&mut self, ctx: &mut Ctx) {
         let lookups: Vec<usize> = self.g.lookups.keys().copied().collect();
+        // Transcript order per lookup node: the chunk challenges, then (for a
+        // NonNegative gate) the root challenge, pad and message. Rows and
+        // claims are pure functions of those values: the chunk rows' terms are
+        // built in parallel, then rows and claims are appended in the same
+        // order as a node-by-node pass.
+        enum Task { Chunk(usize, usize, Vec<K8>), Nn(usize, Vec<K8>, u32, K8) }
+        let mut tasks = Vec::new();
         for &node in &lookups {
             let nd = &self.g.dag.nodes[node];
             let n = self.g.nvars[nd.inputs[0]];
-            let t1 = std::time::Instant::now();
-            for c in 0..self.g.chunks(node).len() {
-                let r = ctx.chals(n);
-                let w = self.g.chunks(node)[c];
-                let terms = ctx.lay.terms(&t_key(node, c), &r, &vec![K8::ONE; 1 << w], K8::ONE);
-                ctx.row(terms, &Lin::new(), K8::ONE);
-            }
-            ctx.tick(".rt_sel_rows", t1);
+            for c in 0..self.g.chunks(node).len() { let r = ctx.chals(n); tasks.push(Task::Chunk(node, c, r)); }
             if let BasicBlockType::NonNegative(_) = nd.kind {
                 let t1 = std::time::Instant::now();
                 let x = nd.inputs[0];
@@ -901,13 +915,29 @@ impl<'g, 'a> Walk<'g, 'a> {
                 let a = ctx.alloc("root pad");
                 let z = ctx.send(if ctx.prover { Some(self.mle_e(x, &r).add(&ctx.bank[a as usize])) } else { None });
                 ctx.tick(".rt_nn_mle", t1);
-                let t1 = std::time::Instant::now();
-                let terms = self.sel_terms(ctx, node, &r, K8::ONE, None);
-                ctx.row(terms, &lin1(a, K8::ONE), z);
-                ctx.tick(".rt_nn_row", t1);
-                let t1 = std::time::Instant::now();
-                self.push(ctx, x, AClaim { point: r, pad: lin1(a, K8::ONE), z });
-                ctx.tick(".rt_nn_push", t1);
+                tasks.push(Task::Nn(node, r, a, z));
+            }
+        }
+        let t1 = std::time::Instant::now();
+        let lay = ctx.lay;
+        let chunk_terms: Vec<Option<Vec<Term>>> = tasks.par_iter().map(|t| match t {
+            Task::Chunk(node, c, r) => { let w = self.g.chunks(*node)[*c]; Some(lay.terms(&t_key(*node, *c), r, &vec![K8::ONE; 1 << w], K8::ONE)) }
+            Task::Nn(..) => None,
+        }).collect();
+        ctx.tick(".rt_sel_rows", t1);
+        for (t, terms) in tasks.into_iter().zip(chunk_terms) {
+            match t {
+                Task::Chunk(..) => ctx.row(terms.unwrap(), &Lin::new(), K8::ONE),
+                Task::Nn(node, r, a, z) => {
+                    let t1 = std::time::Instant::now();
+                    let x = self.g.dag.nodes[node].inputs[0];
+                    let terms = self.sel_terms(ctx, node, &r, K8::ONE, None);
+                    ctx.row(terms, &lin1(a, K8::ONE), z);
+                    ctx.tick(".rt_nn_row", t1);
+                    let t1 = std::time::Instant::now();
+                    self.push(ctx, x, AClaim { point: r, pad: lin1(a, K8::ONE), z });
+                    ctx.tick(".rt_nn_push", t1);
+                }
             }
         }
         let t1 = std::time::Instant::now();
