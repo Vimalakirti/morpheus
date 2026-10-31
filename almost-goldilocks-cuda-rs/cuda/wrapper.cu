@@ -330,6 +330,13 @@ int cuda_device_synchronize() {
 }
 int cuda_get_last_error() { return (int)cudaGetLastError(); }
 int cuda_peek_at_last_error() { return (int)cudaPeekAtLastError(); }
+/// Bytes held in the caching allocator's free lists for the current device.
+size_t agl_cached_bytes() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= AGL_MAX_DEV) return 0;
+    std::lock_guard<std::mutex> lk(g_agl_mx);
+    return g_agl_cached[dev];
+}
 int cuda_mem_get_info(size_t* free, size_t* total) {
     return (cudaMemGetInfo(free, total) == cudaSuccess) ? 0 : -1;
 }

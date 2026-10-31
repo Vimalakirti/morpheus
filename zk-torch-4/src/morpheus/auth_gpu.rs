@@ -98,6 +98,57 @@ fn norm(ptr: *const i64, n: usize) -> (u128, u64) {
 /// replica): key caches, source witnesses and the auxiliary witness.
 pub struct AuthDev<'a> { pub dev: i32, pub keys: &'a Keys, pub sources: &'a [DevSource], pub s_o: &'a DeviceBuffer<i8> }
 
+/// Attempt masks sampled ahead of the authentication (device 0): they
+/// depend only on (opening, attempt), so they are drawn while the GPU is idle
+/// in the PIOP. Keyed by (opening, attempt).
+type Masks = (DeviceBuffer<i64>, DeviceBuffer<i64>, DeviceBuffer<i64>);
+static PRESAMPLED: std::sync::Mutex<Vec<((u64, u16), Masks)>> = std::sync::Mutex::new(Vec::new());
+
+fn sample_masks(p: &Profile, coins: &Coins, opening: u64, attempt: u16) -> Result<Masks, AuthError> {
+    let fs = FastSigma::new(p.sigma);
+    let (sw, sl, so) = (p.source_cols(), p.link_cols(), p.aux_cols());
+    let row = ((sw + sl + so) * N) as u64;
+    let mut uw = DeviceBuffer::<i64>::new(2 * sw * N).unwrap();
+    let mut ul = DeviceBuffer::<i64>::new(2 * sl * N).unwrap();
+    let mut uo = DeviceBuffer::<i64>::new(2 * so * N).unwrap();
+    for r in 0..p.tau {
+        let b = r as u64 * row;
+        unsafe {
+            sample_into(coins, opening, attempt, &fs, b as u32, (sw * N) as u32, uw.as_mut_ptr().add(r * sw * N)).map_err(AuthError::Sampler)?;
+            sample_into(coins, opening, attempt, &fs, (b + (sw * N) as u64) as u32, (sl * N) as u32, ul.as_mut_ptr().add(r * sl * N)).map_err(AuthError::Sampler)?;
+            sample_into(coins, opening, attempt, &fs, (b + ((sw + sl) * N) as u64) as u32, (so * N) as u32, uo.as_mut_ptr().add(r * so * N)).map_err(AuthError::Sampler)?;
+        }
+    }
+    Ok((uw, ul, uo))
+}
+
+/// Draw the masks of attempts 0..count on device 0 ahead of time, while
+/// device memory allows (each attempt's masks are kept until used).
+pub fn presample(p: &Profile, coins: &Coins, opening: u64, count: u16) {
+    almost_goldilocks_cuda::set_device(0).expect("set device");
+    let bytes = 2 * (p.source_cols() + p.link_cols() + p.aux_cols()) * N * 8;
+    let t = Instant::now();
+    let mut done = 0;
+    for attempt in 0..count {
+        // Driver-free plus the caching allocator's free lists (released on demand),
+        // keeping 16 GB for the link.
+        let free = almost_goldilocks_cuda::mem_get_info().unwrap_or((0, 0)).0 + unsafe { almost_goldilocks_cuda::ffi::agl_cached_bytes() };
+        if free < bytes + (16usize << 30) { if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] presample stops: {:.1} GB free", free as f64 / 1e9); } break; }
+        match sample_masks(p, coins, opening, attempt) {
+            Ok(m) => { PRESAMPLED.lock().unwrap().push(((opening, attempt), m)); done += 1; }
+            Err(_) => break,
+        }
+    }
+    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] presampled {done} attempts for opening {opening} in {:.2} s", t.elapsed().as_secs_f64()); }
+}
+fn take_presampled(opening: u64, attempt: u16) -> Option<Masks> {
+    let mut g = PRESAMPLED.lock().unwrap();
+    let i = g.iter().position(|(k, _)| *k == (opening, attempt))?;
+    Some(g.swap_remove(i).1)
+}
+/// Drop any unused presampled masks.
+pub fn clear_presampled() { PRESAMPLED.lock().unwrap().clear(); }
+
 /// One attempt's first messages, verdict and (device) responses.
 struct AttemptOut { verdict: Coin, d: Vec<Tuple>, d_o: Vec<AuxTuple>, z: (DeviceBuffer<i64>, DeviceBuffer<i64>, DeviceBuffer<i64>) }
 
@@ -119,17 +170,8 @@ fn run_attempt(
         timing.attempts += 1;
         let t0 = Instant::now();
         // U blocks laid out [row][cols][N] so both rows commit in one pass.
-        let mut uw = DeviceBuffer::<i64>::new(2 * sw * N).unwrap();
-        let mut ul = DeviceBuffer::<i64>::new(2 * sl * N).unwrap();
-        let mut uo = DeviceBuffer::<i64>::new(2 * so * N).unwrap();
-        for r in 0..p.tau {
-            let b = r as u64 * row;
-            unsafe {
-                sample_into(coins, opening, attempt, &fs, b as u32, (sw * N) as u32, uw.as_mut_ptr().add(r * sw * N)).map_err(AuthError::Sampler)?;
-                sample_into(coins, opening, attempt, &fs, (b + (sw * N) as u64) as u32, (sl * N) as u32, ul.as_mut_ptr().add(r * sl * N)).map_err(AuthError::Sampler)?;
-                sample_into(coins, opening, attempt, &fs, (b + ((sw + sl) * N) as u64) as u32, (so * N) as u32, uo.as_mut_ptr().add(r * so * N)).map_err(AuthError::Sampler)?;
-            }
-        }
+        let (uw, ul, uo) = match take_presampled(opening, attempt) { Some(m) if ad.dev == 0 => m, _ => sample_masks(p, coins, opening, attempt)? };
+        let _ = (&fs, row);
         timing.sample_ms += t0.elapsed().as_secs_f64() * 1e3;
         let t0 = Instant::now();
         let (d, d_o) = first_message(p, keys, None, &dp, &uw, &ul, &uo);
@@ -203,17 +245,8 @@ fn run_attempt_sharded(
     let row = ((sw + sl + so) * N) as u64;
     timing.attempts += 1;
     let t0 = Instant::now();
-    let mut uw = DeviceBuffer::<i64>::new(2 * sw * N).unwrap();
-    let mut ul = DeviceBuffer::<i64>::new(2 * sl * N).unwrap();
-    let mut uo = DeviceBuffer::<i64>::new(2 * so * N).unwrap();
-    for r in 0..p.tau {
-        let b = r as u64 * row;
-        unsafe {
-            sample_into(coins, opening, attempt, &fs, b as u32, (sw * N) as u32, uw.as_mut_ptr().add(r * sw * N)).map_err(AuthError::Sampler)?;
-            sample_into(coins, opening, attempt, &fs, (b + (sw * N) as u64) as u32, (sl * N) as u32, ul.as_mut_ptr().add(r * sl * N)).map_err(AuthError::Sampler)?;
-            sample_into(coins, opening, attempt, &fs, (b + ((sw + sl) * N) as u64) as u32, (so * N) as u32, uo.as_mut_ptr().add(r * so * N)).map_err(AuthError::Sampler)?;
-        }
-    }
+    let (uw, ul, uo) = match take_presampled(opening, attempt) { Some(m) => m, None => sample_masks(p, coins, opening, attempt)? };
+    let _ = (&fs, row);
     timing.sample_ms += t0.elapsed().as_secs_f64() * 1e3;
     let t0 = Instant::now();
     let (d, d_o) = first_message(p, keys, seed, &dp, &uw, &ul, &uo);

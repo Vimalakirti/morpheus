@@ -537,6 +537,13 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
             pc.commit_sources()
         };
         lap(&mut times, "commit", t);
+        // Authentication masks of the first attempts, drawn while the PIOP
+        // leaves the device mostly idle (MORPHEUS_PRESAMPLE attempts, default 3).
+        if o.auth {
+            let n: u16 = std::env::var("MORPHEUS_PRESAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+            let (prof, coins) = (&o.profile, &o.coins);
+            if n > 0 { sc.spawn(move || auth_gpu::presample(prof, coins, opening, n)); }
+        }
         // PIOP.
         let model_prefix = if defer { 0 } else { pp.model.len() };
         if !defer { assert_eq!(&c_req[..model_prefix], &model.c[..], "registered model commitment changed"); }
@@ -601,6 +608,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     };
     lap(&mut times, "link", t);
     let auth = if !o.auth { None } else if pc.streamed { Some(authenticate_streamed(o, opening, pc, &fast, &t1, &mut times)) } else { Some(authenticate(o, opening, pc, &mut rep_vec, &fast, &t1, &mut times)) };
+    auth_gpu::clear_presampled();
     reps.r = rep_vec;
     pc.streamed = false;
     let dg = digest(&t1);
