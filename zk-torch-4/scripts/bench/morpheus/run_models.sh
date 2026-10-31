@@ -70,7 +70,10 @@ run() {   # name kind(e2e|hook:bin:cfg:units) env...
     rm -f "$log.foreign"
     # Peak summed GPU memory (MiB) over the run, sampled every 0.5 s; GPU
     # processes of other users are recorded in $log.foreign.
-    ( peak=0; while true; do m=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '{s+=$1} END {print s}'); [ "$m" -gt "$peak" ] && peak=$m && echo "$peak" > "$log.peak"
+    # Only this run's devices (MORPHEUS_GPUS of CUDA_VISIBLE_DEVICES) count.
+    local ng=$(for kv in "$@"; do case $kv in MORPHEUS_GPUS=*) echo "${kv#*=}";; esac; done | tail -1); ng=${ng:-$MORPHEUS_GPUS}
+    local devs=$(echo "$CUDA_VISIBLE_DEVICES" | cut -d, -f1-"$ng")
+    ( peak=0; while true; do m=$(nvidia-smi -i "$devs" --query-gpu=memory.used --format=csv,noheader,nounits | awk '{s+=$1} END {print s}'); [ "$m" -gt "$peak" ] && peak=$m && echo "$peak" > "$log.peak"
       for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do u=$(ps -o user= -p "$p" 2>/dev/null); [ -n "$u" ] && [ "$u" != "$USER" ] && echo "$(date +%T) $u $p" >> "$log.foreign"; done
       sleep 0.5; done ) &
     local sampler=$!
@@ -100,17 +103,36 @@ want() { [ $# -eq 0 ] && return 0; for w in $SEL; do [ "$w" = "$1" ] && return 0
 SEL="$*"
 sel() { [ -z "${SEL// /}" ] && return 0; for w in $SEL; do [ "$w" = "$1" ] && return 0; done; return 1; }
 
-sel gpt2   && run GPT-2 e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=gpt2 NUM_LAYERS=12 SEQ_LEN=128 VOCAB_SIZE=50257
-sel bert   && run BERT-Large e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=10 MODEL=bert NUM_LAYERS=24 SEQ_LEN=128
-sel llama2 && run LLaMA2-7B e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=llama2 NUM_LAYERS=32 SEQ_LEN=128 NUM_HEADS=32 HEAD_DIM=128 FFN_DIM=11008 FFN_SHARDS=1 VOCAB_SIZE=32000
-sel llama3 && run LLaMA3-8B e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=llama3 NUM_LAYERS=32 SEQ_LEN=128 NUM_HEADS=32 NUM_KV_HEADS=8 HEAD_DIM=128 FFN_DIM=14336 VOCAB_SIZE=128256
-sel gptj   && run GPT-J-6B e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=gptj NUM_LAYERS=28 SEQ_LEN=128 NUM_HEADS=16 HEAD_DIM=256 FFN_DIM=16384 VOCAB_SIZE=50400
-sel resnet && run ResNet-50 hook:bench_streaming_resnet:cv_config.yaml:1 NUM_LAYERS=53 INPUT_SIZE=224 ZK4_TABLE_SIZE_LOG=12
-sel vgg    && run VGG-16 hook:bench_streaming_vgg:cv_config.yaml:1 VGG_VARIANT=16 NUM_LAYERS=13 INPUT_SIZE=32 ZK4_TABLE_SIZE_LOG=12
-sel yolo   && run YOLOv11n hook:bench_streaming_yolo:cv_config.yaml:1 NUM_STAGES=8 INPUT_SIZE=640 ZK4_TABLE_SIZE_LOG=12
-sel unet3d && run 3D-UNet hook:bench_streaming_unet3d:cv_config.yaml:1 NUM_LAYERS=6 INPUT_D=64 INPUT_H=64 INPUT_W=64 ZK4_TABLE_SIZE_LOG=12
-sel pointpillars && run PointPillars hook:bench_streaming_pointpillar:cv_config.yaml:1 NX=432 NY=496 N_PILLARS=12000 MAX_POINTS=32 NUM_ANCHORS=2 NUM_CLASSES=3 ZK4_TABLE_SIZE_LOG=12
-sel whisper && run Whisper hook:bench_streaming_whisper:llama2_config.yaml:1 NUM_ENC_LAYERS=4 NUM_DEC_LAYERS=4 N_MELS=80 N_AUDIO_CTX=1500 N_TEXT_CTX=448 N_STATE=384 N_HEAD=6 ZK4_TABLE_SIZE_LOG=24
+# Per-model configurations (kind, env...), shared by the four-GPU rows and
+# the one-GPU scaling rows (g1).
+C_gpt2=(e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=gpt2 NUM_LAYERS=12 SEQ_LEN=128 VOCAB_SIZE=50257)
+C_bert=(e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=10 MODEL=bert NUM_LAYERS=24 SEQ_LEN=128)
+# The 6B-8B LLMs at full width and vocabulary, LLM_LAYERS of their layers:
+# the full models' witnesses exceed host memory (~30 GB per layer).
+LL=${LLM_LAYERS:-4}
+C_llama2=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=llama2 NUM_LAYERS=$LL SEQ_LEN=128 NUM_HEADS=32 HEAD_DIM=128 FFN_DIM=11008 FFN_SHARDS=1 VOCAB_SIZE=32000)
+C_llama3=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=llama3 NUM_LAYERS=$LL SEQ_LEN=128 NUM_HEADS=32 NUM_KV_HEADS=8 HEAD_DIM=128 FFN_DIM=14336 VOCAB_SIZE=128256)
+C_gptj=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=gptj NUM_LAYERS=$LL SEQ_LEN=128 NUM_HEADS=16 HEAD_DIM=256 FFN_DIM=16384 VOCAB_SIZE=50400)
+C_resnet=(hook:bench_streaming_resnet:cv_config.yaml:1 NUM_LAYERS=53 INPUT_SIZE=224 ZK4_TABLE_SIZE_LOG=12)
+C_vgg=(hook:bench_streaming_vgg:cv_config.yaml:1 VGG_VARIANT=16 NUM_LAYERS=13 INPUT_SIZE=32 ZK4_TABLE_SIZE_LOG=12)
+# YOLOv11n at 320x320 (640x640 needs ~1,860 sources: the exact SiLU range checks).
+C_yolo=(hook:bench_streaming_yolo:cv_config.yaml:1 NUM_STAGES=8 INPUT_SIZE=${YOLO_INPUT:-320} ZK4_TABLE_SIZE_LOG=12)
+C_unet3d=(hook:bench_streaming_unet3d:cv_config.yaml:1 NUM_LAYERS=6 INPUT_D=64 INPUT_H=64 INPUT_W=64 ZK4_TABLE_SIZE_LOG=12 REQ_PLANES_LOG=5)
+# PointPillars on a 64x64 grid with 1,024 pillars: exact private grid routing
+# is O(pillars x grid cells) (432x496 with 12,000 pillars needs ~9e11 cells).
+# Its graph masks need more than 16 slots per node (2^19 in all).
+C_pointpillars=(hook:bench_streaming_pointpillar:cv_config.yaml:1 NX=64 NY=64 N_PILLARS=1024 MAX_POINTS=32 NUM_ANCHORS=2 NUM_CLASSES=3 ZK4_TABLE_SIZE_LOG=12 MORPHEUS_GRID_ROUTING_MAX_CELLS=2147483648 SLOTS_LOG=19)
+# Whisper-tiny (4+4 layers, full width) on a 10 s window: WHISPER_CTX (500)
+# audio frames instead of 1,500. The exact softmax range checks grow with
+# the square of the context; at 1,500 frames even a 2+2-layer request
+# exceeds 905 GB of host memory.
+C_whisper=(hook:bench_streaming_whisper:llama2_config.yaml:1 NUM_ENC_LAYERS=4 NUM_DEC_LAYERS=4 N_MELS=80 N_AUDIO_CTX=${WHISPER_CTX:-500} N_TEXT_CTX=448 N_STATE=384 N_HEAD=6 ZK4_TABLE_SIZE_LOG=24)
+MODELS=(gpt2:GPT-2 bert:BERT-Large llama2:LLaMA2-7B llama3:LLaMA3-8B gptj:GPT-J-6B resnet:ResNet-50 vgg:VGG-16 yolo:YOLOv11n unet3d:3D-UNet pointpillars:PointPillars whisper:Whisper)
+cfg() { local v="C_$1[@]"; printf '%s\0' "${!v}"; }
+for mn in "${MODELS[@]}"; do
+  k=${mn%%:*}; sel "$k" || continue
+  mapfile -d '' c < <(cfg "$k"); run "${mn#*:}" "${c[@]}"
+done
 
 # ---- Comparisons (selected explicitly, never part of the default set) ----
 # DeepProve-matched configurations (scripts/bench/deepprove): GPT-2 and
@@ -129,28 +151,28 @@ done
 # DeepProve's GPU build uses one GPU, so the comparison runs Morpheus on one
 # GPU, for GPT-2 only.
 G1=(MORPHEUS_GPUS=1 MORPHEUS_AUTH_GPUS=1)
-want_x dp1 && MODES=mono && for s in 32 128; do
+{ want_x dp1 || want_x dp1s32 || want_x dp1s128; } && MODES=mono && for s in 32 128; do
+  { want_x dp1 || want_x dp1s$s; } || continue
   run GPT-2_s${s}_g1 e2e "${TW[@]}" "${G1[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=gpt2 NUM_LAYERS=12 SEQ_LEN=$s VOCAB_SIZE=50257
 done
 # DeepProve's own CNNs (zkml/assets/scripts) with their trained weights and
 # first input at scale 2^8 (scripts/bench/deepprove/export_cnn.py). COVID:
 # the final sigmoid dropped and the last layer padded to 10 zero-extended
 # logits, as DeepProve needs to prove it (covid10.onnx).
-CNNFX=${CNNFX:-/scratch/bjchen4_icgpu/goldilocks/deepprove_src/cnn_fixtures}
+# Fixtures from scripts/bench/deepprove/prepare_cnn.sh <work_dir>.
+CNNFX=${CNNFX:-${DP_WORK:-deepprove_work}/cnn_fixtures}
 { want_x dp1 || want_x dp1cnn; } && MODES=mono run CIFAR-LeNet_g1 hook:bench_deepprove_cnn:cv_config.yaml:1 "${G1[@]}" CNN_FIXTURE=$CNNFX/cifar.json ZK4_TABLE_SIZE_LOG=16
 { want_x dp1 || want_x dp1cnn; } && MODES=mono run COVID-CNN_g1 hook:bench_deepprove_cnn:cv_config.yaml:1 "${G1[@]}" CNN_FIXTURE=$CNNFX/covid10.json ZK4_TABLE_SIZE_LOG=20 REQ_PLANES_LOG=5
 # Source-sharding scaling: the same monolithic requests on one GPU (models
 # whose sources fit one device; the LLMs need the memory of four).
-want_x g1 && MODES=mono && {
-  run GPT-2_g1 e2e "${TW[@]}" "${G1[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=gpt2 NUM_LAYERS=12 SEQ_LEN=128 VOCAB_SIZE=50257
-  run BERT-Large_g1 e2e "${TW[@]}" "${G1[@]}" ZK4_TABLE_SIZE_LOG=10 MODEL=bert NUM_LAYERS=24 SEQ_LEN=128
-  run ResNet-50_g1 hook:bench_streaming_resnet:cv_config.yaml:1 "${G1[@]}" NUM_LAYERS=53 INPUT_SIZE=224 ZK4_TABLE_SIZE_LOG=12
-  run VGG-16_g1 hook:bench_streaming_vgg:cv_config.yaml:1 "${G1[@]}" VGG_VARIANT=16 NUM_LAYERS=13 INPUT_SIZE=32 ZK4_TABLE_SIZE_LOG=12
-  run YOLOv11n_g1 hook:bench_streaming_yolo:cv_config.yaml:1 "${G1[@]}" NUM_STAGES=8 INPUT_SIZE=640 ZK4_TABLE_SIZE_LOG=12
-  run 3D-UNet_g1 hook:bench_streaming_unet3d:cv_config.yaml:1 "${G1[@]}" NUM_LAYERS=6 INPUT_D=64 INPUT_H=64 INPUT_W=64 ZK4_TABLE_SIZE_LOG=12
-  run PointPillars_g1 hook:bench_streaming_pointpillar:cv_config.yaml:1 "${G1[@]}" NX=432 NY=496 N_PILLARS=12000 MAX_POINTS=32 NUM_ANCHORS=2 NUM_CLASSES=3 ZK4_TABLE_SIZE_LOG=12
-  run Whisper_g1 hook:bench_streaming_whisper:llama2_config.yaml:1 "${G1[@]}" NUM_ENC_LAYERS=4 NUM_DEC_LAYERS=4 N_MELS=80 N_AUDIO_CTX=1500 N_TEXT_CTX=448 N_STATE=384 N_HEAD=6 ZK4_TABLE_SIZE_LOG=24
-}
+# One-GPU scaling rows (g1): the same configurations on one device. The
+# 6B-8B LLMs are left out (one GPU cannot hold their four-layer requests).
+# G1_MODELS (e.g. "yolo unet3d") restricts the set.
+want_x g1 && MODES=mono && for mn in "${MODELS[@]}"; do
+  k=${mn%%:*}; case $k in llama2|llama3|gptj) continue;; esac
+  [ -n "${G1_MODELS:-}" ] && [[ " $G1_MODELS " != *" $k "* ]] && continue
+  mapfile -d '' c < <(cfg "$k"); run "${mn#*:}_g1" "${c[@]}" "${G1[@]}"
+done
 # EZKL's two reference circuits at their exported shapes, one GPU.
 want_x ezkl && MORPHEUS_GPUS=1 MORPHEUS_AUTH_GPUS=1 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*} \
   run LeNet-5 hook:bench_streaming_lenet:llama2_config.yaml:1 MORPHEUS_GPUS=1 MORPHEUS_AUTH_GPUS=1
