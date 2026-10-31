@@ -143,9 +143,13 @@ fn rank_constants(g: &DagBuilder, first: usize, shards: usize) -> Vec<[usize;3]>
     edges.chunks_exact(3).map(|e|[e[0],e[1],e[2]]).collect()
 }
 
+fn rss_gb() -> f64 { std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok())).unwrap_or(0.0) * 4096.0 / 1e9 }
 fn ar_run(name: &str, ar: Ar, seq: usize, vocab: usize, request: u64) -> Instance {
     let Ar { g, emb_sel, logits, sels, ranges, rank_constants } = ar;
+    let tr = std::env::var("MORPHEUS_RSS").is_ok();
+    if tr { eprintln!("[rss] graph built {:.1} GB", rss_gb()); }
     let (dag, mut wit) = g.compile();
+    if tr { eprintln!("[rss] compiled {:.1} GB", rss_gb()); }
     let t = Instant::now();
     let mut rng = StdRng::seed_from_u64(42 + request);
     assert!(seq > 0);
@@ -161,6 +165,7 @@ fn ar_run(name: &str, ar: Ar, seq: usize, vocab: usize, request: u64) -> Instanc
         wit[emb_sel] = vec![DagBuilder::build_one_hot_selector_witness(seq, vocab, &tokens, Role::Input)];
         dag.run(&mut wit, &[]);
         passes += 1;
+        if tr { eprintln!("[rss] pass {passes} {:.1} GB", rss_gb()); }
         let mut changed = false;
         for position in prompt_len..seq {
             let (mut best, mut value) = (0usize, i128::MIN);
@@ -175,6 +180,7 @@ fn ar_run(name: &str, ar: Ar, seq: usize, vocab: usize, request: u64) -> Instanc
         if !changed { break; }
     }
     eprintln!("[generate] {} suffix tokens in {passes} forward passes", seq - prompt_len);
+    if std::env::var("MORPHEUS_RSS").is_ok() { eprintln!("[rss] after generation {:.1} GB", std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok())).unwrap_or(0.0) * 4096.0 / 1e9); }
     if std::env::var("MORPHEUS_GEN_CHECK").is_ok() {
         // Reference: one position per forward pass.
         let mut seq_tokens = tokens.clone();

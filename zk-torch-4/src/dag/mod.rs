@@ -858,6 +858,10 @@ impl Dag {
             let _ = almost_goldilocks_cuda::set_device(devices[0]);
         } else {
             let prof = std::env::var("ZKT_RUN_PROFILE").ok().as_deref() == Some("1");
+            // MORPHEUS_RSS=1: name the nodes whose run grows the process by > 1 GB.
+            let rss_trace = std::env::var("MORPHEUS_RSS").is_ok();
+            let rss = || -> f64 { std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok())).unwrap_or(0.0) * 4096.0 / 1e9 };
+            let mut last_rss = if rss_trace { rss() } else { 0.0 };
             let mut prof_map: std::collections::BTreeMap<String, (std::time::Duration, usize)> =
                 std::collections::BTreeMap::new();
             for level in &self.topo_levels {
@@ -878,6 +882,7 @@ impl Dag {
                     for (&eid, out) in node.outputs.iter().zip(outs.into_iter()) {
                         witnesses[eid] = vec![out];
                     }
+                    if rss_trace { let r = rss(); if r - last_rss > 1.0 { eprintln!("[rss] node {nid} {:.60} +{:.1} GB -> {:.1} GB", format!("{:?}", node.kind), r - last_rss, r); } last_rss = r; }
                 } else {
                     let results: Vec<(NodeId, Vec<Witness>, String, std::time::Duration)> = level
                         .par_iter()
@@ -905,6 +910,7 @@ impl Dag {
                             witnesses[eid] = vec![out];
                         }
                     }
+                    if rss_trace { let r = rss(); if r - last_rss > 1.0 { eprintln!("[rss] level of {} nodes (first {:.60}) +{:.1} GB -> {:.1} GB", level.len(), format!("{:?}", self.nodes[level[0]].kind), r - last_rss, r); } last_rss = r; }
                 }
             }
             if prof {
