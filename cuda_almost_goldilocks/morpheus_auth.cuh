@@ -169,7 +169,71 @@ __global__ void __launch_bounds__(512) combine_multi_kernel(const int8_t* const*
     }
 }
 
-/// Wire codec of the responses: v ∈ (−B_Z, B_Z) is sent as the 37-bit/// Wire codec of the responses: v ∈ (−B_Z, B_Z) is sent as the 37-bit
+/// combine_multi_kernel with packed int8 dot products. For lane position j
+/// the column's negacyclic sequence is ext[p] = −x_p (p < 64), x_{p−64}
+/// (p ≥ 64), x_t = V[j + 64t], and output k is
+///   y_k = Σ_m β_m ext[k − m + 64] = Σ_u βr[u] ext[k + 1 + u],  βr[u] = β[63 − u],
+/// a 64-byte window: 16 __dp4a per row. Four byte-shifted, word-packed copies
+/// E[sh][w][j] = ext[4w + sh .. 4w + sh + 3] make every window word-aligned.
+__global__ void __launch_bounds__(512) combine_dp4a_kernel(const int8_t* const* __restrict__ Vp, int nsrc, int cols,
+                                                           const int8_t* __restrict__ beta, int64_t* __restrict__ Z0, int64_t* __restrict__ Z1) {
+    __shared__ __align__(16) int8_t s[4096];
+    __shared__ int E[4][33][64];
+    __shared__ int Br[2][16];
+    const int tid = threadIdx.x, j = tid & 63, k0 = tid >> 6;
+    for (int l = blockIdx.x; l < cols; l += gridDim.x) {
+        int a0[8], a1[8];
+#pragma unroll
+        for (int q = 0; q < 8; q++) { a0[q] = 0; a1[q] = 0; }
+        for (int e = 0; e < nsrc; e++) {
+            const int8_t* col = Vp[e] + (size_t)l * 4096;
+            reinterpret_cast<long long*>(s)[tid] = __ldg(reinterpret_cast<const long long*>(col) + tid);
+            if (tid < 32) {
+                // Reversed rows packed: word w = βr[4w .. 4w+3], βr[u] = β[63 − u].
+                const int r = tid >> 4, w = tid & 15;
+                const int8_t* bb = beta + (size_t)e * 128 + r * 64;
+                Br[r][w] = (int)((uint32_t)(uint8_t)bb[63 - 4 * w] | ((uint32_t)(uint8_t)bb[62 - 4 * w] << 8)
+                               | ((uint32_t)(uint8_t)bb[61 - 4 * w] << 16) | ((uint32_t)(uint8_t)bb[60 - 4 * w] << 24));
+            }
+            __syncthreads();
+            // E[sh][w][j] for w < 33 (window words up to index 32 when sh > 0).
+            for (int t = tid; t < 4 * 33 * 64; t += 512) {
+                const int jj = t & 63, w = (t >> 6) % 33, sh = t / (33 * 64);
+                uint32_t word = 0;
+#pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const int p = 4 * w + sh + b;
+                    int v = 0;
+                    if (p < 64) v = -s[jj + 64 * p];
+                    else if (p < 128) v = s[jj + 64 * (p - 64)];
+                    word |= (uint32_t)(uint8_t)(int8_t)v << (8 * b);
+                }
+                E[sh][w][jj] = (int)word;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                const int st = k0 + 8 * q + 1, sh = st & 3, w0 = st >> 2;
+                int x0 = a0[q], x1 = a1[q];
+#pragma unroll
+                for (int w = 0; w < 16; w++) {
+                    const int ev = E[sh][w0 + w][j];
+                    x0 = __dp4a(ev, Br[0][w], x0);
+                    x1 = __dp4a(ev, Br[1][w], x1);
+                }
+                a0[q] = x0; a1[q] = x1;
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            const size_t i = (size_t)l * 4096 + tid + 512 * q;
+            Z0[i] += a0[q]; Z1[i] += a1[q];
+        }
+    }
+}
+
+/// Wire codec of the responses: v ∈ (−B_Z, B_Z) is sent as the 37-bit
 /// unsigned u = v + (B_Z − 1), LSB first, eight coefficients per 37 bytes.
 __global__ void pack37_kernel(const int64_t* __restrict__ z, u64 groups, int64_t off, uint8_t* __restrict__ out) {
     for (u64 g = blockIdx.x * (u64)blockDim.x + threadIdx.x; g < groups; g += (u64)gridDim.x * blockDim.x) {

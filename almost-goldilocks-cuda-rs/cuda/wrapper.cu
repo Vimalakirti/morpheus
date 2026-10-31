@@ -3248,7 +3248,8 @@ int agl_mauth_combine_multi(const int8_t* const* h_V, int nsrc, int cols, const 
     cudaMemcpy(db, tmp.data(), pb + bb, cudaMemcpyHostToDevice);
     int blocks = ma_sms() * 4;
     if (blocks > cols) blocks = cols;
-    mauth::combine_multi_kernel<<<blocks, 512>>>((const int8_t* const*)db, nsrc, cols, (const int8_t*)((char*)db + pb), d_Z0, d_Z1);
+    if (getenv("MORPHEUS_COMBINE_SCALAR")) mauth::combine_multi_kernel<<<blocks, 512>>>((const int8_t* const*)db, nsrc, cols, (const int8_t*)((char*)db + pb), d_Z0, d_Z1);
+    else mauth::combine_dp4a_kernel<<<blocks, 512>>>((const int8_t* const*)db, nsrc, cols, (const int8_t*)((char*)db + pb), d_Z0, d_Z1);
     cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) e = agl_sync_mine();
     cuda_free(db);
