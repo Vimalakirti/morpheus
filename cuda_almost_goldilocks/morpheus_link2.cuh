@@ -179,10 +179,12 @@ __global__ void __launch_bounds__(256) onehot_kernel(
 /// Reduced mode (blockDim 96): warps evaluate t = 0, 2, 3 (range) and t = 0, 2
 /// (query); the host gets t = 1 from the previous round's claims.
 constexpr int GCH = 128;
-template <int MINB>
+/// MODE (specialised by block kind, each launched over its own index list):
+/// 0 range only (no query), 1 range + fast query, 2 range + general query.
+template <int MINB, int MODE>
 __global__ void __launch_bounds__(160, MINB) generic_kernel(
     const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i, int d, int reduced_dbg,
-    const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
+    const Blk* __restrict__ blks, const uint32_t* __restrict__ list, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
     const K8d* __restrict__ e_pre, const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
 {
     // Debug (timing only; results wrong): bit 1 skips range evaluation, bit 2 the query.
@@ -200,7 +202,8 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
     const u64 tq = (u64)t;
     K8d acc_r = kzero(), acc_q = kzero();
     if (threadIdx.x == 0) s_cnt = 0;
-    for (uint32_t bi = blockIdx.x; bi < nblk; bi += gridDim.x) {
+    for (uint32_t li = blockIdx.x; li < nblk; li += gridDim.x) {
+        const uint32_t bi = list[li];
         const Blk b = blks[bi];
         if (threadIdx.x == 0) {
             uint32_t fl = 0; int tc = 0; uint32_t toff = 0, qdo = 0;
@@ -227,7 +230,7 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
         //   S_side[T][pr] = Σ_ir B_T[ir]·w_side(ir, pr)  (t-independent).
         // A thread's rests are ≡ threadIdx (mod blockDim), so its pr is fixed.
         const int pa = s_pa;
-        const bool fastq = qd == 0xffffffffu && tcnt > 0 && tcnt <= 2 && pa <= 3 && !(dbg & 2);
+        const bool fastq = MODE == 1 && !(dbg & 2);
         K8d S00 = kzero(), S01 = kzero(), S10 = kzero(), S11 = kzero();   // S{term}{side}
         for (int c0 = 0; c0 < nrest; c0 += GCH) {
             const int cp = nrest - c0 < GCH ? nrest - c0 : GCH, cy = 2 * cp, y0 = 2 * c0;
@@ -292,7 +295,7 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
                 }
             }
             // Query weights of the compacted pairs at t = 0, 1.
-            if ((qd != 0xffffffffu || tcnt > 0) && !(dbg & 2) && !fastq) {
+            if (MODE == 2 && (qd != 0xffffffffu || tcnt > 0) && !(dbg & 2)) {
                 for (int j = threadIdx.x; j < cnt; j += blockDim.x) {
                     const int rest = c0 + nz[j];
                     K8d q0 = qd != 0xffffffffu ? C.qd[qd + 2 * rest] : kzero();
@@ -308,7 +311,7 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
                 }
                 __syncthreads();
             }
-            const bool hasq = (qd != 0xffffffffu || tcnt > 0) && doq && !(dbg & 2) && !fastq;
+            const bool hasq = MODE == 2 && (qd != 0xffffffffu || tcnt > 0) && doq && !(dbg & 2);
             {
                 for (int j = lane; j < cnt; j += 32) {
                     const int rl = nz[j], rest = c0 + rl;

@@ -3298,7 +3298,7 @@ int agl_mlink2_consts(const void* d_blks, uint32_t nblk, const void* h_consts, u
 }
 
 int agl_mlink2_round(const int8_t* d_raw, uint64_t src_len, int b0, int i, int d, int reduced, const void* h_consts,
-                     const void* d_onehot, uint32_t n_onehot, const void* d_generic, uint32_t n_generic, const uint64_t* d_bc,
+                     const void* d_onehot, uint32_t n_onehot, const void* d_generic, const uint32_t* const* d_lists, const uint32_t* n_lists, const uint64_t* d_bc,
                      const uint64_t* d_e1, const uint64_t* d_e2, const uint64_t* d_e3, const uint64_t* d_ealpha,
                      int skip_range, uint64_t* h_out) {
     if (d > mlink2::MAXD) return -3;
@@ -3316,16 +3316,16 @@ int agl_mlink2_round(const int8_t* d_raw, uint64_t src_len, int b0, int i, int d
         if (e != cudaSuccess) { cuda_free(part); return -(int)e; }
         ml2_sum(part, grid, tmp.data()); add_into(); cuda_free(part);
     }
-    if (n_generic > 0) {
+    for (int mode = 0; mode < 3; mode++) {
+        const uint32_t n_generic = n_lists[mode];
+        if (n_generic == 0) continue;
         int grid = sms * 16; if ((uint32_t)grid > n_generic) grid = (int)n_generic;
         void* part = nullptr; if (cuda_malloc(&part, (size_t)grid * mlink2::NACC * 64)) return -1;
         cudaMemset(part, 0, (size_t)grid * mlink2::NACC * 64);
         const char* gd = getenv("MORPHEUS_DBG_GEN");
         const int dbg = (gd ? atoi(gd) : 0) | (skip_range ? 1 : 0);
-        const char* gm = getenv("MORPHEUS_GEN_MINB");
-        const int minb = gm ? atoi(gm) : 2;
-        auto gk = minb == 1 ? mlink2::generic_kernel<1> : minb == 3 ? mlink2::generic_kernel<3> : minb == 4 ? mlink2::generic_kernel<4> : mlink2::generic_kernel<2>;
-        gk<<<grid, reduced ? 96 : 32 * (d + 1)>>>(d_raw, src_len, b0, i, d, (reduced ? 1 : 0) | (dbg << 1), (const mlink2::Blk*)d_generic, n_generic, C, (const mauth::K8d*)d_bc,
+        auto gk = mode == 0 ? mlink2::generic_kernel<2, 0> : mode == 1 ? mlink2::generic_kernel<2, 1> : mlink2::generic_kernel<2, 2>;
+        gk<<<grid, reduced ? 96 : 32 * (d + 1)>>>(d_raw, src_len, b0, i, d, (reduced ? 1 : 0) | (dbg << 1), (const mlink2::Blk*)d_generic, d_lists[mode], n_generic, C, (const mauth::K8d*)d_bc,
             (const mauth::K8d*)d_e1, (const mauth::K8d*)d_ealpha, (mauth::K8d*)part);
         cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
         if (e != cudaSuccess) { cuda_free(part); return -(int)e; }

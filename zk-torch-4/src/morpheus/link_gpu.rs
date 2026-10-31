@@ -510,7 +510,7 @@ fn phases_v2_body<'u>(
                     qd: up_k(if qt_g.is_empty() || fac_p.is_some() { &[K8::ZERO] } else { &qt_g }), qdl: None, qdl_len: if fac_p.is_some() { 0 } else { qt_g.len() },
                     fac: fac_p.map(|_| (qt_g.clone(), tp_g.clone())), bdev: None, b_round: None,
                     qidx: DeviceBuffer::from_slice(if qi_g.is_empty() { &[0u32][..] } else { &qi_g }).unwrap(),
-                    gen_base: gen_base.len(), oh: oh_g, gen_all: upload(&gen_all),
+                    gen_base: gen_base.len(), oh: oh_g, gen_all: upload(&gen_all), gen_all_h: gen_all.clone(),
                     bc: DeviceBuffer::<u64>::new(bc_len.max(1) * 8).unwrap(), bco: DeviceBuffer::from_slice(if bco.is_empty() { &[0u64][..] } else { &bco }).unwrap(), ca_lo_bits,
                 };
                 let d_t0 = upload(terms_c);
@@ -1140,7 +1140,7 @@ struct Shard {
     fac: Option<(Vec<K8>, Vec<u32>)>,
     /// Device B tables (current, scratch) and the round they hold.
     bdev: Option<(DeviceBuffer<u64>, DeviceBuffer<u64>)>, b_round: Option<usize>,
-    gen_base: usize, oh: Vec<Blk>, gen_all: DeviceBuffer<u8>, bc: DeviceBuffer<u64>, bco: DeviceBuffer<u64>, ca_lo_bits: usize,
+    gen_base: usize, oh: Vec<Blk>, gen_all: DeviceBuffer<u8>, gen_all_h: Vec<Blk>, bc: DeviceBuffer<u64>, bco: DeviceBuffer<u64>, ca_lo_bits: usize,
 }
 
 impl Shard {
@@ -1217,10 +1217,26 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
         let v = kvec(&o7);
         vec![v[0], K8::ZERO, v[2], v[3], K8::ZERO, v[4], K8::ZERO, v[6], K8::ZERO, K8::ZERO]
     } else {
+        // Generic blocks by kind (specialised kernels): 0 no query, 1 fast
+        // query (≤ 2 terms, 2^pa ≤ 8, no dense table), 2 general. Blocks
+        // without a query have nothing to do when the range is binned.
+        let mut lists: [Vec<u32>; 3] = Default::default();
+        for (bi, b) in sh.gen_all_h[..n_gen].iter().enumerate() {
+            let mode = if b.region == u32::MAX { 0 } else {
+                let r = &regions_c[b.region as usize];
+                let pa = if i < r.p as usize { r.p as usize - i - 1 } else { 0 };
+                if r.flags & 4 != 0 { 2 } else if r.tcnt == 0 { 0 } else if r.tcnt <= 2 && pa <= 3 { 1 } else { 2 }
+            };
+            if mode == 0 && rin.skip_range { continue; }
+            lists[mode].push(bi as u32);
+        }
+        let d_lists: Vec<DeviceBuffer<u32>> = lists.iter().map(|l| DeviceBuffer::from_slice(if l.is_empty() { &[0u32][..] } else { l }).unwrap()).collect();
+        let lptr: Vec<*const u32> = d_lists.iter().map(|b| b.as_ptr() as *const u32).collect();
+        let lcnt: Vec<u32> = lists.iter().map(|l| l.len() as u32).collect();
         let mut out = vec![0u64; 8 * 10];
         let rc = unsafe {
             ffi::agl_mlink2_round(raw_ptr, rin.src_len, b0 as i32, i as i32, d as i32, rin.reduced as i32, &consts as *const ConstsC as *const c_void,
-                std::ptr::null(), 0, sh.gen_all.as_ptr() as *const c_void, n_gen as u32, sh.bc.as_ptr(),
+                std::ptr::null(), 0, sh.gen_all.as_ptr() as *const c_void, lptr.as_ptr(), lcnt.as_ptr(), sh.bc.as_ptr(),
                 dptr(&d_e1) as *const u64, dptr(&d_e2) as *const u64, dptr(&d_e3) as *const u64, dptr(&d_ea) as *const u64, rin.skip_range as i32, out.as_mut_ptr())
         };
         assert_eq!(rc, 0, "link v2 round {i} failed");
