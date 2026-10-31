@@ -241,6 +241,7 @@ impl LinkServices for PcsGpu {
         };
         // Per source in parallel (device 0: the PCS device of this process).
         let u: Vec<AElem> = (0..n).into_par_iter().map(|e| { dev0(); a_from(&uniform_q_gpu(coins, Purpose::LinkPayload, owner(e), 0, 512)) }).collect();
+        let t_u = t.elapsed().as_secs_f64();
         let r_cols = (0..n).into_par_iter().map(|e| {
             dev0();
             // Moves, not `concat` (which clones every column).
@@ -249,6 +250,8 @@ impl LinkServices for PcsGpu {
             v.extend(tern_cols(Purpose::LinkError, owner(e), p.rank));
             v
         }).collect();
+        let t_r = t.elapsed().as_secs_f64();
+        if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] masks: u {:.2} s, r columns {:.2} s", t_u, t_r - t_u); }
         let aq = uniform_q_gpu(coins, Purpose::AuxPayload, opening, 0, p.aux_coeffs * 512);
         let a_aux: Vec<AElem> = aq.chunks(512).map(a_from).collect();
         let mut s_o: Vec<Vec<i64>> = a_aux.iter().flat_map(enc).collect();

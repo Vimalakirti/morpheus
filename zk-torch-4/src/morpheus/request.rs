@@ -134,6 +134,7 @@ pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &
     if need > o.cfg.slots_log { o.cfg.slots_log = need; }
     let t = Instant::now();
     let mut g = Graph::new(dag, wit, o.cfg.clone());
+    let t_graph = t.elapsed().as_secs_f64();
     for &e in public {
         let values = piop::witness_vals(&wit[e][0]);
         if let Some(fixed) = g.public.get(&e) { assert_eq!(fixed, &values, "conflicting public input binding"); }
@@ -148,7 +149,9 @@ pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &
     // A registered model identifies all declared parameters, including those
     // consumed only by advice. Keeping them private does not repair that advice.
     for e in 0..dag.num_edges() { if g.model[e] { g.committed[e] = true; } }
+    let t_pd0 = t.elapsed().as_secs_f64();
     let pd = ProverData::new(&g, wit, Vec::new());
+    let t_pd = t.elapsed().as_secs_f64();
     let specs = piop::tensor_specs(&g, &pd);
     // Never co-pack immutable inputs/model with proof-local masks/selectors.
     let (mut m, mut x, mut r) = (Vec::new(), Vec::new(), Vec::new());
@@ -165,6 +168,7 @@ pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &
         let end = lay.n_sources;
         (lay, rg[0].clone(), rg[1].clone(), rg[2].clone(), end..end)
     };
+    if o.timing { eprintln!("[prep] graph {:.2} s, public/prune {:.2} s, prover data {:.2} s, specs + layout {:.2} s", t_graph, t_pd0 - t_graph, t_pd - t_pd0, t.elapsed().as_secs_f64() - t_pd); }
     if o.timing { eprintln!("[prep] graph + prover data + layout {:.2}s: model {:?}, input {:?}, fresh request {:?}, carry {:?}", t.elapsed().as_secs_f64(), model, input, req, carry); }
     Prepared { g, pd, lay, model, input, req, carry, specs, ar: None }
 }
