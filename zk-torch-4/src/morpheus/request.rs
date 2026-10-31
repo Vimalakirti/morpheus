@@ -514,13 +514,19 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         sc.spawn(move || pdr.prefetch());
         let t = Instant::now();
         let mut raw = piop::fill_sources_in(g, pd, lay, ell, req.clone());
+        let t_fs = t.elapsed().as_secs_f64();
         fill_suffixes(&o.profile, &o.coins, &mut raw, &|e| req_owner(j, e));
-        raw = input.raw.iter().cloned().chain(raw).collect();
+        let t_sx = t.elapsed().as_secs_f64();
+        // Copies in parallel (fresh GB-scale buffers fault their pages; one
+        // thread per source).
+        let par_clone = |v: &[Vec<i8>]| -> Vec<Vec<i8>> { v.par_iter().cloned().collect() };
+        raw = par_clone(&input.raw).into_iter().chain(raw).collect();
         if !defer {
             // Preserve the registered model's payload AND hiding suffix. Only
             // request sources above receive fresh masks/suffixes.
-            raw = model.raw.iter().cloned().chain(raw).collect();
+            raw = par_clone(&model.raw).into_iter().chain(raw).collect();
         }
+        if o.timing { eprintln!("[fill] sources {:.2} s, suffixes {:.2} s, model/input copies {:.2} s", t_fs, t_sx - t_fs, t.elapsed().as_secs_f64() - t_sx); }
         lap(&mut times, "fill", t);
         let raw = std::sync::Arc::new(raw);
         let stream = o.streams(raw.len() + defer as usize);
