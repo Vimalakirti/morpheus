@@ -452,6 +452,28 @@ __global__ void dense_expand_kernel(const K8d* __restrict__ af, int afn, const K
     }
 }
 
+/// Round-0 per-term B tables: entry x of term s (at off[s], 2^nv[s] entries)
+/// is Π_j (bit_j(x) ? r_j : 1 − r_j) over the term's index coordinates
+/// coords[co[s] .. co[s] + nv[s]). pre[s] = Σ_{s' < s} 2^nv[s'].
+__global__ void b_build_kernel(const K8d* __restrict__ coords, const uint32_t* __restrict__ co, const uint8_t* __restrict__ nv,
+                               const uint32_t* __restrict__ off, const uint64_t* __restrict__ pre, uint32_t nseg, uint64_t total,
+                               K8d* __restrict__ out)
+{
+    for (uint64_t g = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; g < total; g += (uint64_t)gridDim.x * blockDim.x) {
+        uint32_t lo = 0, hi = nseg;
+        while (hi - lo > 1) { const uint32_t m = (lo + hi) >> 1; if (pre[m] <= g) lo = m; else hi = m; }
+        const uint32_t x = (uint32_t)(g - pre[lo]);
+        const K8d* r = coords + co[lo];
+        K8d acc = kzero(); acc.c[0] = 1;
+        for (int j = 0; j < nv[lo]; j++) {
+            K8d f;
+            if ((x >> j) & 1) f = r[j]; else { f = kzero(); f.c[0] = 1; f = ksub(f, r[j]); }
+            acc = j == 0 ? f : kmul(acc, f);
+        }
+        out[off[lo] + x] = kcanon(acc);
+    }
+}
+
 /// Index-round step of the per-term B tables: dst[off_s + y] = src[off_s + 2y]
 /// + src[off_s + 2y + 1] for y < len_s (eq tables over the remaining index
 /// bits: summing out the bound bit). pre[s] = Σ_{s' < s} len_{s'}.

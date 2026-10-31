@@ -544,13 +544,27 @@ fn phases_v2_body<'u>(
     // Round-5 B tables of the binned terms (eq over index bits 2.., 32 entries), by compact slot.
     let mut b5 = vec![K8::ZERO; (n_ohw as usize).max(1) * 32];
     for &(k, kw) in &bin_terms { b5[kw * 32..(kw + 1) * 32].copy_from_slice(&eq_table(&terms[order[k]].r[2..7])); }
-    // Fixed device offsets of the per-term B tables (round-0 sizes).
+    // Fixed device offsets of the per-term B tables (round-0 sizes), and
+    // their round-0 contents as eq tables over the index coordinates (built
+    // on the device: `b_build_kernel`). Round 0 binds a plane bit (p > 0) or
+    // index bit 0 (p = 0).
     let mut boff0 = vec![0u32; order.len()];
     let mut b_total = 0usize;
+    let mut bseg = BSeg::default();
     for (k, &t) in order.iter().enumerate() {
         boff0[k] = b_total as u32;
         let r = &regs[treg[t]];
-        if !(r.p > DENSE_P || r.terms.len() > 32) { b_total += 1usize << (b0 - r.p); }
+        if !(r.p > DENSE_P || r.terms.len() > 32) {
+            let idx_bits = b0 - r.p;
+            let s0 = if r.p > 0 { 0 } else { 1 };
+            bseg.co.push((bseg.coords.len() / 8) as u32);
+            bseg.nv.push((idx_bits - s0) as u8);
+            bseg.off.push(boff0[k]);
+            bseg.pre.push(bseg.total);
+            bseg.total += 1u64 << (idx_bits - s0);
+            bseg.coords.extend(terms[t].r[s0..idx_bits].iter().flat_map(|x| x.0));
+            b_total += 1usize << idx_bits;
+        }
     }
     // Round-1 range sums of the generic blocks from digit classes (`range_bin1_kernel`).
     let rb1 = b0 >= 3 && std::env::var("MORPHEUS_NO_RB1").is_err();
@@ -570,7 +584,7 @@ fn phases_v2_body<'u>(
         // pairwise sums when a term's index bit is bound (`b_halve_kernel`).
         let tabs: Vec<(Vec<K8>, Vec<K8>, usize)> = order.par_iter().map(|&t| {
             if regs[treg[t]].p > DENSE_P || regs[treg[t]].terms.len() > 32 { (Vec::new(), Vec::new(), 0) }
-            else if i == 0 { term_tables(&terms[t], &xi, i, 1, b0) } else { let (a, pa) = term_a(&terms[t], &xi, i, 1, b0); (a, Vec::new(), pa) }
+            else { let (a, pa) = term_a(&terms[t], &xi, i, 1, b0); (a, Vec::new(), pa) }
         }).collect();
         let mut a_all = Vec::new();
         let mut tc = terms_c.clone();
@@ -578,13 +592,7 @@ fn phases_v2_body<'u>(
             tc[k].pa = *pa as u32; tc[k].aoff = (a_all.len()) as u32; tc[k].boff = boff0[k];
             a_all.extend_from_slice(a);
         }
-        // Round 0: B tables at their fixed offsets (written in parallel).
-        let mut b_all: Vec<K8> = Vec::new();
-        if i == 0 {
-            b_all = vec![K8::ZERO; b_total.max(1)];
-            let bp = SyncPtr(b_all.as_mut_ptr());
-            tabs.par_iter().enumerate().for_each(|(k, (_, b, _))| unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bp.get().add(boff0[k] as usize), b.len()); });
-        }
+        let b_all: Vec<K8> = Vec::new();
         // Terms whose B halves entering round i (index bit bound in round i − 1).
         let halve: Vec<(u32, u64)> = if i == 0 { Vec::new() } else {
             order.iter().enumerate().filter_map(|(k, &t)| {
@@ -606,7 +614,7 @@ fn phases_v2_body<'u>(
         //   R_{i-1}(r) = (1 − α_i) R_i(0) + α_i R_i(1),  Q_{i-1}(r) = Q_i(0) + Q_i(1).
         let reduced = d == 4 && claims.is_some() && !alpha[i].is_zero() && !no_claim;
         let use_index = reduced && (1usize << (b0 - i)) <= 128 && i >= 4 && b0 >= 9 && std::env::var("MORPHEUS_NO_INDEX").is_err();
-        let rin = RoundIn { i, d, b0, src_len, reduced, use_index, halve: &halve, b_total, r_prev: xi.last().copied(), full: false, b5: &b5, xi: &xi, fac_p, dense_pw: &dense_pw, skip_range: rb1 && i == 1, rb1, a_all: &a_all, b_all: &b_all, tc: &tc, e1: &e1, e2: &e2, e3: &e3, ea: &ea };
+        let rin = RoundIn { i, d, b0, src_len, reduced, use_index, halve: &halve, b_total, bseg: &bseg, r_prev: xi.last().copied(), full: false, b5: &b5, xi: &xi, fac_p, dense_pw: &dense_pw, skip_range: rb1 && i == 1, rb1, a_all: &a_all, b_all: &b_all, tc: &tc, e1: &e1, e2: &e2, e3: &e3, ea: &ea };
         let outs: Vec<(Vec<K8>, Option<OhSums>, Option<Vec<K8>>)> = std::thread::scope(|sc| {
             let hs: Vec<_> = shards.iter_mut().map(|sh| {
                 let (rin, regions_c, nterms) = (&rin, &regions_c, n_ohw as usize);
@@ -926,6 +934,11 @@ fn onehot_sums(
     }
 }
 
+/// Round-0 B table segments: per term its index coordinates (flattened K8
+/// words from `coords[co..]`, `nv` of them) and device offset.
+#[derive(Default)]
+struct BSeg { coords: Vec<u64>, co: Vec<u32>, nv: Vec<u8>, off: Vec<u32>, pre: Vec<u64>, total: u64 }
+
 /// The A table and pa of `term_tables` (its B table is kept on the device).
 fn term_a(t: &TermInfo, r_pre: &[K8], i: usize, d: usize, b0: usize) -> (Vec<K8>, usize) {
     let p = t.p;
@@ -1164,7 +1177,7 @@ impl Shard {
 struct RoundIn<'a> {
     i: usize, d: usize, b0: usize, src_len: u64, reduced: bool, use_index: bool, r_prev: Option<K8>, full: bool, b5: &'a [K8],
     xi: &'a [K8], fac_p: Option<usize>, dense_pw: &'a [std::sync::Arc<Vec<K8>>], skip_range: bool, rb1: bool,
-    halve: &'a [(u32, u64)], b_total: usize,
+    halve: &'a [(u32, u64)], b_total: usize, bseg: &'a BSeg,
     a_all: &'a [K8], b_all: &'a [K8], tc: &'a [TermC], e1: &'a [K8], e2: &'a [K8], e3: &'a [K8], ea: &'a [K8],
 }
 
@@ -1190,7 +1203,11 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
     let raw_ptr = sh.raw_ptr(dev_raw, rin.src_len);
     let (d_a, d_t) = (up_k(rin.a_all), upload(rin.tc));
     if i == 0 && sh.b_round.is_none() {
-        sh.bdev = Some((up_k(if rin.b_all.is_empty() { &[K8::ZERO][..] } else { rin.b_all }), DeviceBuffer::<u64>::new(rin.b_total.max(1) * 8).unwrap()));
+        let mut b = DeviceBuffer::<u64>::new(rin.b_total.max(1) * 8).unwrap();
+        let bs = rin.bseg;
+        let rc = unsafe { ffi::agl_mlink2_b_build(bs.coords.as_ptr(), (bs.coords.len() / 8) as u64, bs.co.as_ptr(), bs.nv.as_ptr(), bs.off.as_ptr(), bs.pre.as_ptr(), bs.co.len() as u32, bs.total, b.as_mut_ptr(), rin.b_total.max(1) as u64) };
+        assert_eq!(rc, 0, "B tables");
+        sh.bdev = Some((b, DeviceBuffer::<u64>::new(rin.b_total.max(1) * 8).unwrap()));
         sh.b_round = Some(0);
     } else if sh.b_round.is_some_and(|r| r < i) {
         let (src, dst) = sh.bdev.as_mut().unwrap();

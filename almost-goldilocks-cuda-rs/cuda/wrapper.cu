@@ -3482,6 +3482,25 @@ int agl_mlink2_range_bin1(const int8_t* d_raw, uint64_t src_len, int b0, const v
     return (int)e;
 }
 
+int agl_mlink2_b_build(const uint64_t* h_coords, uint64_t ncoords, const uint32_t* h_co, const uint8_t* h_nv, const uint32_t* h_off,
+                       const uint64_t* h_pre, uint32_t nseg, uint64_t total, uint64_t* d_out, uint64_t out_k) {
+    cudaMemset(d_out, 0, out_k * 64);
+    if (nseg == 0 || total == 0) return (int)agl_sync_mine();
+    void* buf = nullptr;
+    const size_t cb = (ncoords ? ncoords : 1) * 64, sb = (size_t)nseg * (4 + 4 + 8) + nseg;
+    if (cuda_malloc(&buf, cb + sb + 64)) return -1;
+    char* p = (char*)buf;
+    cudaMemcpy(p, h_coords, ncoords * 64, cudaMemcpyHostToDevice);
+    uint32_t* d_co = (uint32_t*)(p + cb); cudaMemcpy(d_co, h_co, (size_t)nseg * 4, cudaMemcpyHostToDevice);
+    uint32_t* d_off = d_co + nseg; cudaMemcpy(d_off, h_off, (size_t)nseg * 4, cudaMemcpyHostToDevice);
+    uint64_t* d_pre = (uint64_t*)(((uintptr_t)(d_off + nseg) + 7) & ~(uintptr_t)7); cudaMemcpy(d_pre, h_pre, (size_t)nseg * 8, cudaMemcpyHostToDevice);
+    uint8_t* d_nv = (uint8_t*)(d_pre + nseg); cudaMemcpy(d_nv, h_nv, nseg, cudaMemcpyHostToDevice);
+    mlink2::b_build_kernel<<<ma_sms() * 16, 256>>>((const mauth::K8d*)p, d_co, d_nv, d_off, d_pre, nseg, total, (mauth::K8d*)d_out);
+    cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
+    cuda_free(buf);
+    return (int)e;
+}
+
 int agl_mlink2_b_halve(const uint64_t* d_src, uint64_t* d_dst, uint64_t nk, const uint32_t* d_off, const uint64_t* d_pre, uint32_t nseg, uint64_t total) {
     cudaMemcpyAsync(d_dst, d_src, nk * 64, cudaMemcpyDeviceToDevice, 0);
     if (nseg && total) mlink2::b_halve_kernel<<<ma_sms() * 16, 256>>>((const mauth::K8d*)d_src, (mauth::K8d*)d_dst, d_off, d_pre, nseg, total);
