@@ -64,7 +64,7 @@ pub fn partial(cache: &KeyCache, k: usize, x: Cols, v: usize, c: usize, colidx: 
 
 /// `partial` on a raw device range of `v·c·N` elements of `bytes` (1 or 8).
 pub fn partial_raw(cache: &KeyCache, k: usize, ptr: *const c_void, bytes: i32, v: usize, c: usize, vstride: usize, colidx: Option<&DeviceBuffer<u32>>) -> DeviceBuffer<u32> {
-    assert!(k <= cache.k && (1..=2).contains(&v));
+    assert!(k <= cache.k && (1..=8).contains(&v));
     let mut acc = DeviceBuffer::<u32>::new(v * k * cache.rows * N).expect("acc alloc");
     let idx = colidx.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
     let rc = unsafe { ffi::agl_mcommit_partial(cache.buf.as_ptr(), cache.ncols as i32, cache.rows as i32, k as i32, ptr, bytes, v as i32, c as i32, vstride as u64, idx, acc.as_mut_ptr()) };

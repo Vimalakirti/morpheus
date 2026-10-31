@@ -33,6 +33,8 @@ pub struct PcsGpu {
     /// shards here for the endpoints and the authentication.
     pub streamed: bool,
     pub kept: std::sync::Mutex<Vec<super::link_gpu::Kept>>,
+    /// Streamed request sources uploaded ahead of the link (device 0).
+    pub pre_raw: std::sync::Mutex<Option<DeviceBuffer<i8>>>,
 }
 
 fn ternary_cpu(coins: &Coins, purpose: Purpose, owner: u64, coord: u32) -> i8 {
@@ -80,7 +82,7 @@ fn i8_cols(cols: &[Vec<i64>]) -> Vec<i8> { cols.iter().flat_map(|c| c.iter().map
 impl PcsGpu {
     pub fn new(p: Profile, seed: KeySeed) -> Self {
         let keys = Keys::build(&p, &seed);
-        PcsGpu { p, seed, keys, src: Vec::new(), err: Vec::new(), flat: None, coin_ms: 0.0, commit_ms: 0.0, streamed: false, kept: std::sync::Mutex::new(Vec::new()) }
+        PcsGpu { p, seed, keys, src: Vec::new(), err: Vec::new(), flat: None, coin_ms: 0.0, commit_ms: 0.0, streamed: false, kept: std::sync::Mutex::new(Vec::new()), pre_raw: std::sync::Mutex::new(None) }
     }
 
     /// Upload the sources (raw logical order) once; physical columns are
@@ -146,7 +148,7 @@ impl PcsGpu {
     }
 
     /// Drop the resident sources (keeps the key caches).
-    pub fn unload(&mut self) { self.src.clear(); self.err.clear(); self.flat = None; self.kept.lock().unwrap().clear(); }
+    pub fn unload(&mut self) { self.src.clear(); self.err.clear(); self.flat = None; self.kept.lock().unwrap().clear(); *self.pre_raw.lock().unwrap() = None; }
 
     /// Kept shards in physical column order (in place, per source).
     pub fn kept_to_phys(&self) {
@@ -174,10 +176,29 @@ impl PcsGpu {
     pub fn commit_sources(&mut self) -> Vec<Vec<Vec<u64>>> {
         let t = std::time::Instant::now();
         let ncols = self.p.source_payload_cols + self.p.hiding;
-        let out = self.src.iter().zip(&self.err).map(|(s, e)| {
-            let acc = super::commit_gpu::partial_raw(&self.keys.w, 3, s.as_ptr() as *const c_void, 1, 1, ncols, 0, None);
-            ring_rows(finish(acc, 1, 3, self.p.rank, Some(e)).to_vec().unwrap())
-        }).collect();
+        let rank = self.p.rank;
+        // Batches of sources copied contiguously, one pass over the key cache each.
+        let n = self.src.len();
+        let bv = if n > 0 { commit_batch(ncols, self.src[0].len()) } else { 1 };
+        let mut out = Vec::with_capacity(n);
+        if n > 0 {
+            let len = self.src[0].len();
+            let el = self.err[0].len();
+            let mut tmp = DeviceBuffer::<i8>::new(len * bv.min(n)).unwrap();
+            let mut ecat = DeviceBuffer::<i64>::new(el * bv.min(n)).unwrap();
+            for s0 in (0..n).step_by(bv) {
+                let nb = bv.min(n - s0);
+                for q in 0..nb {
+                    tmp.copy_range_from_device(q * len, &self.src[s0 + q], 0, len).unwrap();
+                    ecat.copy_range_from_device(q * el, &self.err[s0 + q], 0, el).unwrap();
+                }
+                let acc = super::commit_gpu::partial_raw(&self.keys.w, 3, tmp.as_ptr() as *const c_void, 1, nb, ncols, len, None);
+                let mut e = DeviceBuffer::<i64>::new(el * nb).unwrap();
+                e.copy_range_from_device(0, &ecat, 0, el * nb).unwrap();
+                let rr = ring_rows(finish(acc, nb, 3, rank, Some(&e)).to_vec().unwrap());
+                out.extend(rr.chunks(rank).map(|c| c.to_vec()));
+            }
+        }
         self.commit_ms += t.elapsed().as_secs_f64() * 1e3;
         out
     }
@@ -198,6 +219,18 @@ impl PcsGpu {
 }
 
 fn ring_rows(v: Vec<u64>) -> Vec<Vec<u64>> { v.chunks(N).map(|c| c.to_vec()).collect() }
+
+/// Sources per commit pass (≤ MORPHEUS_COMMIT_V, default 8) that fit in the
+/// current device's free memory (driver free + allocator cache, 4 GB kept):
+/// each needs its NTT residues (3 primes) and a staged copy of `len` bytes.
+fn commit_batch(ncols: usize, len: usize) -> usize {
+    let want: usize = std::env::var("MORPHEUS_COMMIT_V").ok().and_then(|s| s.parse().ok()).unwrap_or(8).clamp(1, 8);
+    let free = almost_goldilocks_cuda::mem_get_info().map(|x| x.0).unwrap_or(0) + unsafe { ffi::agl_cached_bytes() };
+    let per = 3 * ncols * N * 4 + len + (1 << 20);
+    let b = want.min(free.saturating_sub(4usize << 30) / per).max(1);
+    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[commit] {b} sources per key pass ({:.1} GB free)", free as f64 / 1e9); }
+    b
+}
 
 impl LinkServices for PcsGpu {
     fn masks(&mut self, p: &Profile, coins: &Coins, opening: u64, n: usize) -> Masks {
@@ -238,6 +271,7 @@ impl LinkServices for PcsGpu {
     }
     fn dev_raw(&self) -> Option<&DeviceBuffer<i8>> { self.flat.as_ref() }
     fn kept(&self) -> Option<&std::sync::Mutex<Vec<super::link_gpu::Kept>>> { if self.streamed { Some(&self.kept) } else { None } }
+    fn take_pre_raw(&self) -> Option<DeviceBuffer<i8>> { self.pre_raw.lock().unwrap().take() }
     fn ev(&mut self, p: &Profile, _raw: &[Vec<i8>], xi: &[K8]) -> Vec<AElem> {
         if self.streamed {
             self.kept_to_phys();
@@ -293,19 +327,28 @@ pub fn commit_streamed_on(p: &Profile, extra: Option<(&KeySeed, &[i32])>, devs: 
                 let (lo, hi) = ((k * per).min(n), ((k + 1) * per).min(n));
                 if lo == hi { return (lo, Vec::new()); }
                 let len = raw[0].len();
-                let mut flat = DeviceBuffer::<i8>::new(len).unwrap();
-                let mut phys = DeviceBuffer::<i8>::new(len).unwrap();
                 let rank = p.rank;
                 let ncols = p.source_payload_cols + p.hiding;
-                let v = (lo..hi).map(|s| {
-                    flat.copy_from_slice(&raw[s]).unwrap();
-                    let rc = unsafe { ffi::agl_morpheus_permute(flat.as_ptr(), phys.as_mut_ptr(), len as u64) };
-                    assert_eq!(rc, 0);
-                    let e8 = phys.read_slice((len / N - rank) * N, rank * N).unwrap();
-                    let err = DeviceBuffer::from_slice(&e8.iter().map(|&v| v as i64).collect::<Vec<_>>()).unwrap();
-                    let acc = super::commit_gpu::partial_raw(wk, 3, phys.as_ptr() as *const c_void, 1, 1, ncols, 0, None);
-                    ring_rows(finish(acc, 1, 3, rank, Some(&err)).to_vec().unwrap())
-                }).collect();
+                // Up to MORPHEUS_COMMIT_V sources per pass over the key cache
+                // (multi-vector MAC: each key element read once per pass).
+                let bv = commit_batch(ncols, len);
+                let mut flat = DeviceBuffer::<i8>::new(len).unwrap();
+                let mut phys = DeviceBuffer::<i8>::new(len * bv).unwrap();
+                let mut v = Vec::with_capacity(hi - lo);
+                for s0 in (lo..hi).step_by(bv) {
+                    let nb = bv.min(hi - s0);
+                    let mut err8: Vec<i8> = Vec::with_capacity(nb * rank * N);
+                    for q in 0..nb {
+                        flat.copy_from_slice(&raw[s0 + q]).unwrap();
+                        let rc = unsafe { ffi::agl_morpheus_permute(flat.as_ptr(), phys.as_mut_ptr().add(q * len), len as u64) };
+                        assert_eq!(rc, 0);
+                        err8.extend(phys.read_slice(q * len + (len / N - rank) * N, rank * N).unwrap());
+                    }
+                    let err = DeviceBuffer::from_slice(&err8.iter().map(|&x| x as i64).collect::<Vec<_>>()).unwrap();
+                    let acc = super::commit_gpu::partial_raw(wk, 3, phys.as_ptr() as *const c_void, 1, nb, ncols, len, None);
+                    let rr = ring_rows(finish(acc, nb, 3, rank, Some(&err)).to_vec().unwrap());
+                    v.extend(rr.chunks(rank).map(|c| c.to_vec()));
+                }
                 (lo, v)
             })
         }).collect();

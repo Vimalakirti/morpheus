@@ -506,6 +506,9 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     lap(&mut times, "bank", t);
     let defer = o.defer;
     let Prepared { g, pd, lay, req, carry, .. } = &*pp;
+    // Streamed sources uploaded for the link while the PIOP runs (one device).
+    let pre_raw: std::sync::Mutex<Option<DeviceBuffer<i8>>> = std::sync::Mutex::new(None);
+    let one_gpu = std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) == 1;
     let (raw_req, mut rep_vec, c_req, piop_out) = std::thread::scope(|sc| {
         let pdr = pd;
         sc.spawn(move || pdr.prefetch());
@@ -537,6 +540,19 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
             pc.commit_sources()
         };
         lap(&mut times, "commit", t);
+        if stream && one_gpu && std::env::var("MORPHEUS_NO_PRE_RAW").is_err() {
+            let (raw, pre_raw) = (raw.clone(), &pre_raw);
+            sc.spawn(move || {
+                almost_goldilocks_cuda::set_device(0).expect("set device");
+                let len = raw[0].len();
+                let t = Instant::now();
+                if let Ok(mut d) = DeviceBuffer::<i8>::new(len * raw.len()) {
+                    for (s, r) in raw.iter().enumerate() { d.copy_from_slice_at(s * len, r).expect("raw upload"); }
+                    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] sources uploaded during the PIOP: {:.1} GB in {:.2} s", (len * raw.len()) as f64 / 1e9, t.elapsed().as_secs_f64()); }
+                    *pre_raw.lock().unwrap() = Some(d);
+                }
+            });
+        }
         // Authentication masks of the first attempts, drawn while the PIOP
         // leaves the device mostly idle (MORPHEUS_PRESAMPLE attempts, default 3).
         if o.auth {
@@ -576,6 +592,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
             }
         }
     }
+    *pc.pre_raw.lock().unwrap() = pre_raw.into_inner().unwrap();
     let mut raw: Vec<Vec<i8>> = std::sync::Arc::try_unwrap(raw_req).unwrap_or_else(|a| (*a).clone());
     let mut c_src = c_req;
     let mut t1 = ctx.tr.clone();

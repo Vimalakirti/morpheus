@@ -145,7 +145,7 @@ fn kvec(words: &[u64]) -> Vec<K8> { words.chunks(8).map(|c| K8(c.try_into().unwr
 pub fn phases_v2(
     p: &Profile, st: &Statement, raw: &[Vec<i8>], b0: usize, alpha: &[K8], eta: &K8, gp: &[K8],
     degs: &[usize], a_coef: &[Vec<K8>], tr: &mut MTranscript, dev_raw: Option<&DeviceBuffer<i8>>,
-    keep: Option<&std::sync::Mutex<Vec<Kept>>>,
+    keep: Option<&std::sync::Mutex<Vec<Kept>>>, pre_raw: Option<DeviceBuffer<i8>>,
 ) -> (Vec<Vec<K8>>, Vec<K8>, Vec<K8>, Vec<K8>, Vec<K8>, K8, K8) {
     // Device shards (MORPHEUS_GPUS): sources go to devices greedily by
     // weighted load, from the raw digits and the declared bit blocks alone,
@@ -175,9 +175,12 @@ pub fn phases_v2(
         load[g] += per_src[s] + 1;
     }
     let src_len = raw[0].len();
+    // A single device's sources may already be resident (uploaded during the PIOP).
+    let mut pre_raw = if ngpu == 1 { pre_raw.filter(|b| b.len() == n * src_len) } else { None };
     std::thread::scope(|sc| {
         let ups: Vec<Option<std::thread::ScopedJoinHandle<'_, DeviceBuffer<i8>>>> = (0..ngpu).map(|g| {
             if g == 0 && dev_raw.is_some() { return None; }
+            if g == 0 { if let Some(b) = pre_raw.take() { return Some(sc.spawn(move || b)); } }
             let owner = &owner;
             Some(sc.spawn(move || {
                 almost_goldilocks_cuda::set_device(g as i32).expect("set device");

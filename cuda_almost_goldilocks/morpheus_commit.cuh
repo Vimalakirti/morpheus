@@ -210,7 +210,68 @@ __global__ void mac_kernel(const uint32_t* __restrict__ key, int kcols, int rows
             partial[((((size_t)blockIdx.y * V + v) * k + pi) * rows + r) * N + jj] = barrett64(acc[v][r], p, m);
 }
 
-/// acc[v][prime][row][j] = sum over `parts` partial blocks (mod p).
+/// mac_kernel for up to MV vectors per pass over the key cache: block =
+/// 64 positions j of one prime × (rows / RPT) row groups; a column's V input
+/// residues are staged in shared memory once for all row groups, so each key
+/// element is read once per pass of V sources (mac_kernel<1> re-reads the
+/// whole key per source). Output layout as mac_kernel.
+constexpr int MV = 8, RPT = 2;
+template <int V>
+__global__ void mac_v_kernel(const uint32_t* __restrict__ key, int kcols, int rows, const uint32_t* __restrict__ xh,
+                             const uint32_t* __restrict__ colidx, int C, int k, int chunk_cols,
+                             const Tables* __restrict__ T, uint32_t* __restrict__ partial) {
+    __shared__ uint32_t sx[4][V][64];
+    const int lane = threadIdx.x & 63, rg = threadIdx.x >> 6, ngroups = blockDim.x >> 6;
+    const int jt = blockIdx.x * 64 + lane;   // over k*N
+    const int pi = (blockIdx.x * 64) / N, jj = jt % N;
+    const uint32_t p = T->p[pi];
+    const u64 m = T->barrett[pi];
+    const int r0 = rg * RPT;
+    const int c0 = blockIdx.y * chunk_cols;
+    const int c1 = min(C, c0 + chunk_cols);
+    u64 acc[V][RPT];
+#pragma unroll
+    for (int v = 0; v < V; v++)
+#pragma unroll
+        for (int r = 0; r < RPT; r++) acc[v][r] = 0;
+    int pending = 0;
+    for (int cb = c0; cb < c1; cb += 4) {
+        const int nb = min(4, c1 - cb);
+        // Stage the residues of up to 4 columns × V vectors.
+        for (int t = threadIdx.x; t < 4 * V * 64; t += blockDim.x) {
+            const int q = t / (V * 64), v = (t / 64) % V, l = t & 63;
+            if (q < nb) sx[q][v][l] = xh[(((size_t)v * k + pi) * C + cb + q) * N + (size_t)(blockIdx.x * 64 % N) + l];
+        }
+        __syncthreads();
+        for (int q = 0; q < nb; q++) {
+            const int c = cb + q;
+            const int kc = colidx ? (int)colidx[c] : c;
+            const uint32_t* kp = key + (((size_t)pi * kcols + kc) * rows) * N + jj;
+#pragma unroll
+            for (int r = 0; r < RPT; r++) {
+                if (r0 + r < rows) {
+                    const uint32_t a = kp[(size_t)(r0 + r) * N];
+#pragma unroll
+                    for (int v = 0; v < V; v++) acc[v][r] += (u64)a * sx[q][v][lane];
+                }
+            }
+            if (++pending == 4) {
+                pending = 0;
+#pragma unroll
+                for (int v = 0; v < V; v++)
+#pragma unroll
+                    for (int r = 0; r < RPT; r++) acc[v][r] = barrett64(acc[v][r], p, m);
+            }
+        }
+        __syncthreads();
+    }
+    for (int v = 0; v < V; v++)
+        for (int r = 0; r < RPT; r++)
+            if (r0 + r < rows) partial[((((size_t)blockIdx.y * V + v) * k + pi) * rows + r0 + r) * N + jj] = barrett64(acc[v][r], p, m);
+    (void)ngroups;
+}
+
+/// acc[v][prime][row][j] = sum over `parts` partial blocks (mod p)./// acc[v][prime][row][j] = sum over `parts` partial blocks (mod p).
 __global__ void sum_partials_kernel(const uint32_t* __restrict__ partial, int parts, size_t stride, int k, int rows,
                                     const Tables* __restrict__ T, uint32_t* __restrict__ acc, size_t n_elems) {
     for (size_t id = blockIdx.x * (size_t)blockDim.x + threadIdx.x; id < n_elems; id += (size_t)gridDim.x * blockDim.x) {

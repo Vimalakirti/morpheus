@@ -3095,7 +3095,7 @@ int agl_mcommit_keygen(const uint32_t* h_seed, uint32_t kind, int rows, uint64_t
 int agl_mcommit_partial(const uint32_t* d_key, int kcols, int rows, int k, const void* d_x, int x_bytes, int V, int C,
                         uint64_t x_vstride, const uint32_t* d_colidx, uint32_t* d_acc) {
     const mcommit::Tables* T = agl_mcommit_tables();
-    if (!T || (V != 1 && V != 2) || rows > mcommit::MAXROWS) return -1;
+    if (!T || V < 1 || V > mcommit::MV || rows > mcommit::MAXROWS) return -1;
     const int N = mcommit::N;
     if (C == 0) { cudaMemset(d_acc, 0, (size_t)V * k * rows * N * 4); return (int)agl_sync_mine(); }
     void* d_xh = nullptr;
@@ -3119,8 +3119,23 @@ int agl_mcommit_partial(const uint32_t* d_key, int kcols, int rows, int k, const
     void* d_part = nullptr;
     if (cuda_malloc(&d_part, (size_t)chunks * stride * 4)) { cuda_free(d_xh); return -1; }
     dim3 g(xblocks, chunks);
-    if (V == 1) mcommit::mac_kernel<1><<<g, 256>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part);
-    else mcommit::mac_kernel<2><<<g, 256>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part);
+    if (V == 1 && !getenv("MORPHEUS_MAC_V")) mcommit::mac_kernel<1><<<g, 256>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part);
+    else if (V == 2 && !getenv("MORPHEUS_MAC_V")) mcommit::mac_kernel<2><<<g, 256>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part);
+    else {
+        // Row groups of RPT rows; 64 positions per block.
+        dim3 gv((unsigned)(k * N / 64), (unsigned)chunks);
+        const int th = 64 * ((rows + mcommit::RPT - 1) / mcommit::RPT);
+        switch (V) {
+            case 1: mcommit::mac_v_kernel<1><<<gv, th>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part); break;
+            case 2: mcommit::mac_v_kernel<2><<<gv, th>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part); break;
+            case 3: mcommit::mac_v_kernel<3><<<gv, th>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part); break;
+            case 4: mcommit::mac_v_kernel<4><<<gv, th>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part); break;
+            case 5: mcommit::mac_v_kernel<5><<<gv, th>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part); break;
+            case 6: mcommit::mac_v_kernel<6><<<gv, th>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part); break;
+            case 7: mcommit::mac_v_kernel<7><<<gv, th>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part); break;
+            default: mcommit::mac_v_kernel<8><<<gv, th>>>(d_key, kcols, rows, (const uint32_t*)d_xh, d_colidx, C, k, chunk_cols, T, (uint32_t*)d_part); break;
+        }
+    }
     mcommit::sum_partials_kernel<<<mc_grid(stride, 256), 256>>>((const uint32_t*)d_part, chunks, stride, k, rows, T, d_acc, stride);
     cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) e = agl_sync_mine();

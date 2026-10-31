@@ -189,6 +189,9 @@ pub trait LinkServices {
     fn dev_raw(&self) -> Option<&almost_goldilocks_cuda::DeviceBuffer<i8>> { None }
     /// Streamed sources: where the link keeps its per-device source shards.
     fn kept(&self) -> Option<&std::sync::Mutex<Vec<super::link_gpu::Kept>>> { None }
+    /// Streamed sources already uploaded to device 0 (logical order,
+    /// concatenated), e.g. during the PIOP.
+    fn take_pre_raw(&self) -> Option<almost_goldilocks_cuda::DeviceBuffer<i8>> { None }
 }
 
 pub struct CpuServices;
@@ -396,7 +399,7 @@ pub fn prove_with(
         panic!("CUDA link v2 requested in CPU-only build");
         #[cfg(feature = "cuda")]
         {
-        let o = super::link_gpu::phases_v2(p, st, raw, b0, &alpha, &eta, &gp, &degs, &a_coef, tr, svc.dev_raw(), svc.kept());
+        let o = super::link_gpu::phases_v2(p, st, raw, b0, &alpha, &eta, &gp, &degs, &a_coef, tr, svc.dev_raw(), svc.kept(), svc.take_pre_raw());
         lap("v2 phases");
         (o.0, o.1, o.2.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.3.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.4.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.5, o.6)
         }
