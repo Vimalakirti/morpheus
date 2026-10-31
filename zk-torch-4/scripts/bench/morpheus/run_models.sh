@@ -20,7 +20,7 @@ OUT=${OUT:-scripts/bench/morpheus/out}
 mkdir -p "$OUT"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3,0,1}
 export MORPHEUS_GPUS=${MORPHEUS_GPUS:-4} MORPHEUS_AUTH_GPUS=${MORPHEUS_AUTH_GPUS:-4}
-export PROFILE=ternary B0=11 SLOTS_LOG=${SLOTS_LOG:-17} ZK4_EXP_BITS=8 MORPHEUS_TIMING=1
+export PROFILE=ternary B0=11 SLOTS_LOG=${SLOTS_LOG:-10} ZK4_EXP_BITS=8 MORPHEUS_TIMING=1
 # Public argmax logit bound: |logit| < 2^20 at the logit scale (GPT-2 reaches ~2^16).
 export ARGMAX_LOGIT_BITS=${ARGMAX_LOGIT_BITS:-20}
 # Transformers: quantized-model-like dense weights (the previous evaluation
@@ -132,6 +132,13 @@ G1=(MORPHEUS_GPUS=1 MORPHEUS_AUTH_GPUS=1)
 want_x dp1 && MODES=mono && for s in 32 128; do
   run GPT-2_s${s}_g1 e2e "${TW[@]}" "${G1[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=gpt2 NUM_LAYERS=12 SEQ_LEN=$s VOCAB_SIZE=50257
 done
+# DeepProve's own CNNs (zkml/assets/scripts) with their trained weights and
+# first input at scale 2^8 (scripts/bench/deepprove/export_cnn.py). COVID:
+# the final sigmoid dropped and the last layer padded to 10 zero-extended
+# logits, as DeepProve needs to prove it (covid10.onnx).
+CNNFX=${CNNFX:-/scratch/bjchen4_icgpu/goldilocks/deepprove_src/cnn_fixtures}
+{ want_x dp1 || want_x dp1cnn; } && MODES=mono run CIFAR-LeNet_g1 hook:bench_deepprove_cnn:cv_config.yaml:1 "${G1[@]}" CNN_FIXTURE=$CNNFX/cifar.json ZK4_TABLE_SIZE_LOG=16
+{ want_x dp1 || want_x dp1cnn; } && MODES=mono run COVID-CNN_g1 hook:bench_deepprove_cnn:cv_config.yaml:1 "${G1[@]}" CNN_FIXTURE=$CNNFX/covid10.json ZK4_TABLE_SIZE_LOG=20 REQ_PLANES_LOG=5
 # EZKL's two reference circuits at their exported shapes, one GPU.
 want_x ezkl && MORPHEUS_GPUS=1 MORPHEUS_AUTH_GPUS=1 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*} \
   run LeNet-5 hook:bench_streaming_lenet:llama2_config.yaml:1 MORPHEUS_GPUS=1 MORPHEUS_AUTH_GPUS=1

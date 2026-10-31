@@ -83,7 +83,7 @@ impl Opts {
             seed: KeySeed([1; 8]),
             coins: private_coins(),
             b0: ev("B0", 11),
-            cfg: Config { tcl: ev("TCL", 4), slots_log: ev("SLOTS_LOG", 17), req_planes_log: ev("REQ_PLANES_LOG", 4) },
+            cfg: Config { tcl: ev("TCL", 4), slots_log: ev("SLOTS_LOG", 10), req_planes_log: ev("REQ_PLANES_LOG", 4) },
             defer: std::env::var("DEFER").ok().as_deref() == Some("1"),
             carry_log: ev("CARRY_LOG", 14),
             auth: std::env::var("NO_AUTH").is_err(),
@@ -128,9 +128,10 @@ pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &
     let cap = o.profile.source_payload_cols * super::ring::N;
     let max_lg = (usize::BITS - 1 - cap.leading_zeros()) as usize;
     o.carry_log = o.carry_log.min(max_lg - 9);
-    // Graph-mask slots: at least SLOTS_LOG, and about 32 per graph node
-    // (GPT-2 uses ~13; reductions draw a few pads and mask coefficients).
-    let need = crate::util::arith::log2_ceil(dag.nodes.len().max(1) * 32);
+    // Graph-mask slots: at least SLOTS_LOG, and 16 per graph node (the
+    // census: GPT-2 uses ~6, LeNet-5 ~12; reductions draw a few pads and
+    // mask coefficients). The bank is committed (512 digits per slot).
+    let need = crate::util::arith::log2_ceil(dag.nodes.len().max(1) * 16);
     if need > o.cfg.slots_log { o.cfg.slots_log = need; }
     let t = Instant::now();
     let mut g = Graph::new(dag, wit, o.cfg.clone());
@@ -586,7 +587,9 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         if !defer { assert_eq!(&c_req[..model_prefix], &model.c[..], "registered model commitment changed"); }
         let input_end = model_prefix + pp.input.len();
         assert_eq!(&c_req[model_prefix..input_end], &input.c[..], "registered input commitment changed");
+        let t = Instant::now();
         let tr = request_transcript(o, pp, j, &salt, &model.c, &input.c, &c_req[input_end..]).expect("invalid request statement");
+        lap(&mut times, "statement", t);
         let t = Instant::now();
         let mut ctx = Ctx::prover(tr, &pd.bank, lay, o.cfg.slots_log);
         if defer { ctx.defer = Some(Defer::new(o.carry_log)); }
@@ -710,13 +713,17 @@ fn verify_request_with(pp: &Prepared, o: &Opts, j: u64, model: Option<Registered
     // The expected registry commitments, not a prover-selected model identity,
     // are bound before graph challenges. Empty-model graphs still supply a
     // RegisteredModel descriptor, with an empty commitments slice.
+    // The public statement and request prefix are part of verification.
+    let t = Instant::now();
     let tr = request_transcript(o, pp, j, &out.salt, expected_model, input.commitments, &out.c_src[input_end..nreq])?;
+    lap(times, "verify prefix", t);
     let t = Instant::now();
     let mut vctx = Ctx::verifier(tr, out.piop.clone(), &pp.lay, o.cfg.slots_log);
     if defer { vctx.defer = Some(Defer::new(o.carry_log)); }
     let mut vw = Walk::new(&pp.g, None);
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vw.run(&mut vctx)));
     lap(times, "verify piop", t);
+    if o.timing { for (k, v) in &vctx.stats { eprintln!("  [verify] {k:12} {:6} calls {:.3}s", v.0, v.1); } }
     if ran.is_err() || !vctx.ok { eprintln!("request {j}: PIOP rejected ({:?})", vctx.fail); return None; }
     if !vctx.consumed() { eprintln!("request {j}: PIOP proof has unread messages"); return None; }
     let mut tv = vctx.tr.clone();
@@ -866,7 +873,9 @@ fn verify_final_with(pp: &Prepared, o: &Opts, b: u64, model: RegisteredModel<'_>
     let st = final_statement(pp, q);
     let mut c_src = c_model.to_vec();
     for e in q { c_src.push(e.c_carry.to_vec()); }
+    let t = Instant::now();
     let Some(mut tv) = final_transcript(o, pp, b, &out.salt, c_model, q) else { return false; };
+    lap(times, "verify prefix", t);
     let t = Instant::now();
     let lv = link::verify(&o.profile, &mut tv, &st, &c_src, &out.link);
     lap(times, "verify link", t);

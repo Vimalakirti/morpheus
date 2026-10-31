@@ -33,10 +33,24 @@ impl Words {
     /// injective, and it binds every value; constant tables (interval
     /// bounds), masks and one-hot selectors stay small.
     fn field_values(&mut self, xs: &[u64]) -> Result<(), String> {
-        if xs.iter().any(|&v| v >= Q) { return Err("noncanonical public field value".into()); }
+        use rayon::prelude::*;
+        const CH: usize = 1 << 16;
+        if xs.par_chunks(CH).any(|c| c.iter().any(|&v| v >= Q)) { return Err("noncanonical public field value".into()); }
         self.us(xs.len())?;
+        let local = |c: &[u64]| -> Vec<(u64, usize)> {
+            let mut runs: Vec<(u64, usize)> = Vec::new();
+            for &v in c { match runs.last_mut() { Some(r) if r.0 == v => r.1 += 1, _ => runs.push((v, 1)) } }
+            runs
+        };
+        // Runs per chunk in parallel, merged across chunk boundaries: the
+        // same maximal runs as a single pass.
         let mut runs: Vec<(u64, usize)> = Vec::new();
-        for &v in xs { match runs.last_mut() { Some(r) if r.0 == v => r.1 += 1, _ => runs.push((v, 1)) } }
+        let parts: Vec<Vec<(u64, usize)>> = if xs.len() <= CH { vec![local(xs)] } else { xs.par_chunks(CH).map(local).collect() };
+        for part in parts {
+            let mut it = part.into_iter();
+            if let Some(f) = it.next() { match runs.last_mut() { Some(r) if r.0 == f.0 => r.1 += f.1, _ => runs.push(f) } }
+            runs.extend(it);
+        }
         self.us(runs.len())?;
         for (v, n) in runs { self.u(v); self.us(n)?; }
         Ok(())
@@ -238,7 +252,12 @@ fn encode(g: &Graph, p: &Profile, seed: &KeySeed, b0: usize, defer: bool, carry_
     }
     let mut public: Vec<_> = g.public.iter().collect(); public.sort_unstable_by_key(|(e,_)| **e);
     w.us(public.len())?;
-    for (&e,v) in public { public_array(&mut w,g,e,v,values)?; }
+    // Independent arrays encoded in parallel, concatenated in order.
+    {
+        use rayon::prelude::*;
+        let enc: Vec<Result<Vec<u64>, String>> = public.par_iter().map(|&(&e,v)| { let mut a = Words::default(); public_array(&mut a,g,e,v,values)?; Ok(a.0) }).collect();
+        for x in enc { w.0.extend(x?); }
+    }
     // Output order is meaningful (root-claim challenge schedule); preserve it.
     w.us(g.outputs.len())?; let mut seen = std::collections::HashSet::new();
     for (e,v) in &g.outputs {
@@ -265,6 +284,23 @@ mod run_tests {
             }
         }
         assert_eq!(enc(&[5; 1000]), vec![1000, 1, 5, 1000]);
+    }
+    #[test]
+    fn chunked_runs_equal_a_single_pass() {
+        let serial = |xs: &[u64]| -> Vec<u64> {
+            let mut runs: Vec<(u64, usize)> = Vec::new();
+            for &v in xs { match runs.last_mut() { Some(r) if r.0 == v => r.1 += 1, _ => runs.push((v, 1)) } }
+            let mut w = vec![xs.len() as u64, runs.len() as u64];
+            for (v, n) in runs { w.push(v); w.push(n as u64); }
+            w
+        };
+        let mut x = 7u64;
+        for len in [0usize, 1, 65535, 65536, 65537, 300_000] {
+            for period in [1usize, 3, 65536, 70_000, 1 << 20] {
+                let xs: Vec<u64> = (0..len).map(|i| { if i % period == 0 { x = x.wrapping_mul(6364136223846793005).wrapping_add(1); } (x >> 62) % 3 }).collect();
+                assert_eq!(enc(&xs), serial(&xs), "len {len} period {period}");
+            }
+        }
     }
 }
 
