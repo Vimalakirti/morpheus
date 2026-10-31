@@ -179,7 +179,8 @@ __global__ void __launch_bounds__(256) onehot_kernel(
 /// Reduced mode (blockDim 96): warps evaluate t = 0, 2, 3 (range) and t = 0, 2
 /// (query); the host gets t = 1 from the previous round's claims.
 constexpr int GCH = 128;
-__global__ void __launch_bounds__(160, 2) generic_kernel(
+template <int MINB>
+__global__ void __launch_bounds__(160, MINB) generic_kernel(
     const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i, int d, int reduced_dbg,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
     const K8d* __restrict__ e_pre, const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
@@ -740,23 +741,8 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
     K8d* V = Jw + BIN_NP * BIN_NP;
     uint8_t* sel = reinterpret_cast<uint8_t*>(V + 64);
     for (int j = lane; j < BIN_NP * BIN_NP; j += 32) Jw[j] = kzero();
-    int cur = -1, ctc = 0, jsrc = -1, jchi = 0;
-    uint32_t ctoff = 0, cw = 0;
-    K8d gv = kzero(), u00 = kzero(), u01 = kzero(), u10 = kzero(), u11 = kzero();   // u{term}{b}
-    auto flush = [&]() {
-        if (cur < 0) return;
-        if (ctc > 0) { kacc_atomic(U + (((size_t)(cw + 0) * 4 + 0 + par) * 32 + cls) * 16, kcanon(u00)); kacc_atomic(U + (((size_t)(cw + 0) * 4 + 2 + par) * 32 + cls) * 16, kcanon(u01)); }
-        if (ctc > 1) { kacc_atomic(U + (((size_t)(cw + 1) * 4 + 0 + par) * 32 + cls) * 16, kcanon(u10)); kacc_atomic(U + (((size_t)(cw + 1) * 4 + 2 + par) * 32 + cls) * 16, kcanon(u11)); }
-    };
-    // Per-warp cache of the dominant round-5 class contributions.
-    int d5 = -1; K8d d5r = kzero(), d5b = kzero();
-    auto flush5 = [&]() {
-        if (d5 >= 0 && lane == 0) {
-            kacc_atomic(J5 + ((size_t)0 * 65536 + d5) * 16, kcanon(d5r));
-            kacc_atomic(J5 + ((size_t)1 * 65536 + d5) * 16, kcanon(d5b));
-        }
-        d5 = -1; d5r = d5b = kzero();
-    };
+    int jsrc = -1, jchi = 0;
+    K8d gv = kzero();
     auto flush_j = [&]() {
         __syncwarp();
         if (jsrc < 0) return;
@@ -784,11 +770,6 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
         const Region R = C.regions[b.region];
         if (!(R.flags & 8)) continue;
         BPROF(7);
-        if ((int)b.region != cur) {
-            flush();
-            u00 = u01 = u10 = u11 = kzero();
-            cur = (int)b.region; ctoff = R.toff; cw = R.qd_off; ctc = (int)R.tcnt;
-        }
         const int chi = (int)(R.flags & 1);
         if ((int)b.src != jsrc || chi != jchi) { flush_j(); jsrc = (int)b.src; jchi = chi; }
         BPROF(0);
@@ -809,31 +790,6 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
         V[lane + 32] = (dbg & 8) ? ea1[lane + 32] : kmul(ca, ea1[lane + 32]);
         __syncwarp();
         BPROF(1);
-        const K8d* o = bc_oh + C.bco[C.oh_base + nblk - 1 - bi];
-        if (!(dbg & 1)) {
-            // Round-5 pair r = lane: quad class of indices 4r..4r+3.
-            const int c5 = (sel[4 * lane] << 12) | (sel[4 * lane + 1] << 8) | (sel[4 * lane + 2] << 4) | sel[4 * lane + 3];
-            const unsigned peers = __match_any_sync(0xffffffffu, c5);
-            const unsigned best = __reduce_max_sync(0xffffffffu, ((unsigned)__popc(peers) << 16) | (unsigned)c5);
-            const int dom5 = (int)(best & 0xffff);
-            const K8d cr = o[0], cb = o[1];
-            const bool hb = !kzero_p(cb);
-            K8d vr = kzero(), vb = kzero();
-            if (c5 != dom5) {
-                vr = kmul(cr, ea5[lane]);
-                kacc_atomic(J5 + ((size_t)0 * 65536 + c5) * 16, kcanon(vr));
-                if (hb) { vb = kmul(cb, ea5[lane]); kacc_atomic(J5 + ((size_t)1 * 65536 + c5) * 16, kcanon(vb)); }
-            }
-            // Dominant: cr·Σ ea5 − Σ_{others} = cr − Σ_{others}.
-            vr = kcanon(vr); vb = kcanon(vb);
-            for (int off = 16; off > 0; off >>= 1) { vr = kadd(vr, shfl_down_k(vr, off)); vb = kadd(vb, shfl_down_k(vb, off)); }
-            if (lane == 0) {
-                if (dom5 != d5) { flush5(); d5 = dom5; }
-                d5r = kadd(d5r, ksub(cr, vr));
-                if (hb) d5b = kadd(d5b, ksub(cb, vb));
-            }
-            d5 = __shfl_sync(0xffffffffu, d5, 0);
-        }
         uint32_t mk[4];
         #pragma unroll
         for (int c = 0; c < 4; c++) {
@@ -856,14 +812,9 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
             if (lane == 0) { atomicAdd(&g_bin_prof[5], (unsigned long long)mx); atomicAdd(&g_bin_prof[6], (unsigned long long)m2); }
         }
         BPROF(2);
-        const Term* Ts = C.terms + ctoff;
-        const K8d* B0t = ctc > 0 ? C.B + Ts[0].boff : nullptr;
-        const K8d* B1t = ctc > 1 ? C.B + Ts[1].boff : nullptr;
-        // Block-local sums of this lane's class and parity; js: this lane's
+        // Block-local sum of this lane's class and parity; js: this lane's
         // J additions (pairs not both dominant).
-        const K8d* B50 = ctc > 0 ? B5 + (size_t)(cw + 0) * 32 : nullptr;
-        const K8d* B51 = ctc > 1 ? B5 + (size_t)(cw + 1) * 32 : nullptr;
-        K8d gvb = kzero(), ub00 = kzero(), ub01 = kzero(), ub10 = kzero(), ub11 = kzero(), js = kzero();
+        K8d gvb = kzero(), js = kzero();
         if (cls != dom && !(dbg & 2)) {
             #pragma unroll
             for (int c = 0; c < 4; c++) {
@@ -873,9 +824,6 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
                     const int idx = c * 32 + bt, r = idx >> 1;
                     const K8d vr = V[r];
                     gvb = kadd(gvb, vr);
-                    const int y5 = idx >> 2;
-                    if ((idx >> 1) & 1) { if (B50) ub01 = kadd(ub01, B50[y5]); if (B51) ub11 = kadd(ub11, B51[y5]); }
-                    else                { if (B50) ub00 = kadd(ub00, B50[y5]); if (B51) ub10 = kadd(ub10, B51[y5]); }
                     // Pair (s0, s1): row s0 ≠ dom by lane (s0, 0); (dom, s1) by lane (s1, 1).
                     if (par == 0) { K8d& jj = Jw[cls * BIN_NP + sel[idx + 1]]; jj = kadd(jj, vr); js = kadd(js, vr); }
                     else if (sel[idx - 1] == dom) { K8d& jj = Jw[dom * BIN_NP + cls]; jj = kadd(jj, vr); js = kadd(js, vr); }
@@ -896,25 +844,137 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
             K8d h; for (int w = 0; w < 8; w++) h.c[w] = __shfl_sync(0xffffffffu, x.c[w], lane & 16);
             return h;
         };
-        const K8d hg = half_sum(gvb), h00 = half_sum(ub00), h01 = half_sum(ub01), h10 = half_sum(ub10), h11 = half_sum(ub11);
+        const K8d hg = half_sum(gvb);
         if (cls == dom) {
-            K8d one = kzero(); one.c[0] = 1;
             gvb = ksub(tvb, hg);
-            ub00 = ksub(one, h00); ub01 = ksub(one, h01); ub10 = ksub(one, h10); ub11 = ksub(one, h11);
             if (par == 0) { K8d& jj = Jw[dom * BIN_NP + dom]; jj = kadd(jj, ksub(tvb, jsb)); }
         }
         gv = kadd(gv, gvb);
         __syncwarp();
         BPROF(3);
-        if (!(dbg & 4)) {
-            if (ctc > 0) { u00 = kadd(u00, kmul(o[2], ub00)); u01 = kadd(u01, kmul(o[2], ub01)); }
-            if (ctc > 1) { u10 = kadd(u10, kmul(o[3], ub10)); u11 = kadd(u11, kmul(o[3], ub11)); }
+    }
+    flush_j();
+}
+
+/// Binned one-hot blocks, part B: the query moments U (see above) and the
+/// round-5 range bins J5. Per block the round-5 tables are pre-scaled,
+/// B5c_T = c_T(b)·B5_T (lane y computes entry y), so the class loop only adds
+/// (dominant class by complement: Σ_y B5c_T[y] = c_T); the run sums of U live
+/// in shared memory (RU[term·2 + b][lane]).
+__global__ void __launch_bounds__(128, 3) onehot_q5_kernel(
+    const int8_t* __restrict__ raw, uint64_t src_len, int b0,
+    const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc_oh,
+    const K8d* __restrict__ ea5, const K8d* __restrict__ B5, uint32_t chunk,
+    u64* __restrict__ U, u64* __restrict__ J5)
+{
+    extern __shared__ K8d q5_sh[];   // per warp: B5c[2][32], RU[4][32], sel (128 B)
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int cls = lane & 15, par = lane >> 4;
+    J5 += (size_t)(blockIdx.x % J5_REP) * 2 * 65536 * 16;
+    const uint64_t gw = blockIdx.x * 4 + warp, nw = (uint64_t)gridDim.x * 4;
+    K8d* B5c = q5_sh + (size_t)warp * (64 + 128 + 2);
+    K8d* RU = B5c + 64;
+    uint8_t* sel = reinterpret_cast<uint8_t*>(RU + 128);
+    for (int q = 0; q < 4; q++) RU[q * 32 + lane] = kzero();
+    int cur = -1, ctc = 0;
+    uint32_t cw = 0;
+    auto flush = [&]() {
+        if (cur < 0) return;
+        for (int q = 0; q < 2 * ctc; q++) {
+            const K8d x = RU[q * 32 + lane];
+            if (!kzero_p(x)) kacc_atomic(U + (((size_t)(cw + (q >> 1)) * 4 + (q & 1) * 2 + par) * 32 + cls) * 16, kcanon(x));
+            RU[q * 32 + lane] = kzero();
+        }
+    };
+    int d5 = -1; K8d d5r = kzero(), d5b = kzero();
+    auto flush5 = [&]() {
+        if (d5 >= 0 && lane == 0) {
+            kacc_atomic(J5 + ((size_t)0 * 65536 + d5) * 16, kcanon(d5r));
+            kacc_atomic(J5 + ((size_t)1 * 65536 + d5) * 16, kcanon(d5b));
+        }
+        d5 = -1; d5r = d5b = kzero();
+    };
+    const uint32_t pmask = par ? 0xAAAAAAAAu : 0x55555555u;
+    for (uint64_t ch = gw; ch * chunk < nblk; ch += nw)
+    for (uint64_t bi = ch * chunk; bi < nblk && bi < (ch + 1) * chunk; bi++) {
+        const Blk b = blks[bi];
+        const Region R = C.regions[b.region];
+        if (!(R.flags & 8)) continue;
+        if ((int)b.region != cur) { flush(); cur = (int)b.region; cw = R.qd_off; ctc = (int)R.tcnt; }
+        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        #pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int idx = lane * 4 + q;
+            const int4 v = __ldg(reinterpret_cast<const int4*>(dg) + idx);
+            const uint32_t wv[4] = {(uint32_t)v.x, (uint32_t)v.y, (uint32_t)v.z, (uint32_t)v.w};
+            int s = 0;
+            #pragma unroll
+            for (int k = 3; k >= 0; k--) if (wv[k]) s = k * 4 + ((__ffs(wv[k]) - 1) >> 3);
+            sel[idx] = (uint8_t)s;
+        }
+        const K8d* o = bc_oh + C.bco[C.oh_base + nblk - 1 - bi];
+        for (int t = 0; t < ctc; t++) B5c[t * 32 + lane] = kmul(o[2 + t], B5[(size_t)(cw + t) * 32 + lane]);
+        __syncwarp();
+        {
+            // Round-5 pair r = lane: quad class of indices 4r..4r+3.
+            const int c5 = (sel[4 * lane] << 12) | (sel[4 * lane + 1] << 8) | (sel[4 * lane + 2] << 4) | sel[4 * lane + 3];
+            const unsigned peers = __match_any_sync(0xffffffffu, c5);
+            const unsigned best = __reduce_max_sync(0xffffffffu, ((unsigned)__popc(peers) << 16) | (unsigned)c5);
+            const int dom5 = (int)(best & 0xffff);
+            const K8d cr = o[0], cb = o[1];
+            const bool hb = !kzero_p(cb);
+            K8d vr = kzero(), vb = kzero();
+            if (c5 != dom5) {
+                vr = kmul(cr, ea5[lane]);
+                kacc_atomic(J5 + ((size_t)0 * 65536 + c5) * 16, kcanon(vr));
+                if (hb) { vb = kmul(cb, ea5[lane]); kacc_atomic(J5 + ((size_t)1 * 65536 + c5) * 16, kcanon(vb)); }
+            }
+            vr = kcanon(vr); vb = kcanon(vb);
+            for (int off = 16; off > 0; off >>= 1) { vr = kadd(vr, shfl_down_k(vr, off)); vb = kadd(vb, shfl_down_k(vb, off)); }
+            if (lane == 0) {
+                if (dom5 != d5) { flush5(); d5 = dom5; }
+                d5r = kadd(d5r, ksub(cr, vr));
+                if (hb) d5b = kadd(d5b, ksub(cb, vb));
+            }
+            d5 = __shfl_sync(0xffffffffu, d5, 0);
+        }
+        uint32_t mk[4];
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const int sv = sel[c * 32 + lane];
+            uint32_t mine = 0;
+            #pragma unroll
+            for (int s = 0; s < BIN_NP; s++) { const uint32_t m = __ballot_sync(0xffffffffu, sv == s); if (s == cls) mine = m; }
+            mk[c] = mine & pmask;
+        }
+        int n = 0;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) n += __popc(mk[c]);
+        const int tot = n + __shfl_xor_sync(0xffffffffu, n, 16);
+        const int dom = (int)(__reduce_max_sync(0xffffffffu, (unsigned)((tot << 4) | cls)) & 15);
+        K8d ub[4] = {kzero(), kzero(), kzero(), kzero()};   // ub[term·2 + b]
+        if (cls != dom) {
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                uint32_t m = mk[c];
+                while (m) {
+                    const int bt = __ffs(m) - 1; m &= m - 1;
+                    const int idx = c * 32 + bt, y5 = idx >> 2, bb = (idx >> 1) & 1;
+                    for (int t = 0; t < ctc; t++) ub[t * 2 + bb] = kadd(ub[t * 2 + bb], B5c[t * 32 + y5]);
+                }
+            }
+        }
+        // Dominant: Σ over the half (parity) of B5c sums is c_T per (term, b).
+        for (int q = 0; q < 2 * ctc; q++) {
+            K8d x = kcanon(ub[q]);
+            for (int off = 8; off > 0; off >>= 1) x = kadd(x, shfl_down_seg(x, off, 16));
+            K8d h; for (int w = 0; w < 8; w++) h.c[w] = __shfl_sync(0xffffffffu, x.c[w], lane & 16);
+            const K8d v = cls == dom ? ksub(o[2 + (q >> 1)], h) : ub[q];
+            RU[q * 32 + lane] = kadd(RU[q * 32 + lane], v);
         }
         __syncwarp();
-        BPROF(4);
     }
     flush();
-    flush_j();
     flush5();
 }
 
@@ -932,7 +992,8 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
 /// partial[block][t] range at t (slot 1 zero), [4 + t] query at t (slot 5 zero).
 constexpr int IDX_WARPS = 4;
 constexpr int IDX_MAXY = 128;
-__global__ void __launch_bounds__(128, 4) index_kernel(
+template <int MINB>
+__global__ void __launch_bounds__(128, MINB) index_kernel(
     const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
     const K8d* __restrict__ e_pre, const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
