@@ -22,6 +22,7 @@ extern "C" {
     pub fn agl_mauth_wtable(h_el: *const u64, cols: c_int, h_ej: *const u64, d_w: *mut u64) -> c_int;
     pub fn agl_mauth_ev(d_w_cols: *const c_void, w_bytes: c_int, cols: c_int, d_w: *const u64, h_out: *mut u64) -> c_int;
     pub fn agl_mauth_decode(d_cols: *const i64, ncols: c_int, h_out: *mut u64) -> c_int;
+    pub fn agl_mauth_combine_multi(h_v: *const *const i8, nsrc: c_int, cols: c_int, h_beta: *const i8, d_z0: *mut i64, d_z1: *mut i64) -> c_int;
     pub fn agl_mauth_combine(d_v: *const i8, cols: c_int, h_beta2: *const i8, d_z0: *mut i64, d_z1: *mut i64) -> c_int;
     pub fn agl_mauth_norm(d_z: *const i64, n: u64, h_out: *mut u64) -> c_int;
     pub fn agl_mauth_pack37(d_z: *const i64, n: u64, off: i64, d_out: *mut u8) -> c_int;
@@ -51,6 +52,7 @@ extern "C" {
     pub fn agl_mpiop_pe(d_vals: *const u64, rest_pos: *const c_int, nrest_v: c_int, fix_pos: *const c_int, nfix_v: c_int, d_e: *const u64, d_out: *mut u64) -> c_int;
     pub fn agl_mpiop_eq(h_point: *const u64, n: c_int, d_out: *mut u64) -> c_int;
     pub fn agl_cached_bytes() -> usize;
+    pub fn agl_d2h_staged(h_dst: *mut c_void, d_src: *const c_void, bytes: usize) -> c_int;
     pub fn agl_mpiop_mle(d_vals: *const u64, h_point: *const u64, n: c_int, h_out: *mut u64) -> c_int;
     pub fn agl_mpiop_sel_lookup(d_sel: *const u64, n: u64, shift: c_int, mask: u64, d_table: *const u64, d_out: *mut u64) -> c_int;
     pub fn agl_mpiop_eq_outer(d_lo: *const u64, nlo: c_int, d_hi: *const u64, nhi: c_int, d_out: *mut u64) -> c_int;

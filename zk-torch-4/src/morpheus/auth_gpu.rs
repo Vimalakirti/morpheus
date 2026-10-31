@@ -184,14 +184,15 @@ fn run_attempt(
         let mut zo = uo.clone_on_device().unwrap();
         assert_eq!(p.tau, 2);
         let b2 = |e: usize| -> [i8; 128] { std::array::from_fn(|i| beta[i / 64][e][i % 64]) };
-        for (e, s) in sources.iter().enumerate() {
-            let bb = b2(e);
-            unsafe {
-                let rc = ffi::agl_mauth_combine(s.w.as_ptr(), sw as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(sw * N));
-                assert_eq!(rc, 0);
-                let rc = ffi::agl_mauth_combine(s.r.as_ptr(), sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N));
-                assert_eq!(rc, 0);
-            }
+        // All sources in one pass per column block.
+        let bb: Vec<i8> = (0..sources.len()).flat_map(b2).collect();
+        let vw: Vec<*const i8> = sources.iter().map(|s| s.w.as_ptr()).collect();
+        let vl: Vec<*const i8> = sources.iter().map(|s| s.r.as_ptr()).collect();
+        unsafe {
+            let rc = ffi::agl_mauth_combine_multi(vw.as_ptr(), vw.len() as i32, sw as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(sw * N));
+            assert_eq!(rc, 0);
+            let rc = ffi::agl_mauth_combine_multi(vl.as_ptr(), vl.len() as i32, sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N));
+            assert_eq!(rc, 0);
         }
         let bb = b2(n);
         unsafe { assert_eq!(ffi::agl_mauth_combine(s_o.as_ptr(), so as i32, bb.as_ptr(), zo.as_mut_ptr(), zo.as_mut_ptr().add(so * N)), 0); }
@@ -266,15 +267,19 @@ fn run_attempt_sharded(
     }
     let mut zw = uw.clone_on_device().unwrap();
     let mut zl = ul.clone_on_device().unwrap();
+    // All of a shard's sources in one pass per block (sources are contiguous
+    // at strides sh.len and sl·N).
     let combine = |sh: &ShardSrc, zw: &mut DeviceBuffer<i64>, zl: &mut DeviceBuffer<i64>| {
-        for (j, &e) in sh.srcs.iter().enumerate() {
-            let bb = b2(e);
-            unsafe {
-                let rc = ffi::agl_mauth_combine(sh.w.add(j * sh.len), sw as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(sw * N));
-                assert_eq!(rc, 0);
-                let rc = ffi::agl_mauth_combine(sh.r.as_ptr().add(j * sl * N), sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N));
-                assert_eq!(rc, 0);
-            }
+        if sh.srcs.is_empty() { return; }
+        let bb: Vec<i8> = sh.srcs.iter().flat_map(|&e| b2(e)).collect();
+        let ns = sh.srcs.len();
+        let vw: Vec<*const i8> = (0..ns).map(|j| unsafe { sh.w.add(j * sh.len) }).collect();
+        let vl: Vec<*const i8> = (0..ns).map(|j| unsafe { sh.r.as_ptr().add(j * sl * N) }).collect();
+        unsafe {
+            let rc = ffi::agl_mauth_combine_multi(vw.as_ptr(), ns as i32, sw as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(sw * N));
+            assert_eq!(rc, 0);
+            let rc = ffi::agl_mauth_combine_multi(vl.as_ptr(), ns as i32, sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N));
+            assert_eq!(rc, 0);
         }
     };
     let parts: Vec<(Vec<i32>, Vec<i32>)> = std::thread::scope(|sc| {
@@ -426,9 +431,17 @@ fn accept(p: &Profile, attempt: u16, o: AttemptOut, keep_z: bool) -> AuthOut {
 }
 
 fn pack_dev(p: &Profile, z: &DeviceBuffer<i64>) -> Vec<u8> {
-    let mut b = DeviceBuffer::<u8>::new(super::wire::packed_len(z.len())).unwrap();
+    let len = super::wire::packed_len(z.len());
+    let mut b = DeviceBuffer::<u8>::new(len).unwrap();
     assert_eq!(unsafe { ffi::agl_mauth_pack37(z.as_ptr(), z.len() as u64, super::wire::z_off(p), b.as_mut_ptr()) }, 0);
-    b.to_vec().unwrap()
+    // Fault the destination's pages in parallel (a fresh GB-scale vector
+    // otherwise takes its page faults serially inside the copy), then a
+    // staged pinned copy.
+    let mut v: Vec<u8> = Vec::with_capacity(len);
+    unsafe { v.set_len(len); }
+    { use rayon::prelude::*; v.par_chunks_mut(1 << 20).for_each(|c| { let mut i = 0; while i < c.len() { c[i] = 0; i += 4096; } }); }
+    assert_eq!(unsafe { ffi::agl_d2h_staged(v.as_mut_ptr() as *mut std::ffi::c_void, b.as_ptr() as *const std::ffi::c_void, len) }, 0);
+    v
 }
 
 /// Device responses of one block from the wire; None if a code is outside

@@ -330,6 +330,44 @@ int cuda_device_synchronize() {
 }
 int cuda_get_last_error() { return (int)cudaGetLastError(); }
 int cuda_peek_at_last_error() { return (int)cudaPeekAtLastError(); }
+/// Device-to-host copy through two reusable pinned 64 MB buffers per device:
+/// the DMA of chunk c+1 overlaps the host copy of chunk c (pageable copies of
+/// GB-scale buffers run at a few GB/s).
+int agl_d2h_staged(void* h_dst, const void* d_src, size_t bytes) {
+    if (bytes == 0) return 0;
+    const size_t CH = (size_t)64 << 20;
+    static std::mutex mx;
+    static void* buf[AGL_MAX_DEV][2] = {};
+    static cudaStream_t st[AGL_MAX_DEV] = {};
+    static cudaEvent_t ev[AGL_MAX_DEV][2] = {};
+    int dev = 0; cudaGetDevice(&dev);
+    if (dev < 0 || dev >= AGL_MAX_DEV) return (cudaMemcpy(h_dst, d_src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess) ? 0 : -1;
+    std::lock_guard<std::mutex> lk(mx);
+    if (!buf[dev][0]) {
+        for (int k = 0; k < 2; k++) {
+            if (cudaMallocHost(&buf[dev][k], CH) != cudaSuccess) return -1;
+            cudaEventCreateWithFlags(&ev[dev][k], cudaEventDisableTiming);
+        }
+        cudaStreamCreateWithFlags(&st[dev], cudaStreamNonBlocking);
+    }
+    const size_t n = (bytes + CH - 1) / CH;
+    auto issue = [&](size_t c) {
+        const size_t off = c * CH, len = bytes - off < CH ? bytes - off : CH;
+        cudaMemcpyAsync(buf[dev][c & 1], (const char*)d_src + off, len, cudaMemcpyDeviceToHost, st[dev]);
+        cudaEventRecord(ev[dev][c & 1], st[dev]);
+    };
+    // The caller's prior kernels on its own stream must be complete.
+    agl_sync_mine();
+    issue(0);
+    for (size_t c = 0; c < n; c++) {
+        if (c + 1 < n) issue(c + 1);
+        if (cudaEventSynchronize(ev[dev][c & 1]) != cudaSuccess) return -1;
+        const size_t off = c * CH, len = bytes - off < CH ? bytes - off : CH;
+        memcpy((char*)h_dst + off, buf[dev][c & 1], len);
+    }
+    return 0;
+}
+
 /// Bytes held in the caching allocator's free lists for the current device.
 size_t agl_cached_bytes() {
     int dev = 0;
@@ -3167,6 +3205,23 @@ int agl_mauth_decode(const int64_t* d_cols, int ncols, uint64_t* h_out) {
 }
 
 // Z0 += β0·V, Z1 += β1·V over `cols` ring columns (V int8).
+int agl_mauth_combine_multi(const int8_t* const* h_V, int nsrc, int cols, const int8_t* h_beta, int64_t* d_Z0, int64_t* d_Z1) {
+    if (nsrc <= 0 || cols <= 0) return 0;
+    void* db = nullptr;
+    const size_t pb = (size_t)nsrc * sizeof(void*), bb = (size_t)nsrc * 128;
+    if (cuda_malloc(&db, pb + bb)) return -1;
+    std::vector<uint8_t> tmp(pb + bb);
+    memcpy(tmp.data(), h_V, pb); memcpy(tmp.data() + pb, h_beta, bb);
+    cudaMemcpy(db, tmp.data(), pb + bb, cudaMemcpyHostToDevice);
+    int blocks = ma_sms() * 4;
+    if (blocks > cols) blocks = cols;
+    mauth::combine_multi_kernel<<<blocks, 512>>>((const int8_t* const*)db, nsrc, cols, (const int8_t*)((char*)db + pb), d_Z0, d_Z1);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = agl_sync_mine();
+    cuda_free(db);
+    return (int)e;
+}
+
 int agl_mauth_combine(const int8_t* d_V, int cols, const int8_t* h_beta2, int64_t* d_Z0, int64_t* d_Z1) {
     void* db = nullptr;
     if (cuda_malloc(&db, 128)) return -1;

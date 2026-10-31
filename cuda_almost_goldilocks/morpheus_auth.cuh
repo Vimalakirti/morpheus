@@ -130,7 +130,46 @@ __global__ void combine_kernel(const int8_t* __restrict__ V, int cols, const int
     }
 }
 
-/// Wire codec of the responses: v ∈ (−B_Z, B_Z) is sent as the 37-bit
+/// combine_kernel over several sources at once: source e's column l is at
+/// Vp[e] + l·4096 with challenge rows beta[e][2][64]. Each block
+/// keeps a column's 2×4096 sums in registers across the sources (thread t
+/// owns outputs t + 512q, q < 8) and updates Z once, instead of one
+/// read-modify-write of Z per source.
+__global__ void __launch_bounds__(512) combine_multi_kernel(const int8_t* const* __restrict__ Vp, int nsrc, int cols,
+                                                            const int8_t* __restrict__ beta, int64_t* __restrict__ Z0, int64_t* __restrict__ Z1) {
+    __shared__ __align__(16) int8_t s[4096];
+    __shared__ int8_t b[2][64];
+    const int tid = threadIdx.x, j = tid & 63, k0 = tid >> 6;
+    for (int l = blockIdx.x; l < cols; l += gridDim.x) {
+        int a0[8], a1[8];
+#pragma unroll
+        for (int q = 0; q < 8; q++) { a0[q] = 0; a1[q] = 0; }
+        for (int e = 0; e < nsrc; e++) {
+            const int8_t* col = Vp[e] + (size_t)l * 4096;
+            reinterpret_cast<long long*>(s)[tid] = __ldg(reinterpret_cast<const long long*>(col) + tid);
+            if (tid < 128) b[tid >> 6][tid & 63] = beta[(size_t)e * 128 + tid];
+            __syncthreads();
+#pragma unroll 4
+            for (int m = 0; m < 64; m++) {
+                const int bb0 = b[0][m], bb1 = b[1][m];
+#pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    const int kk = k0 + 8 * q - m;
+                    const int v = kk >= 0 ? s[j + 64 * kk] : -s[j + 64 * (kk + 64)];
+                    a0[q] += bb0 * v; a1[q] += bb1 * v;
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            const size_t i = (size_t)l * 4096 + tid + 512 * q;
+            Z0[i] += a0[q]; Z1[i] += a1[q];
+        }
+    }
+}
+
+/// Wire codec of the responses: v ∈ (−B_Z, B_Z) is sent as the 37-bit/// Wire codec of the responses: v ∈ (−B_Z, B_Z) is sent as the 37-bit
 /// unsigned u = v + (B_Z − 1), LSB first, eight coefficients per 37 bytes.
 __global__ void pack37_kernel(const int64_t* __restrict__ z, u64 groups, int64_t off, uint8_t* __restrict__ out) {
     for (u64 g = blockIdx.x * (u64)blockDim.x + threadIdx.x; g < groups; g += (u64)gridDim.x * blockDim.x) {
