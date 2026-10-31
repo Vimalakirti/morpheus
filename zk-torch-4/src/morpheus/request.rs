@@ -457,6 +457,7 @@ fn load_replicas<'s>(sc: &'s std::thread::Scope<'s, '_>, reps: Vec<AuthReplica>,
 fn authenticate(o: &Opts, opening: u64, pc: &mut PcsGpu, reps: &mut [AuthReplica], fast: &link::LinkOutput, t1: &MTranscript, times: &mut Times) -> AuthProof {
     let to_dev = |cols: &[Vec<i64>]| DeviceBuffer::from_slice(&cols.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
     let t = Instant::now();
+    pc.ensure_w();
     let r_cols: Vec<Vec<Vec<i64>>> = fast.sources.iter().map(|s| s.r.clone()).collect();
     let dsrc: Vec<DevSource> = pc.dev_sources(&r_cols);
     let rsrc: Vec<Vec<DevSource>> = reps.iter_mut().map(|r| r.sources(&r_cols)).collect();
@@ -547,7 +548,13 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         } else {
             pc.streamed = false;
             pc.load_sources(&raw);
-            pc.commit_sources()
+            let c = pc.commit_sources();
+            // MORPHEUS_DROP_W=1 (one device): free the source key cache (43 GB)
+            // until the authentication rebuilds it (~1.3 s), so the PIOP can
+            // presample more attempts. Off by default: the background sampling
+            // then slows the PIOP and the rebuild costs about what it saves.
+            if o.auth && jobs.is_empty() && std::env::var("MORPHEUS_DROP_W").is_ok() { pc.drop_w(); }
+            c
         };
         lap(&mut times, "commit", t);
         if stream && one_gpu && std::env::var("MORPHEUS_NO_PRE_RAW").is_err() {
@@ -634,6 +641,9 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         _ => link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, &raw, o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), true),
     };
     lap(&mut times, "link", t);
+    // The logical source copy served the link; the authentication uses the
+    // physical columns.
+    if o.auth && !pc.streamed && !defer { pc.flat = None; }
     let auth = if !o.auth { None } else if pc.streamed { Some(authenticate_streamed(o, opening, pc, &fast, &t1, &mut times)) } else { Some(authenticate(o, opening, pc, &mut rep_vec, &fast, &t1, &mut times)) };
     auth_gpu::clear_presampled();
     reps.r = rep_vec;
