@@ -2993,7 +2993,10 @@ int agl_morpheus_gauss_dev(const uint64_t* h_consts, const uint64_t* h_base, uin
         long long need = ((long long)in_n + threads - 1) / threads;
         // Background (low-priority) sampling uses one short block per 128
         // coordinates so that other work's blocks are scheduled in between.
-        long long cap = st ? (1LL << 30) : (long long)sms * 16;
+        // MORPHEUS_GAUSS_BG_BLOCKS caps the background grid (grid-stride
+        // loop) so that the other stream's kernels keep free SM slots.
+        static long long bg_cap = []{ const char* e = getenv("MORPHEUS_GAUSS_BG_BLOCKS"); return e ? atoll(e) : (1LL << 30); }();
+        long long cap = st ? bg_cap : (long long)sms * 16;
         int blocks = (int)(need < cap ? need : cap);
         mgauss::trial_kernel<<<blocks, threads, 0, st>>>((const mgauss::Consts*)d_c, base, coord0, tr, in_idx, in_n, out_q, cnt,
                                                   (long long*)d_out, (uint32_t*)d_fl, cnt + 1);
@@ -3570,6 +3573,26 @@ int agl_mlink2_onehot_pre(const int8_t* d_raw, uint64_t src_len, int b0, const v
         (const mauth::K8d*)d_eai, d_eai_off, per_warp, (unsigned long long*)d_G, (unsigned long long*)d_W);
     cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
     return (int)e;
+}
+
+// Sum `rep` replicas of n split (lo, hi) K8 accumulators [rep][n][16] into
+// canonical K8 words [n][8] (mod q).
+__global__ void mlink2_rep_reduce_kernel(const uint64_t* in, int rep, uint64_t n, uint64_t* out) {
+    const unsigned __int128 Q = 18446744069414584289ULL;
+    for (uint64_t t = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; t < n * 8; t += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t c = t >> 3, w = t & 7;
+        unsigned __int128 acc = 0;
+        for (int r = 0; r < rep; r++) {
+            const uint64_t* e = in + ((uint64_t)r * n + c) * 16;
+            unsigned __int128 v = ((unsigned __int128)e[2 * w] + (((unsigned __int128)(e[2 * w + 1] % 18446744069414584289ULL)) << 32)) % Q;
+            acc += v;
+        }
+        out[t] = (uint64_t)(acc % Q);
+    }
+}
+int agl_mlink2_rep_reduce(const uint64_t* d_in, int rep, uint64_t n, uint64_t* d_out) {
+    mlink2_rep_reduce_kernel<<<(unsigned)((n * 8 + 255) / 256 < 4096 ? (n * 8 + 255) / 256 : 4096), 256>>>(d_in, rep, n, d_out);
+    return (int)agl_sync_mine();
 }
 
 int agl_mlink2_onehot_bin(const int8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,

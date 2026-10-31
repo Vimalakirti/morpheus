@@ -49,6 +49,7 @@ extern "C" {
     pub fn agl_mlink2_onehot3(d_raw: *const i8, src_len: u64, b0: c_int, i: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_e1: *const u64, d_e2: *const u64, d_e3: *const u64, d_eai: *const u64, d_eai_off: *const u32, d_eapr: *const u64, d_eapr_off: *const u32, h_out: *mut u64) -> c_int;
     pub fn agl_mlink2_onehot_pre(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc_oh: *const u64, d_eai: *const u64, d_eai_off: *const u32, d_g: *mut u64, d_w: *mut u64) -> c_int;
     pub fn agl_mlink2_onehot_bin(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc_oh: *const u64, d_ea1: *const u64, d_ea5: *const u64, d_b5: *const u64, d_gv: *mut u64, d_u: *mut u64, d_j: *mut u64, d_j5: *mut u64) -> c_int;
+    pub fn agl_mlink2_rep_reduce(d_in: *const u64, rep: c_int, n: u64, d_out: *mut u64) -> c_int;
     pub fn agl_morpheus_permute(d_src: *const i8, d_dst: *mut i8, n: u64) -> c_int;
     pub fn agl_mpiop_pe(d_vals: *const u64, rest_pos: *const c_int, nrest_v: c_int, fix_pos: *const c_int, nfix_v: c_int, d_e: *const u64, d_out: *mut u64) -> c_int;
     pub fn agl_mpiop_eq(h_point: *const u64, n: c_int, d_out: *mut u64) -> c_int;

@@ -883,7 +883,8 @@ fn onehot_sums(
     let d_gv = DeviceBuffer::from_slice(&vec![0u64; ngv * 16]).unwrap();
     let any_bin = oh.iter().any(|b| regions_c[b.region as usize].flags & 8 != 0);
     let (nj5, j5_rep) = (2 * 65536, 8);
-    let d_j5 = DeviceBuffer::from_slice(&vec![0u64; if any_bin { j5_rep * nj5 * 16 } else { 16 }]).unwrap();
+    let mut d_j5 = DeviceBuffer::<u64>::new(if any_bin { j5_rep * nj5 * 16 } else { 16 }).unwrap();
+    d_j5.zero().unwrap();
     let bc_oh = d_bc.as_ptr();
     let mut c2 = *consts;
     c2.oh_base = n_gen_base as u64;
@@ -927,8 +928,10 @@ fn onehot_sums(
         u: halves(d_u.read_slice(0, nu * 16).unwrap()), j: halves(d_j.read_slice(0, nj * 16).unwrap()),
         gv: halves(d_gv.read_slice(0, ngv * 16).unwrap()),
         j5: if any_bin {
-            let all = halves(d_j5.read_slice(0, j5_rep * nj5 * 16).unwrap());
-            (0..nj5).into_par_iter().map(|c| (0..j5_rep).fold(K8::ZERO, |a, r| a.add(&all[r * nj5 + c]))).collect()
+            // Replicas summed on the device: 1/8 of the readback.
+            let d_s = DeviceBuffer::<u64>::new(nj5 * 8).unwrap();
+            assert_eq!(unsafe { ffi::agl_mlink2_rep_reduce(d_j5.as_ptr(), j5_rep as i32, nj5 as u64, d_s.as_ptr() as *mut u64) }, 0);
+            kvec(&d_s.to_vec().unwrap())
         } else { vec![K8::ZERO; nj5] },
         u4: Vec::new(),
     }

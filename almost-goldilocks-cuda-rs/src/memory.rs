@@ -28,6 +28,14 @@ pub struct DeviceBuffer<T> {
     _marker: PhantomData<T>,
 }
 
+
+/// MORPHEUS_TRACE_COPIES=<MB>: print a backtrace for host<->device copies at
+/// least that large (diagnostics only).
+pub fn trace_copy(what: &str, bytes: usize) {
+    static LIM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let lim = *LIM.get_or_init(|| std::env::var("MORPHEUS_TRACE_COPIES").ok().and_then(|s| s.parse::<usize>().ok()).map(|m| m << 20).unwrap_or(usize::MAX));
+    if bytes >= lim { eprintln!("[copy] {what} {} MB\n{}", bytes >> 20, std::backtrace::Backtrace::force_capture()); }
+}
 impl<T> std::fmt::Debug for DeviceBuffer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceBuffer")
@@ -56,6 +64,7 @@ impl<T> DeviceBuffer<T> {
     }
 
     pub fn from_slice(data: &[T]) -> Result<Self> {
+        trace_copy("H2D from_slice", std::mem::size_of_val(data));
         let buffer = Self::new(data.len())?;
         if !data.is_empty() {
             let size = data.len() * std::mem::size_of::<T>();
@@ -77,6 +86,7 @@ impl<T> DeviceBuffer<T> {
     where
         T: Clone + Default,
     {
+        trace_copy("D2H to_vec", self.len * std::mem::size_of::<T>());
         let mut result = vec![T::default(); self.len];
         if !result.is_empty() {
             let size = self.len * std::mem::size_of::<T>();
@@ -100,6 +110,7 @@ impl<T> DeviceBuffer<T> {
     pub fn as_mut_ptr(&mut self) -> *mut T { self.ptr }
 
     pub fn copy_from_slice(&mut self, data: &[T]) -> Result<()> {
+        trace_copy("H2D copy_from_slice", std::mem::size_of_val(data));
         if data.len() != self.len {
             return Err(CudaError::InvalidArgument(
                 "Slice length does not match buffer length".to_string(),
@@ -166,6 +177,7 @@ impl<T> DeviceBuffer<T> {
     /// between a multi-gigabyte host allocation and a `cudaMemset` plus a
     /// handful of small copies.
     pub fn copy_from_slice_at(&mut self, offset: usize, data: &[T]) -> Result<()> {
+        trace_copy("H2D copy_from_slice_at", std::mem::size_of_val(data));
         if data.is_empty() { return Ok(()); }
         if offset + data.len() > self.len {
             return Err(CudaError::InvalidArgument(
@@ -343,6 +355,7 @@ impl<T> DeviceBuffer<T> {
     where
         T: Clone + Default,
     {
+        trace_copy("D2H read_slice", len * std::mem::size_of::<T>());
         if offset + len > self.len {
             return Err(CudaError::InvalidArgument(format!(
                 "read_slice out of bounds: offset={} len={} buf_len={}",
