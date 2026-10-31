@@ -102,7 +102,17 @@ pub struct AuthDev<'a> { pub dev: i32, pub keys: &'a Keys, pub sources: &'a [Dev
 /// depend only on (opening, attempt), so they are drawn while the GPU is idle
 /// in the PIOP. Keyed by (opening, attempt).
 type Masks = (DeviceBuffer<i64>, DeviceBuffer<i64>, DeviceBuffer<i64>);
-static PRESAMPLED: std::sync::Mutex<Vec<((u64, u16), Masks)>> = std::sync::Mutex::new(Vec::new());
+/// Presampled masks: kept on the device when it has room, else parked in
+/// host memory (re-uploaded on use, far cheaper than resampling).
+enum Pre { Dev(Masks), Host(Vec<i64>, Vec<i64>, Vec<i64>) }
+static PRESAMPLED: std::sync::Mutex<Vec<((u64, u16), Pre)>> = std::sync::Mutex::new(Vec::new());
+fn to_host(b: &DeviceBuffer<i64>) -> Vec<i64> {
+    let mut v: Vec<i64> = Vec::with_capacity(b.len());
+    unsafe { v.set_len(b.len()); }
+    { use rayon::prelude::*; v.par_chunks_mut(1 << 17).for_each(|c| { let mut i = 0; while i < c.len() { c[i] = 0; i += 512; } }); }
+    assert_eq!(unsafe { ffi::agl_d2h_staged(v.as_mut_ptr() as *mut std::ffi::c_void, b.as_ptr() as *const std::ffi::c_void, b.len() * 8) }, 0);
+    v
+}
 
 fn sample_masks(p: &Profile, coins: &Coins, opening: u64, attempt: u16) -> Result<Masks, AuthError> {
     let fs = FastSigma::new(p.sigma);
@@ -125,26 +135,52 @@ fn sample_masks(p: &Profile, coins: &Coins, opening: u64, attempt: u16) -> Resul
 /// Draw the masks of attempts 0..count on device 0 ahead of time, while
 /// device memory allows (each attempt's masks are kept until used).
 pub fn presample(p: &Profile, coins: &Coins, opening: u64, count: u16) {
+    // Its own small thread pool: the PIOP running meanwhile is host-latency
+    // bound and uses the global pool.
+    match rayon::ThreadPoolBuilder::new().num_threads(4).build() {
+        Ok(pool) => pool.install(|| presample_in(p, coins, opening, count)),
+        Err(_) => presample_in(p, coins, opening, count),
+    }
+}
+fn presample_in(p: &Profile, coins: &Coins, opening: u64, count: u16) {
     almost_goldilocks_cuda::set_device(0).expect("set device");
+    // This thread's sampling kernels yield to the PIOP's.
+    unsafe { ffi::agl_gauss_low_priority(1); }
     let bytes = 2 * (p.source_cols() + p.link_cols() + p.aux_cols()) * N * 8;
     let t = Instant::now();
     let mut done = 0;
     for attempt in 0..count {
-        // Driver-free plus the caching allocator's free lists (released on demand),
-        // keeping 16 GB for the link.
+        // Driver-free plus the caching allocator's free lists (released on demand).
+        // Keep the masks on the device if 16 GB stay free for the link; else
+        // sample there (one attempt's buffers at a time) and park them on the host.
         let free = almost_goldilocks_cuda::mem_get_info().unwrap_or((0, 0)).0 + unsafe { almost_goldilocks_cuda::ffi::agl_cached_bytes() };
-        if free < bytes + (16usize << 30) { if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] presample stops: {:.1} GB free", free as f64 / 1e9); } break; }
+        // Host parking needs large device-to-host copies, which delay the
+        // PIOP's small synchronous transfers (MORPHEUS_PRESAMPLE_HOST=1 enables it).
+        let reserve: usize = std::env::var("MORPHEUS_PRESAMPLE_RESERVE_GB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4) << 30;
+        let on_dev = free >= bytes + reserve;
+        let host_ok = std::env::var("MORPHEUS_PRESAMPLE_HOST").is_ok();
+        if !on_dev && (!host_ok || free < bytes + (2usize << 30)) { if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] presample stops: {:.1} GB free", free as f64 / 1e9); } break; }
         match sample_masks(p, coins, opening, attempt) {
-            Ok(m) => { PRESAMPLED.lock().unwrap().push(((opening, attempt), m)); done += 1; }
+            Ok(m) => {
+                let pre = if on_dev { Pre::Dev(m) } else { Pre::Host(to_host(&m.0), to_host(&m.1), to_host(&m.2)) };
+                PRESAMPLED.lock().unwrap().push(((opening, attempt), pre)); done += 1;
+            }
             Err(_) => break,
         }
     }
+    unsafe { ffi::agl_gauss_low_priority(0); }
     if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] presampled {done} attempts for opening {opening} in {:.2} s", t.elapsed().as_secs_f64()); }
 }
 fn take_presampled(opening: u64, attempt: u16) -> Option<Masks> {
-    let mut g = PRESAMPLED.lock().unwrap();
-    let i = g.iter().position(|(k, _)| *k == (opening, attempt))?;
-    Some(g.swap_remove(i).1)
+    let pre = {
+        let mut g = PRESAMPLED.lock().unwrap();
+        let i = g.iter().position(|(k, _)| *k == (opening, attempt))?;
+        g.swap_remove(i).1
+    };
+    Some(match pre {
+        Pre::Dev(m) => m,
+        Pre::Host(w, l, o) => (DeviceBuffer::from_slice(&w).unwrap(), DeviceBuffer::from_slice(&l).unwrap(), DeviceBuffer::from_slice(&o).unwrap()),
+    })
 }
 /// Drop any unused presampled masks.
 pub fn clear_presampled() { PRESAMPLED.lock().unwrap().clear(); }

@@ -2956,8 +2956,21 @@ int agl_morpheus_gauss_words() { return (int)(sizeof(mgauss::Consts) / 8); }
 // Samples coordinates [coord0, coord0+n) into device buffer d_out. Indices of
 // coordinates the host must replay go to h_flag_idx (capacity n); their count
 // to *h_nflag. d_out entries of flagged coordinates are 0 until scattered.
+// Optional low-priority stream for the calling thread's Gaussian sampling
+// (background presampling must not delay latency-bound work on the device).
+static thread_local cudaStream_t t_gauss_stream = 0;
+int agl_gauss_low_priority(int on) {
+    if (on && !t_gauss_stream) {
+        int lo = 0, hi = 0;
+        cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        if (cudaStreamCreateWithPriority(&t_gauss_stream, cudaStreamNonBlocking, lo) != cudaSuccess) { t_gauss_stream = 0; return -1; }
+    } else if (!on && t_gauss_stream) { cudaStreamDestroy(t_gauss_stream); t_gauss_stream = 0; }
+    return 0;
+}
+
 int agl_morpheus_gauss_dev(const uint64_t* h_consts, const uint64_t* h_base, uint32_t coord0, uint32_t n,
                            int64_t* d_out, uint32_t* h_flag_idx, uint32_t* h_nflag) {
+    cudaStream_t st = t_gauss_stream;
     *h_nflag = 0;
     if (n == 0) return 0;
     void *d_c = nullptr, *d_q0 = nullptr, *d_q1 = nullptr, *d_cnt = nullptr, *d_fl = nullptr;
@@ -2965,8 +2978,8 @@ int agl_morpheus_gauss_dev(const uint64_t* h_consts, const uint64_t* h_base, uin
     if (cuda_malloc(&d_c, sizeof(mgauss::Consts)) || cuda_malloc(&d_q0, qbytes) || cuda_malloc(&d_q1, qbytes) ||
         cuda_malloc(&d_fl, qbytes) || cuda_malloc(&d_cnt, 8)) return -1;
     uint32_t* cnt = (uint32_t*)d_cnt;  // [0] queue length, [1] flagged count
-    cudaMemcpy(d_c, h_consts, sizeof(mgauss::Consts), cudaMemcpyHostToDevice);
-    cudaMemset(cnt, 0, 8);
+    cudaMemcpyAsync(d_c, h_consts, sizeof(mgauss::Consts), cudaMemcpyHostToDevice, st);
+    cudaMemsetAsync(cnt, 0, 8, st);
     mgauss::CoinBase base;
     memcpy(base.lane, h_base, sizeof(base.lane));
     int dev = 0; cudaGetDevice(&dev);
@@ -2976,22 +2989,27 @@ int agl_morpheus_gauss_dev(const uint64_t* h_consts, const uint64_t* h_base, uin
     const uint32_t* in_idx = nullptr;
     uint32_t* out_q = (uint32_t*)d_q0;
     for (uint32_t tr = 0; in_n > 0 && tr < 8192; tr++) {
-        cudaMemset(cnt, 0, 4);
+        cudaMemsetAsync(cnt, 0, 4, st);
         long long need = ((long long)in_n + threads - 1) / threads;
-        int blocks = (int)(need < (long long)sms * 16 ? need : (long long)sms * 16);
-        mgauss::trial_kernel<<<blocks, threads>>>((const mgauss::Consts*)d_c, base, coord0, tr, in_idx, in_n, out_q, cnt,
+        // Background (low-priority) sampling uses one short block per 128
+        // coordinates so that other work's blocks are scheduled in between.
+        long long cap = st ? (1LL << 30) : (long long)sms * 16;
+        int blocks = (int)(need < cap ? need : cap);
+        mgauss::trial_kernel<<<blocks, threads, 0, st>>>((const mgauss::Consts*)d_c, base, coord0, tr, in_idx, in_n, out_q, cnt,
                                                   (long long*)d_out, (uint32_t*)d_fl, cnt + 1);
         uint32_t next = 0;
-        cudaMemcpy(&next, cnt, 4, cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(&next, cnt, 4, cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
         in_n = next;
         in_idx = out_q;
         out_q = (out_q == (uint32_t*)d_q0) ? (uint32_t*)d_q1 : (uint32_t*)d_q0;
     }
-    if (in_n > 0) mgauss::flag_rest_kernel<<<sms * 4, 256>>>(in_idx, in_n, (long long*)d_out, (uint32_t*)d_fl, cnt + 1);
-    cudaMemcpy(h_nflag, cnt + 1, 4, cudaMemcpyDeviceToHost);
-    if (*h_nflag) cudaMemcpy(h_flag_idx, d_fl, (size_t)*h_nflag * 4, cudaMemcpyDeviceToHost);
+    if (in_n > 0) mgauss::flag_rest_kernel<<<sms * 4, 256, 0, st>>>(in_idx, in_n, (long long*)d_out, (uint32_t*)d_fl, cnt + 1);
+    cudaMemcpyAsync(h_nflag, cnt + 1, 4, cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (*h_nflag) { cudaMemcpyAsync(h_flag_idx, d_fl, (size_t)*h_nflag * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); }
     cudaError_t e = cudaGetLastError();
-    if (e == cudaSuccess) e = agl_sync_mine();
+    if (e == cudaSuccess) e = st ? cudaStreamSynchronize(st) : agl_sync_mine();
     cuda_free(d_c); cuda_free(d_q0); cuda_free(d_q1); cuda_free(d_fl); cuda_free(d_cnt);
     return (int)e;
 }
