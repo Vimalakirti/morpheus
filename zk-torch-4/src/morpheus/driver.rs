@@ -67,6 +67,9 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
         }
         for (k, v) in by { println!("  {k:28} {:6} tensors {:>14} indices {:>14} digit slots", v.0, v.1, v.2); }
     }
+    if let Some(s) = crate::morpheus::request::request_support(&pp, &o) {
+        println!("public response support: {} of {} source columns", s.len(), o.profile.source_cols());
+    }
     if std::env::var("LAYOUT_ONLY").is_ok() { return; }
     let t = Instant::now();
     let mut pc = PcsGpu::new(o.profile.clone(), o.seed);
@@ -93,7 +96,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
             // The verifier sees only the serialized proof.
             let mut vt = Times::new();
             let t = Instant::now();
-            let pf = crate::morpheus::wire::decode_request(&o.profile, &out.bytes).expect("proof decodes");
+            let pf = crate::morpheus::wire::decode_request_compact(&o.profile, &request::request_support(&pp, &o).expect("public support"), &out.bytes).expect("proof decodes");
             println!("MORPHEUS_AUTH request={j} present={}", pf.auth.is_some());
             assert!(pf.auth.is_some(), "benchmark request lacks authentication");
             vt.insert("decode", t.elapsed().as_secs_f64());
@@ -131,7 +134,7 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
             let mut fv = 0.0;
             if o.verify {
                 let t = Instant::now();
-                let fpf = crate::morpheus::wire::decode_final(&o.profile, &fo.bytes).expect("finalization proof decodes");
+                let fpf = crate::morpheus::wire::decode_final_compact(&o.profile, &request::final_support(&pp, &o).expect("public support"), &fo.bytes).expect("finalization proof decodes");
                 println!("MORPHEUS_AUTH batch={b} present={}", fpf.auth.is_some());
                 assert!(fpf.auth.is_some(), "benchmark finalization lacks authentication");
                 let dec = t.elapsed().as_secs_f64();

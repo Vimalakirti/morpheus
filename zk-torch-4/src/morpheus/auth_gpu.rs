@@ -87,6 +87,49 @@ pub struct DevSource { pub w: DeviceBuffer<i8>, pub r: DeviceBuffer<i8> }
 #[derive(Debug, Default, Clone)]
 pub struct AuthTiming { pub attempts: u32, pub sample_ms: f64, pub first_msg_ms: f64, pub respond_ms: f64, pub decide_ms: f64, pub extract_ms: f64 }
 
+/// Public response support of the source block as column runs [start, end),
+/// sorted and disjoint (`auth_compact::Support`). The masks are zero outside
+/// it and only its columns are sent, so a proof equals `auth_compact::prove`.
+pub type Runs = Vec<(usize, usize)>;
+pub fn runs_of(s: &super::auth_compact::Support) -> Runs {
+    let mut r: Runs = Vec::new();
+    for &c in s.columns() {
+        match r.last_mut() { Some(l) if l.1 == c => l.1 = c + 1, _ => r.push((c, c + 1)) }
+    }
+    r
+}
+fn run_cols(r: &[(usize, usize)]) -> usize { r.iter().map(|&(a, b)| b - a).sum() }
+
+/// Support columns of τ rows of a dense [row][cols][N] block, packed in order.
+fn gather(z: &DeviceBuffer<i64>, cols: usize, runs: &[(usize, usize)]) -> DeviceBuffer<i64> {
+    let rows = z.len() / (cols * N);
+    let k = run_cols(runs);
+    let mut out = DeviceBuffer::<i64>::new(rows * k * N).unwrap();
+    for r in 0..rows {
+        let mut o = r * k * N;
+        for &(a, b) in runs {
+            unsafe { almost_goldilocks_cuda::memory::memcpy_dtod(out.as_mut_ptr().add(o) as *mut c_void, z.as_ptr().add((r * cols + a) * N) as *const c_void, (b - a) * N * 8).unwrap(); }
+            o += (b - a) * N;
+        }
+    }
+    out
+}
+/// Inverse of `gather`: zero extension to the full block.
+fn scatter(c: &DeviceBuffer<i64>, cols: usize, runs: &[(usize, usize)]) -> DeviceBuffer<i64> {
+    let k = run_cols(runs);
+    let rows = c.len() / (k * N);
+    let mut out = DeviceBuffer::<i64>::new(rows * cols * N).unwrap();
+    out.zero().unwrap();
+    for r in 0..rows {
+        let mut o = r * k * N;
+        for &(a, b) in runs {
+            unsafe { almost_goldilocks_cuda::memory::memcpy_dtod(out.as_mut_ptr().add((r * cols + a) * N) as *mut c_void, c.as_ptr().add(o) as *const c_void, (b - a) * N * 8).unwrap(); }
+            o += (b - a) * N;
+        }
+    }
+    out
+}
+
 fn norm(ptr: *const i64, n: usize) -> (u128, u64) {
     let mut o = [0u64; 3];
     let rc = unsafe { ffi::agl_mauth_norm(ptr, n as u64, o.as_mut_ptr()) };
@@ -96,7 +139,7 @@ fn norm(ptr: *const i64, n: usize) -> (u128, u64) {
 
 /// The device inputs of one authentication prover (the primary device or a
 /// replica): key caches, source witnesses and the auxiliary witness.
-pub struct AuthDev<'a> { pub dev: i32, pub keys: &'a Keys, pub sources: &'a [DevSource], pub s_o: &'a DeviceBuffer<i8> }
+pub struct AuthDev<'a> { pub dev: i32, pub keys: &'a Keys, pub sources: &'a [DevSource], pub s_o: &'a DeviceBuffer<i8>, pub runs: Option<&'a [(usize, usize)]> }
 
 /// Attempt masks sampled ahead of the authentication (device 0): they
 /// depend only on (opening, attempt), so they are drawn while the GPU is idle
@@ -114,17 +157,24 @@ fn to_host(b: &DeviceBuffer<i64>) -> Vec<i64> {
     v
 }
 
-fn sample_masks(p: &Profile, coins: &Coins, opening: u64, attempt: u16) -> Result<Masks, AuthError> {
+fn sample_masks(p: &Profile, coins: &Coins, opening: u64, attempt: u16, runs: Option<&[(usize, usize)]>) -> Result<Masks, AuthError> {
     let fs = FastSigma::new(p.sigma);
     let (sw, sl, so) = (p.source_cols(), p.link_cols(), p.aux_cols());
     let row = ((sw + sl + so) * N) as u64;
     let mut uw = DeviceBuffer::<i64>::new(2 * sw * N).unwrap();
     let mut ul = DeviceBuffer::<i64>::new(2 * sl * N).unwrap();
     let mut uo = DeviceBuffer::<i64>::new(2 * so * N).unwrap();
+    // Source masks only on the public support (same coordinates as the
+    // dense sampler); zero elsewhere.
+    let full = [(0, sw)];
+    let runs = runs.unwrap_or(&full);
+    if run_cols(runs) < sw { uw.zero().unwrap(); }
     for r in 0..p.tau {
         let b = r as u64 * row;
         unsafe {
-            sample_into(coins, opening, attempt, &fs, b as u32, (sw * N) as u32, uw.as_mut_ptr().add(r * sw * N)).map_err(AuthError::Sampler)?;
+            for &(c0, c1) in runs {
+                sample_into(coins, opening, attempt, &fs, (b + (c0 * N) as u64) as u32, ((c1 - c0) * N) as u32, uw.as_mut_ptr().add((r * sw + c0) * N)).map_err(AuthError::Sampler)?;
+            }
             sample_into(coins, opening, attempt, &fs, (b + (sw * N) as u64) as u32, (sl * N) as u32, ul.as_mut_ptr().add(r * sl * N)).map_err(AuthError::Sampler)?;
             sample_into(coins, opening, attempt, &fs, (b + ((sw + sl) * N) as u64) as u32, (so * N) as u32, uo.as_mut_ptr().add(r * so * N)).map_err(AuthError::Sampler)?;
         }
@@ -134,15 +184,15 @@ fn sample_masks(p: &Profile, coins: &Coins, opening: u64, attempt: u16) -> Resul
 
 /// Draw the masks of attempts 0..count on device 0 ahead of time, while
 /// device memory allows (each attempt's masks are kept until used).
-pub fn presample(p: &Profile, coins: &Coins, opening: u64, count: u16) {
+pub fn presample(p: &Profile, coins: &Coins, opening: u64, count: u16, runs: Option<&[(usize, usize)]>) {
     // Its own small thread pool: the PIOP running meanwhile is host-latency
     // bound and uses the global pool.
     match rayon::ThreadPoolBuilder::new().num_threads(4).build() {
-        Ok(pool) => pool.install(|| presample_in(p, coins, opening, count)),
-        Err(_) => presample_in(p, coins, opening, count),
+        Ok(pool) => pool.install(|| presample_in(p, coins, opening, count, runs)),
+        Err(_) => presample_in(p, coins, opening, count, runs),
     }
 }
-fn presample_in(p: &Profile, coins: &Coins, opening: u64, count: u16) {
+fn presample_in(p: &Profile, coins: &Coins, opening: u64, count: u16, runs: Option<&[(usize, usize)]>) {
     almost_goldilocks_cuda::set_device(0).expect("set device");
     // This thread's sampling kernels yield to the PIOP's.
     unsafe { ffi::agl_gauss_low_priority(1); }
@@ -160,7 +210,7 @@ fn presample_in(p: &Profile, coins: &Coins, opening: u64, count: u16) {
         let on_dev = free >= bytes + reserve;
         let host_ok = std::env::var("MORPHEUS_PRESAMPLE_HOST").is_ok();
         if !on_dev && (!host_ok || free < bytes + (2usize << 30)) { if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] presample stops: {:.1} GB free", free as f64 / 1e9); } break; }
-        match sample_masks(p, coins, opening, attempt) {
+        match sample_masks(p, coins, opening, attempt, runs) {
             Ok(m) => {
                 let pre = if on_dev { Pre::Dev(m) } else { Pre::Host(to_host(&m.0), to_host(&m.1), to_host(&m.2)) };
                 PRESAMPLED.lock().unwrap().push(((opening, attempt), pre)); done += 1;
@@ -206,11 +256,11 @@ fn run_attempt(
         timing.attempts += 1;
         let t0 = Instant::now();
         // U blocks laid out [row][cols][N] so both rows commit in one pass.
-        let (uw, ul, uo) = match take_presampled(opening, attempt) { Some(m) if ad.dev == 0 => m, _ => sample_masks(p, coins, opening, attempt)? };
+        let (uw, ul, uo) = match take_presampled(opening, attempt) { Some(m) if ad.dev == 0 => m, _ => sample_masks(p, coins, opening, attempt, ad.runs)? };
         let _ = (&fs, row);
         timing.sample_ms += t0.elapsed().as_secs_f64() * 1e3;
         let t0 = Instant::now();
-        let (d, d_o) = first_message(p, keys, None, &dp, &uw, &ul, &uo);
+        let (d, d_o) = first_message(p, keys, None, &dp, &uw, &ul, &uo, ad.runs);
         let _ = &dp.degs;
         timing.first_msg_ms += t0.elapsed().as_secs_f64() * 1e3;
         let t0 = Instant::now();
@@ -273,7 +323,7 @@ unsafe impl Sync for ShardSrc {}
 /// share of the responses, summed on the host. Same output as `run_attempt`.
 #[allow(clippy::too_many_arguments)]
 fn run_attempt_sharded(
-    p: &Profile, keys: &Keys, seed: Option<&KeySeed>, shards: &[ShardSrc], s_o: &DeviceBuffer<i8>, n: usize, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, attempt: u16, timing: &mut AuthTiming,
+    p: &Profile, keys: &Keys, seed: Option<&KeySeed>, shards: &[ShardSrc], s_o: &DeviceBuffer<i8>, n: usize, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, attempt: u16, runs: Option<&[(usize, usize)]>, timing: &mut AuthTiming,
 ) -> Result<AttemptOut, AuthError> {
     almost_goldilocks_cuda::set_device(0).expect("set device");
     let fs = FastSigma::new(p.sigma);
@@ -282,11 +332,11 @@ fn run_attempt_sharded(
     let row = ((sw + sl + so) * N) as u64;
     timing.attempts += 1;
     let t0 = Instant::now();
-    let (uw, ul, uo) = match take_presampled(opening, attempt) { Some(m) => m, None => sample_masks(p, coins, opening, attempt)? };
+    let (uw, ul, uo) = match take_presampled(opening, attempt) { Some(m) => m, None => sample_masks(p, coins, opening, attempt, runs)? };
     let _ = (&fs, row);
     timing.sample_ms += t0.elapsed().as_secs_f64() * 1e3;
     let t0 = Instant::now();
-    let (d, d_o) = first_message(p, keys, seed, &dp, &uw, &ul, &uo);
+    let (d, d_o) = first_message(p, keys, seed, &dp, &uw, &ul, &uo, runs);
     timing.first_msg_ms += t0.elapsed().as_secs_f64() * 1e3;
     let t0 = Instant::now();
     let beta = super::auth::challenges_pub(tr, &d, &d_o, attempt, n);
@@ -380,12 +430,12 @@ fn run_attempt_sharded(
 /// `prove` on the same inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_sharded(
-    p: &Profile, keys: &Keys, seed: Option<&KeySeed>, shards: &[ShardSrc], s_o: &DeviceBuffer<i8>, n: usize, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, keep_z: bool, timing: &mut AuthTiming,
+    p: &Profile, keys: &Keys, seed: Option<&KeySeed>, shards: &[ShardSrc], s_o: &DeviceBuffer<i8>, n: usize, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, keep_z: bool, runs: Option<&[(usize, usize)]>, timing: &mut AuthTiming,
 ) -> Result<AuthOut, AuthError> {
     for attempt in 0..p.attempts as u16 {
-        let o = run_attempt_sharded(p, keys, seed, shards, s_o, n, coins, opening, tr, pt, attempt, timing)?;
+        let o = run_attempt_sharded(p, keys, seed, shards, s_o, n, coins, opening, tr, pt, attempt, runs, timing)?;
         match o.verdict {
-            Coin::Accept => { let t = Instant::now(); let out = accept(p, attempt, o, keep_z); timing.extract_ms += t.elapsed().as_secs_f64() * 1e3; return Ok(out); }
+            Coin::Accept => { let t = Instant::now(); let out = accept(p, attempt, o, keep_z, runs); timing.extract_ms += t.elapsed().as_secs_f64() * 1e3; return Ok(out); }
             Coin::Reject => {}
             Coin::Abort => return Err(AuthError::CoinAbort),
         }
@@ -399,8 +449,20 @@ pub fn prove_sharded(
 /// resident source key cache (it was freed for the link), the key is
 /// generated from `seed` in column chunks and the NTT-domain partial
 /// products are summed; the result is the same.
-fn source_product(p: &Profile, keys: &Keys, seed: Option<&KeySeed>, uw: &DeviceBuffer<i64>) -> DeviceBuffer<u64> {
+fn source_product(p: &Profile, keys: &Keys, seed: Option<&KeySeed>, uw: &DeviceBuffer<i64>, runs: Option<&[(usize, usize)]>) -> DeviceBuffer<u64> {
     let (sw, c) = (p.source_cols(), p.source_cols() - p.rank);
+    if let (Some(r), true) = (runs, keys.w.buf.len() > 1) {
+        // Only the support columns are nonzero: gather them (the identity
+        // error columns, always in the support, come last) and index the key.
+        let k = run_cols(r);
+        if k < sw {
+            let g = gather(uw, sw, r);
+            let cols: Vec<u32> = r.iter().flat_map(|&(a, b)| (a..b).map(|x| x as u32)).filter(|&x| (x as usize) < c).collect();
+            assert_eq!(cols.len(), k - p.rank);
+            let idx = DeviceBuffer::from_slice(&cols).unwrap();
+            return finish(partial_raw(&keys.w, 5, g.as_ptr() as *const c_void, 8, 2, cols.len(), k * N, Some(&idx)), 2, 5, p.rank, None);
+        }
+    }
     if keys.w.buf.len() > 1 {
         return finish(partial_raw(&keys.w, 5, uw.as_ptr() as *const c_void, 8, 2, c, sw * N, None), 2, 5, p.rank, None);
     }
@@ -416,11 +478,11 @@ fn source_product(p: &Profile, keys: &Keys, seed: Option<&KeySeed>, uw: &DeviceB
     finish(acc.expect("no source columns"), 2, 5, p.rank, None)
 }
 
-fn first_message(p: &Profile, keys: &Keys, seed: Option<&KeySeed>, dp: &DevPoint, uw: &DeviceBuffer<i64>, ul: &DeviceBuffer<i64>, uo: &DeviceBuffer<i64>) -> (Vec<Tuple>, Vec<AuxTuple>) {
+fn first_message(p: &Profile, keys: &Keys, seed: Option<&KeySeed>, dp: &DevPoint, uw: &DeviceBuffer<i64>, ul: &DeviceBuffer<i64>, uo: &DeviceBuffer<i64>, runs: Option<&[(usize, usize)]>) -> (Vec<Tuple>, Vec<AuxTuple>) {
     let (sw, sl, so) = (p.source_cols(), p.link_cols(), p.aux_cols());
     let degs = p.degs();
     let half = K8::ONE.scale((Q + 1) / 2);
-    let cw = ring_rows(source_product(p, keys, seed, uw).to_vec().unwrap(), p.rank);
+    let cw = ring_rows(source_product(p, keys, seed, uw, runs).to_vec().unwrap(), p.rank);
     let cl = ring_rows(finish(partial_raw(&keys.l, 5, ul.as_ptr() as *const c_void, 8, 2, sl - p.rank, sl * N, None), 2, 5, p.rank, None).to_vec().unwrap(), p.rank);
     let co = ring_rows(finish(partial_raw(&keys.o, 5, uo.as_ptr() as *const c_void, 8, 2, so - p.rank, so * N, None), 2, 5, p.rank, None).to_vec().unwrap(), p.rank);
     let (mut d, mut d_o) = (Vec::new(), Vec::new());
@@ -459,10 +521,12 @@ fn first_message(p: &Profile, keys: &Keys, seed: Option<&KeySeed>, dp: &DevPoint
 
 type AuthOut = (AuthProof, Option<(DeviceBuffer<i64>, DeviceBuffer<i64>, DeviceBuffer<i64>)>);
 
-fn accept(p: &Profile, attempt: u16, o: AttemptOut, keep_z: bool) -> AuthOut {
+fn accept(p: &Profile, attempt: u16, o: AttemptOut, keep_z: bool, runs: Option<&[(usize, usize)]>) -> AuthOut {
     let (zw, zl, zo) = o.z;
-    // Serialize on the device (37 bits per coefficient), one D2H copy per block.
-    let z = if keep_z { Responses { w: pack_dev(p, &zw), l: pack_dev(p, &zl), o: pack_dev(p, &zo) } } else { Responses::default() };
+    // Serialize on the device (37 bits per coefficient), one D2H copy per
+    // block; the source block carries only its support columns.
+    let w = |zw: &DeviceBuffer<i64>| match runs { Some(r) if run_cols(r) < p.source_cols() => pack_dev(p, &gather(zw, p.source_cols(), r)), _ => pack_dev(p, zw) };
+    let z = if keep_z { Responses { w: w(&zw), l: pack_dev(p, &zl), o: pack_dev(p, &zo) } } else { Responses::default() };
     (AuthProof { attempt, d: o.d, d_o: o.d_o, z }, Some((zw, zl, zo)))
 }
 
@@ -498,11 +562,11 @@ pub fn prove(
     p: &Profile, keys: &Keys, coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point,
     sources: &[DevSource], s_o: &DeviceBuffer<i8>, keep_z: bool, timing: &mut AuthTiming,
 ) -> Result<AuthOut, AuthError> {
-    let ad = AuthDev { dev: -1, keys, sources, s_o };
+    let ad = AuthDev { dev: -1, keys, sources, s_o, runs: None };
     for attempt in 0..p.attempts as u16 {
         let o = run_attempt(p, &ad, coins, opening, tr, pt, attempt, timing)?;
         match o.verdict {
-            Coin::Accept => { let t = Instant::now(); let out = accept(p, attempt, o, keep_z); timing.extract_ms += t.elapsed().as_secs_f64() * 1e3; return Ok(out); }
+            Coin::Accept => { let t = Instant::now(); let out = accept(p, attempt, o, keep_z, ad.runs); timing.extract_ms += t.elapsed().as_secs_f64() * 1e3; return Ok(out); }
             Coin::Reject => {}
             Coin::Abort => return Err(AuthError::CoinAbort),
         }
@@ -546,7 +610,7 @@ pub fn prove_multi(
                         let dev = devs[(attempt - base) as usize].dev;
                         if dev >= 0 { almost_goldilocks_cuda::set_device(dev).expect("set device"); }
                         let t = Instant::now();
-                        done = Some(Ok(accept(p, attempt, o, keep_z)));
+                        done = Some(Ok(accept(p, attempt, o, keep_z, devs[0].runs)));
                         timing.extract_ms += t.elapsed().as_secs_f64() * 1e3;
                         if devs[0].dev >= 0 { almost_goldilocks_cuda::set_device(devs[0].dev).expect("set device"); }
                     }
@@ -564,10 +628,17 @@ pub fn prove_multi(
 /// GPU verifier of the masked authentication (same verdict as `auth::verify`).
 #[allow(clippy::too_many_arguments)]
 pub fn verify(p: &Profile, keys: &Keys, tr: &MTranscript, pt: &Point, targets: &[Tuple], target_o: &AuxTuple, pf: &AuthProof) -> bool {
+    verify_runs(p, keys, tr, pt, targets, target_o, pf, None)
+}
+/// `verify` with source responses on the public support `runs` only
+/// (virtual zero extension; same verdict as `auth_compact::verify`).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_runs(p: &Profile, keys: &Keys, tr: &MTranscript, pt: &Point, targets: &[Tuple], target_o: &AuxTuple, pf: &AuthProof, runs: Option<&[(usize, usize)]>) -> bool {
     use super::auth::{act_tuple, add_ring, add_tuple};
     use super::pcs_maps::{act_c0_a, act_c0_ring_q};
     use rayon::prelude::*;
-    if !super::wire::auth_shape_ok(p, pf) || targets.len() > p.n_max
+    let wcols = runs.map_or(p.source_cols(), run_cols);
+    if !super::wire::auth_shape_ok_cols(p, pf, wcols) || targets.len() > p.n_max
         || pt.xi.len() != p.ell() || !pt.xi.iter().all(super::wire::canonical_k)
         || !super::wire::canonical_k(&pt.rho) || pt.rho == K8::ZERO || pt.rho == K8::ONE
         || !targets.iter().all(|t| super::wire::commitment_ok(p, &t.c)
@@ -579,10 +650,11 @@ pub fn verify(p: &Profile, keys: &Keys, tr: &MTranscript, pt: &Point, targets: &
     }
     let n = targets.len();
     let beta = super::auth::challenges_pub(tr, &pf.d, &pf.d_o, pf.attempt, n);
-    let (zw, zl, zo) = match (unpack_dev(p, &pf.z.w, sw), unpack_dev(p, &pf.z.l, sl), unpack_dev(p, &pf.z.o, so)) {
+    let (zw, zl, zo) = match (unpack_dev(p, &pf.z.w, wcols), unpack_dev(p, &pf.z.l, sl), unpack_dev(p, &pf.z.o, so)) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => return false,
     };
+    let zw = match runs { Some(r) if wcols < sw => scatter(&zw, sw, r), _ => zw };
     // Caps per row and block.
     for (zb, cols) in [(&zw, sw), (&zl, sl), (&zo, so)] {
         for r in 0..p.tau {
@@ -591,7 +663,7 @@ pub fn verify(p: &Profile, keys: &Keys, tr: &MTranscript, pt: &Point, targets: &
         }
     }
     let dp = DevPoint::new(p, pt);
-    let (lhs, lhs_o) = first_message(p, keys, None, &dp, &zw, &zl, &zo);
+    let (lhs, lhs_o) = first_message(p, keys, None, &dp, &zw, &zl, &zo, runs);
     for r in 0..p.tau {
         let acted: Vec<Tuple> = targets.par_iter().enumerate().map(|(e, t)| act_tuple(&beta[r][e], t)).collect();
         let rhs = acted.iter().fold(pf.d[r].clone(), |acc, t| add_tuple(&acc, t));
@@ -655,6 +727,54 @@ mod tests {
     }
 
     #[test]
+    fn gpu_compact_authentication_equals_cpu_compact() {
+        use super::super::auth_compact::{self, Support};
+        let p = Profile::toy();
+        let seed = KeySeed([5; 8]);
+        let coins = Coins::new([11u8; 64], CoinProfile::Ternary);
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(7);
+        let support = Support::from_public_columns(&p, vec![0, 2, 3, 4, 5, 6, 7]).unwrap();
+        let tern = |rng: &mut rand_chacha::ChaCha20Rng, cols: usize| -> Vec<Vec<i64>> { (0..cols).map(|_| ternary_vec(rng, N).unwrap()).collect() };
+        let mut raw = Vec::new();
+        let mut sources = Vec::new();
+        for _ in 0..2 {
+            let mut w = tern(&mut rng, p.source_cols());
+            w[1] = vec![0; N];
+            let mut r8 = vec![0i8; p.source_cols() * N];
+            for c in 0..p.source_cols() { for i in 0..N { r8[c * N + i] = w[c][super::super::ring::phys_of_logical(i)] as i8; } }
+            assert!((0..p.source_cols()).all(|c| auth_compact::raw_column(&r8, c) == w[c]));
+            let u = AElem((0..64).map(|_| rk(&mut rng)).collect());
+            sources.push(SourceVec { w, r: [enc(&u), tern(&mut rng, p.hiding + p.rank)].concat() });
+            raw.push(r8);
+        }
+        let aux_payload: Vec<Vec<i64>> = (0..p.aux_coeffs).flat_map(|_| enc(&AElem((0..64).map(|_| rk(&mut rng)).collect()))).collect();
+        let s_o = [aux_payload, tern(&mut rng, p.hiding + p.rank)].concat();
+        let pt = Point { xi: (0..p.ell()).map(|_| rk(&mut rng)).collect(), rho: rk(&mut rng) };
+        let targets: Vec<Tuple> = sources.iter().map(|s| f_x(&p, &seed, &pt, &s.w, &s.r)).collect();
+        let target_o = f_ox(&p, &seed, &pt, &s_o);
+        let mut tr = MTranscript::new(p.name, &coins.salt(0));
+        for t in &targets { for c in &t.c { tr.absorb(Item::SourceCommitment, c); } }
+        let links: Vec<Vec<Vec<i64>>> = sources.iter().map(|s| s.r.clone()).collect();
+        let cpu = auth_compact::prove(&p, &seed, &coins, 0, &tr, &pt, &support, &raw, &links, &s_o).unwrap();
+
+        let keys = Keys::build(&p, &seed);
+        let runs = runs_of(&support);
+        assert_eq!(runs, vec![(0, 1), (2, 8)]);
+        let dsrc: Vec<DevSource> = sources.iter().map(|s| DevSource { w: to_dev(&s.w), r: to_dev(&s.r) }).collect();
+        let so = to_dev(&s_o);
+        let devs = [AuthDev { dev: -1, keys: &keys, sources: &dsrc, s_o: &so, runs: Some(&runs) }];
+        let mut tm = AuthTiming::default();
+        let (gpu, _) = prove_multi(&p, &devs, &coins, 0, &tr, &pt, true, &mut tm).unwrap();
+        assert_eq!(gpu, cpu);
+        assert!(verify_runs(&p, &keys, &tr, &pt, &targets, &target_o, &gpu, Some(&runs)));
+        assert!(auth_compact::verify(&p, &seed, &tr, &pt, &support, &targets, &target_o, &gpu));
+        assert!(!verify(&p, &keys, &tr, &pt, &targets, &target_o, &gpu));
+        let mut bad = gpu.clone();
+        bad.z.w[3] ^= 1;
+        assert!(!verify_runs(&p, &keys, &tr, &pt, &targets, &target_o, &bad, Some(&runs)));
+    }
+
+    #[test]
     fn chunked_source_product_equals_cached_product() {
         let p = Profile::toy();
         let seed = KeySeed([5; 8]);
@@ -663,11 +783,11 @@ mod tests {
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(7);
         let u: Vec<i64> = (0..2 * sw * N).map(|_| rng.gen_range(-1_000_000_000i64..1_000_000_000)).collect();
         let uw = DeviceBuffer::from_slice(&u).unwrap();
-        let full = source_product(&p, &keys, None, &uw).to_vec().unwrap();
+        let full = source_product(&p, &keys, None, &uw, None).to_vec().unwrap();
         keys.w = KeyCache { buf: DeviceBuffer::<u32>::new(1).unwrap(), ..keys.w.clone_meta() };
         for chunk in ["1", "2", "100"] {
             std::env::set_var("MORPHEUS_W_CHUNK", chunk);
-            assert_eq!(source_product(&p, &keys, Some(&seed), &uw).to_vec().unwrap(), full, "chunk {chunk}");
+            assert_eq!(source_product(&p, &keys, Some(&seed), &uw, None).to_vec().unwrap(), full, "chunk {chunk}");
         }
         std::env::remove_var("MORPHEUS_W_CHUNK");
     }

@@ -295,8 +295,8 @@ fn main() {
         almost_goldilocks_cuda::set_device(0).unwrap();
         if !reps.is_empty() { println!("auth replicas ready after {:.2}s wait", tw.elapsed().as_secs_f64()); }
         let s_o0 = to_dev(&fast.s_o);
-        let mut devs = vec![auth_gpu::AuthDev { dev: 0, keys, sources: &dsrc, s_o: &s_o0 }];
-        for (j, r) in reps.iter().enumerate() { devs.push(auth_gpu::AuthDev { dev: r.dev, keys: &r.keys, sources: &rsrc[j], s_o: &s_os[j] }); }
+        let mut devs = vec![auth_gpu::AuthDev { dev: 0, keys, sources: &dsrc, s_o: &s_o0, runs: None }];
+        for (j, r) in reps.iter().enumerate() { devs.push(auth_gpu::AuthDev { dev: r.dev, keys: &r.keys, sources: &rsrc[j], s_o: &s_os[j], runs: None }); }
         let (apf, _) = auth_gpu::prove_multi(&profile, &devs, &coins, 0, &t1, &fast.point, std::env::var("NO_AUTH_VERIFY").is_err(), &mut tm).expect("auth");
         println!("auth (GPU) {:.2}s, attempt {} {:?}", t.elapsed().as_secs_f64(), apf.attempt, tm);
         if std::env::var("NO_AUTH_VERIFY").is_err() {

@@ -423,7 +423,7 @@ fn key_devs<'k>(pc: &'k PcsGpu, reps: &'k [AuthReplica]) -> Vec<(i32, &'k auth_g
 }
 
 /// Streamed authentication over the link's kept per-device source ranges.
-fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::LinkOutput, t1: &MTranscript, times: &mut Times) -> AuthProof {
+fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::LinkOutput, t1: &MTranscript, runs: &[(usize, usize)], times: &mut Times) -> AuthProof {
     let t = Instant::now();
     pc.kept_to_phys();
     // Rebuild the resident source key cache if it fits next to the kept
@@ -441,7 +441,7 @@ fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::L
     almost_goldilocks_cuda::set_device(0).unwrap();
     let s_o = DeviceBuffer::from_slice(&fast.s_o.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
     let mut tm = AuthTiming::default();
-    let (apf, _) = auth_gpu::prove_sharded(&o.profile, &pc.keys, if pc.keys.w.buf.len() > 1 { None } else { Some(&o.seed) }, &shards, &s_o, fast.sources.len(), &o.coins, opening, t1, &fast.point, true, &mut tm).expect("authentication");
+    let (apf, _) = auth_gpu::prove_sharded(&o.profile, &pc.keys, if pc.keys.w.buf.len() > 1 { None } else { Some(&o.seed) }, &shards, &s_o, fast.sources.len(), &o.coins, opening, t1, &fast.point, true, Some(runs), &mut tm).expect("authentication");
     drop(k);
     let secs = lap(times, "auth", t);
     if o.timing { eprintln!("[auth, sharded] {:.2}s, attempt {} {:?}", secs, apf.attempt, tm); }
@@ -454,7 +454,7 @@ fn load_replicas<'s>(sc: &'s std::thread::Scope<'s, '_>, reps: Vec<AuthReplica>,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn authenticate(o: &Opts, opening: u64, pc: &mut PcsGpu, reps: &mut [AuthReplica], fast: &link::LinkOutput, t1: &MTranscript, times: &mut Times) -> AuthProof {
+fn authenticate(o: &Opts, opening: u64, pc: &mut PcsGpu, reps: &mut [AuthReplica], fast: &link::LinkOutput, t1: &MTranscript, runs: &[(usize, usize)], times: &mut Times) -> AuthProof {
     let to_dev = |cols: &[Vec<i64>]| DeviceBuffer::from_slice(&cols.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
     let t = Instant::now();
     pc.ensure_w();
@@ -464,8 +464,8 @@ fn authenticate(o: &Opts, opening: u64, pc: &mut PcsGpu, reps: &mut [AuthReplica
     let s_os: Vec<DeviceBuffer<i8>> = reps.iter().map(|r| { almost_goldilocks_cuda::set_device(r.dev).unwrap(); to_dev(&fast.s_o) }).collect();
     almost_goldilocks_cuda::set_device(0).unwrap();
     let s_o0 = to_dev(&fast.s_o);
-    let mut devs = vec![AuthDev { dev: 0, keys: &pc.keys, sources: &dsrc, s_o: &s_o0 }];
-    for (k, r) in reps.iter().enumerate() { devs.push(AuthDev { dev: r.dev, keys: &r.keys, sources: &rsrc[k], s_o: &s_os[k] }); }
+    let mut devs = vec![AuthDev { dev: 0, keys: &pc.keys, sources: &dsrc, s_o: &s_o0, runs: Some(runs) }];
+    for (k, r) in reps.iter().enumerate() { devs.push(AuthDev { dev: r.dev, keys: &r.keys, sources: &rsrc[k], s_o: &s_os[k], runs: Some(runs) }); }
     let mut tm = AuthTiming::default();
     let (apf, _) = auth_gpu::prove_multi(&o.profile, &devs, &o.coins, opening, t1, &fast.point, true, &mut tm).expect("authentication");
     let secs = lap(times, "auth", t);
@@ -510,6 +510,10 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     pp.pd.bank = piop::sample_bank(&o.coins, opening, 1usize << o.cfg.slots_log);
     lap(&mut times, "bank", t);
     let defer = o.defer;
+    // Public response support (registered layout only, no witness or coin):
+    // the authentication masks and responses cover these source columns.
+    let support = request_support(pp, o).expect("invalid registered public layout");
+    let runs = auth_gpu::runs_of(&support);
     let Prepared { g, pd, lay, req, carry, .. } = &*pp;
     // Streamed sources uploaded for the link while the PIOP runs (one device).
     let pre_raw: std::sync::Mutex<Option<DeviceBuffer<i8>>> = std::sync::Mutex::new(None);
@@ -574,8 +578,8 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         // leaves the device mostly idle (MORPHEUS_PRESAMPLE attempts, default 3).
         if o.auth {
             let n: u16 = std::env::var("MORPHEUS_PRESAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-            let (prof, coins) = (&o.profile, &o.coins);
-            if n > 0 { sc.spawn(move || auth_gpu::presample(prof, coins, opening, n)); }
+            let (prof, coins, runs) = (&o.profile, &o.coins, &runs);
+            if n > 0 { sc.spawn(move || auth_gpu::presample(prof, coins, opening, n, Some(runs))); }
         }
         // PIOP.
         let model_prefix = if defer { 0 } else { pp.model.len() };
@@ -644,7 +648,8 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     // The logical source copy served the link; the authentication uses the
     // physical columns.
     if o.auth && !pc.streamed && !defer { pc.flat = None; }
-    let auth = if !o.auth { None } else if pc.streamed { Some(authenticate_streamed(o, opening, pc, &fast, &t1, &mut times)) } else { Some(authenticate(o, opening, pc, &mut rep_vec, &fast, &t1, &mut times)) };
+    if o.auth && support.len() < o.profile.source_cols() { super::auth_compact::check_raw_support(&o.profile, &support, &raw); }
+    let auth = if !o.auth { None } else if pc.streamed { Some(authenticate_streamed(o, opening, pc, &fast, &t1, &runs, &mut times)) } else { Some(authenticate(o, opening, pc, &mut rep_vec, &fast, &t1, &runs, &mut times)) };
     auth_gpu::clear_presampled();
     reps.r = rep_vec;
     pc.streamed = false;
@@ -655,7 +660,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     let c_carry = if defer { c_src.last().cloned() } else { None };
     let piop_len = ctx.proof.len();
     let pf = wire::RequestProof { salt, piop: std::mem::take(&mut ctx.proof), c_src, link: fast.proof, auth };
-    let bytes = wire::encode_request(&o.profile, &pf);
+    let bytes = if o.auth { wire::encode_request_compact(&o.profile, &support, &pf).expect("compact request encode") } else { wire::encode_request(&o.profile, &pf) };
     lap(&mut times, "serialize", t);
     RequestOut { bytes, piop_len, c_carry, carry_raw, deferred, digest: dg, literal_prefix: t1.literal_prefix().to_vec(), times, rows: ctx.rows.len(), carries: ncarry }
 }
@@ -668,7 +673,9 @@ fn registered_model_matches(n_model: usize, defer: bool, expected: Option<&[Vec<
 
 /// Verifier of request `j`; returns deferred rows, diagnostic digest, and literal public prefix.
 pub fn verify_request(pp: &Prepared, o: &Opts, j: u64, model: Option<RegisteredModel<'_>>, input: RegisteredInput<'_>, out: &wire::RequestProof, keys: &auth_gpu::Keys, times: &mut Times) -> Option<(Vec<Row>, K8, Vec<u8>)> {
-    verify_request_with(pp, o, j, model, input, out, times, o.profile.source_cols(), &|tr, pt, targets, target_o, apf| auth_gpu::verify(&o.profile, keys, tr, pt, targets, target_o, apf))
+    let support = request_support(pp, o)?;
+    let runs = auth_gpu::runs_of(&support);
+    verify_request_with(pp, o, j, model, input, out, times, support.len(), &|tr, pt, targets, target_o, apf| auth_gpu::verify_runs(&o.profile, keys, tr, pt, targets, target_o, apf, Some(&runs)))
 }
 
 /// Host authentication backend; all statement, registry, graph and link gates
@@ -810,7 +817,10 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
     let t = Instant::now();
     let fast = link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut tr, &st, &raw, o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), true);
     lap(&mut times, "link", t);
-    let auth = if !o.auth { None } else if pc.streamed { Some(authenticate_streamed(o, opening, pc, &fast, &tr, &mut times)) } else { Some(authenticate(o, opening, pc, &mut rep_vec, &fast, &tr, &mut times)) };
+    let support = final_support(pp, o).expect("invalid final public support");
+    let runs = auth_gpu::runs_of(&support);
+    if o.auth && support.len() < o.profile.source_cols() { super::auth_compact::check_raw_support(&o.profile, &support, &raw); }
+    let auth = if !o.auth { None } else if pc.streamed { Some(authenticate_streamed(o, opening, pc, &fast, &tr, &runs, &mut times)) } else { Some(authenticate(o, opening, pc, &mut rep_vec, &fast, &tr, &runs, &mut times)) };
     reps.r = rep_vec;
     pc.streamed = false;
     pc.unload();
@@ -818,7 +828,8 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
     raw.truncate(nm);
     model.raw = raw;
     let t = Instant::now();
-    let bytes = wire::encode_final(&o.profile, &wire::FinalProof { salt, link: fast.proof, auth });
+    let fp = wire::FinalProof { salt, link: fast.proof, auth };
+    let bytes = if o.auth { wire::encode_final_compact(&o.profile, &support, &fp).expect("compact final encode") } else { wire::encode_final(&o.profile, &fp) };
     lap(&mut times, "serialize", t);
     FinalOut { bytes, times, rows: st.rows.len() }
 }
@@ -827,7 +838,9 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
 /// this same independently pinned model/program/layout; this function does not
 /// re-run request verification. The expected model commitments are external.
 pub fn verify_final(pp: &Prepared, o: &Opts, b: u64, model: RegisteredModel<'_>, q: &[QueueEntry], out: &wire::FinalProof, keys: &auth_gpu::Keys, times: &mut Times) -> bool {
-    verify_final_with(pp, o, b, model, q, out, times, o.profile.source_cols(), &|tr, pt, targets, target_o, apf| auth_gpu::verify(&o.profile, keys, tr, pt, targets, target_o, apf))
+    let Some(support) = final_support(pp, o) else { return false };
+    let runs = auth_gpu::runs_of(&support);
+    verify_final_with(pp, o, b, model, q, out, times, support.len(), &|tr, pt, targets, target_o, apf| auth_gpu::verify_runs(&o.profile, keys, tr, pt, targets, target_o, apf, Some(&runs)))
 }
 /// Host finalization verifier sharing every registry, queue, transcript and link
 /// check with the GPU backend. Queue entries must come from verified requests.

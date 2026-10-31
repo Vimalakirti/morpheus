@@ -604,7 +604,7 @@ mod tests {
 pub const COMPACT_MAGIC:&[u8;8]=b"MCOLv001";
 fn valid_codes(p:&Profile,bytes:&[u8])->bool{
     // One physical column at a time, bounded temporary decode storage.
-    let n=packed_len(N);bytes.len()%n==0&&bytes.chunks(n).all(|b|unpack37(b,N,z_off(p),z_umax(p)).is_some())
+    use rayon::prelude::*;let n=packed_len(N);bytes.len()%n==0&&bytes.par_chunks(n).all(|b|unpack37(b,N,z_off(p),z_umax(p)).is_some())
 }
 pub(crate) fn auth_shape_ok_cols(p:&Profile,a:&AuthProof,cols:usize)->bool{
     (a.attempt as usize)<p.attempts&&a.d.len()==p.tau&&a.d_o.len()==p.tau
