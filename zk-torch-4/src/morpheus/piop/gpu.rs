@@ -13,6 +13,11 @@ pub fn threshold() -> usize {
     static T: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| std::env::var("MORPHEUS_GPU_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 12));
     *T
 }
+/// Smallest table evaluated by `mle` on the device (one kernel, one readback).
+pub fn mle_threshold() -> usize {
+    static T: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| std::env::var("MORPHEUS_MLE_GPU_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 9));
+    *T
+}
 pub fn enabled() -> bool {
     if !cfg!(feature = "cuda") {
         assert!(std::env::var_os("MORPHEUS_PIOP_GPU").map(|v| v == "0").unwrap_or(true), "GPU requested in a CUDA-free build");
@@ -94,9 +99,22 @@ pub fn partial_eval(vals: &DeviceBuffer<u64>, n: usize, fixed: &[(usize, K8)]) -
 }
 
 /// MLE of a base table at a K point.
+/// (calls, host eq ns, device call ns) of `mle`.
+pub static MLE_STATS: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
 pub fn mle(vals: &DeviceBuffer<u64>, point: &[K8]) -> K8 {
-    let fixed: Vec<(usize, K8)> = point.iter().copied().enumerate().collect();
-    partial_eval(vals, point.len(), &fixed).first()
+    use std::sync::atomic::Ordering::Relaxed;
+    let t0 = std::time::Instant::now();
+    // One kernel over the split eq table (no 2^n table, one small readback).
+    // Point split low/mid/high on the device (eq tables of ≤ 2^8 entries per block).
+    let n = point.len();
+    if n > 24 { return partial_eval(vals, n, &point.iter().copied().enumerate().collect::<Vec<_>>()).first(); }
+    let pw: Vec<u64> = point.iter().flat_map(|k| k.0).collect();
+    let mut out = [0u64; 8];
+    let t1 = std::time::Instant::now();
+    let rc = unsafe { ffi::agl_mpiop_mle(vals.as_ptr(), pw.as_ptr(), n as i32, out.as_mut_ptr()) };
+    assert_eq!(rc, 0, "mle kernel");
+    MLE_STATS.0.fetch_add(1, Relaxed); MLE_STATS.1.fetch_add((t1 - t0).as_nanos() as u64, Relaxed); MLE_STATS.2.fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
+    K8(out)
 }
 
 /// eq table of a point (little-endian, = field8::eq_table).

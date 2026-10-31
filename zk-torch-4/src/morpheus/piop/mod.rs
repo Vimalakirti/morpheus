@@ -830,7 +830,7 @@ impl<'g, 'a> Walk<'g, 'a> {
 
     fn mle_e(&self, e: usize, r: &[K8]) -> K8 {
         let pd = self.pd.unwrap();
-        backend_tables!(gpu::enabled() && (1usize << r.len()) >= gpu::threshold(), { gpu::mle(&pd.dev(e), r) }, { mle(pd.v(e), r) })
+        backend_tables!(gpu::enabled() && (1usize << r.len()) >= gpu::mle_threshold(), { gpu::mle(&pd.dev(e), r) }, { mle(pd.v(e), r) })
     }
 
     /// MLE of a public program literal. A constant table (the interval
@@ -1009,7 +1009,7 @@ impl<'g, 'a> Walk<'g, 'a> {
         let a = ctx.alloc("linear/merge child pad");
         let t0 = std::time::Instant::now();
         let m = if ctx.prover { Some(self.mle_e(e, r)) } else { None };
-        if ctx.prover { ctx.tick(if gpu::enabled() && (1usize << r.len()) >= gpu::threshold() { ".mle_dev" } else { ".mle_host" }, t0); }
+        if ctx.prover { ctx.tick(if gpu::enabled() && (1usize << r.len()) >= gpu::mle_threshold() { ".mle_dev" } else { ".mle_host" }, t0); }
         let v = ctx.send(m.map(|m| m.add(&ctx.bank[a as usize])));
         (a, v)
     }

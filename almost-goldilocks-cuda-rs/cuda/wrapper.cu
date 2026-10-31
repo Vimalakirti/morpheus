@@ -3526,6 +3526,32 @@ int agl_mpiop_pe(const uint64_t* d_vals, const int* rest_pos, int nrest_v, const
     return rc;
 }
 
+int agl_mpiop_mle(const uint64_t* d_vals, const uint64_t* h_point, int n, uint64_t* h_out) {
+    const int nlo = n < 8 ? n : 8, nmid = n - nlo < 8 ? n - nlo : 8, nhi = n - nlo - nmid;
+    if (nhi > 8) return -2;
+    const uint64_t nrows = 1ULL << (nmid + nhi);
+    uint64_t g = (nrows + 7) / 8; if (g > (uint64_t)ma_sms() * 4) g = (uint64_t)ma_sms() * 4;
+    const int grid = (int)g;
+    void* buf = nullptr;
+    const size_t eb = (size_t)(24 + 768) * 64, pb = (size_t)grid * 64;
+    if (cuda_malloc(&buf, eb + pb)) return -1;
+    if (n > 0) cudaMemcpy(buf, h_point, (size_t)n * 64, cudaMemcpyHostToDevice);
+    mauth::K8d* tab = (mauth::K8d*)buf + 24;
+    mauth::K8d* part = (mauth::K8d*)((char*)buf + eb);
+    mpiop::eq3_kernel<<<3, 256>>>((const mauth::K8d*)buf, nlo, nmid, nhi, tab);
+    mpiop::mle2_kernel<<<grid, 256>>>((const unsigned long long*)d_vals, tab, nlo, nmid, nhi, part);
+    int rc = mp_ret();
+    if (rc == 0) {
+        std::vector<uint64_t> h((size_t)grid * 8);
+        cudaMemcpy(h.data(), part, h.size() * 8, cudaMemcpyDeviceToHost);
+        for (int a = 0; a < 8; a++) h_out[a] = 0;
+        for (int k = 0; k < grid; k++) for (int a = 0; a < 8; a++)
+            h_out[a] = (uint64_t)(((unsigned __int128)h_out[a] + h[(size_t)k * 8 + a]) % 18446744069414584289ULL);
+    }
+    cuda_free(buf);
+    return rc;
+}
+
 int agl_mpiop_sel_lookup(const uint64_t* d_sel, uint64_t n, int shift, uint64_t mask, const uint64_t* d_table, uint64_t* d_out) {
     mpiop::sel_lookup_kernel<<<mp_grid(n, 256), 256>>>((const mpiop::u64*)d_sel, n, shift, mask, (const mauth::K8d*)d_table, (mauth::K8d*)d_out);
     return mp_ret();

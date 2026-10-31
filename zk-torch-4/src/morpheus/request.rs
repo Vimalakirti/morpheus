@@ -550,6 +550,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         walk.run(&mut ctx);
         lap(&mut times, "piop", t);
         if o.timing { let u = piop::gpu::UPLOAD.lock().unwrap(); eprintln!("[piop] edge uploads: {} edges, {:.2} GB, {:.2} s", u.0, u.1 as f64 / 1e9, u.2); }
+        if o.timing { use std::sync::atomic::Ordering::Relaxed; let m = &piop::gpu::MLE_STATS; eprintln!("[piop] device mle: {} calls, host eq {:.3} s, device {:.3} s", m.0.load(Relaxed), m.1.load(Relaxed) as f64 / 1e9, m.2.load(Relaxed) as f64 / 1e9); }
         if o.timing { let q = &super::transcript::QUERY_STATS; eprintln!("[transcript] queries so far: {} ({:.2} s)", q.0.load(std::sync::atomic::Ordering::Relaxed), q.1.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); }
         pd.clear_cache();
         if o.timing { for (k, v) in &ctx.stats { eprintln!("  {k:12} {:6} calls {:.3}s", v.0, v.1); } }

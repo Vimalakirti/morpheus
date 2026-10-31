@@ -74,6 +74,35 @@ impl K8 {
     /// summed in u128 before one more reduction; the wrapped half is scaled
     /// by W = 3 the same way, so no intermediate overflows (8 * 2^64 * 3 < 2^128).
     pub fn mul(&self, o: &K8) -> K8 {
+        // Unreduced 128-bit products summed in 192 bits per output coefficient
+        // (the Θ^8-wrapped half scaled by W = 3), one reduction each.
+        let a: [u64; 8] = self.0.map(canon);
+        let b: [u64; 8] = o.0.map(canon);
+        let mut lo = [0u128; 8];
+        let mut ov = [0u64; 8];
+        let mut hl = [0u128; 8];
+        let mut hov = [0u64; 8];
+        for i in 0..8 {
+            for j in 0..8 {
+                let p = a[i] as u128 * b[j] as u128;
+                let k = i + j;
+                if k < 8 { let (s, c) = lo[k].overflowing_add(p); lo[k] = s; ov[k] += c as u64; }
+                else { let (s, c) = hl[k - 8].overflowing_add(p); hl[k - 8] = s; hov[k - 8] += c as u64; }
+            }
+        }
+        let mut r = [0u64; 8];
+        for k in 0..8 {
+            // x = lo + ov·2^128 + 3·(hl + hov·2^128) mod q, 2^128 ≡ C² (mod q).
+            let h = reduce128(hl[k]) as u128 * W as u128;                       // < 2^66
+            let (s, c) = lo[k].overflowing_add(h);
+            let top = ov[k] + c as u64 + W * hov[k];                              // small
+            const C2: u64 = 63 * (1u64 << 32) + 992;                            // 2^128 mod q
+            r[k] = reduce128(reduce128(s) as u128 + top as u128 * C2 as u128);
+        }
+        K8(r)
+    }
+    #[cfg(test)]
+    pub fn mul_ref(&self, o: &K8) -> K8 {
         let a: [u64; 8] = self.0.map(canon);
         let b: [u64; 8] = o.0.map(canon);
         let mut lo = [0u128; 8];
@@ -207,5 +236,22 @@ mod tests {
         }
         let s_all = t.iter().fold(K8::ZERO, |acc, x| acc.add(x));
         assert_eq!(s_all, K8::ONE);
+    }
+}
+
+#[cfg(test)]
+mod mul_tests {
+    use super::*;
+    #[test]
+    fn fast_mul_matches_reference() {
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let edge = [0u64, 1, 2, Q - 1, Q - 2, Q, Q + 5, u64::MAX, 1 << 63, (1 << 32) + 31];
+        for it in 0..20000 {
+            let gen = |next: &mut dyn FnMut() -> u64, i: usize| -> u64 { if it % 3 == 0 { edge[(next() as usize + i) % edge.len()] } else { next() } };
+            let a = K8(std::array::from_fn(|i| gen(&mut next, i)));
+            let b = K8(std::array::from_fn(|i| gen(&mut next, i)));
+            assert_eq!(a.mul(&b), a.mul_ref(&b), "{a:?} * {b:?}");
+        }
     }
 }

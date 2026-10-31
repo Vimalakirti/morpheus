@@ -26,7 +26,68 @@ __device__ __forceinline__ uint64_t deposit(uint64_t x, const VarMap& m) {
 }
 __device__ __forceinline__ K8d kmulb(const K8d& a, u64 v) { K8d r; for (int j = 0; j < 8; j++) r.c[j] = mauth::fmul(a.c[j], v); return r; }
 
-/// 256 threads = 32 outputs × 8 f-lanes.
+/// MLE of a base table at a K point without a full eq table: the point is
+/// split low/mid/high (≤ 8 variables each, eq tables built per block in
+/// shared memory) and
+///   Σ_{h,m} eh[h]·em[m]·Σ_l el[l]·vals[(((h << nmid) | m) << nlo) | l],
+/// a warp per row (h, m); partial[block] = the block's sum.
+__device__ __forceinline__ void eq_smem(K8d* e, const K8d* r, int n) {
+    if (threadIdx.x == 0) { e[0] = kzero(); e[0].c[0] = 1; }
+    __syncthreads();
+    for (int j = 0; j < n; j++) {
+        const int half = 1 << j;
+        K8d omr = kzero(); omr.c[0] = 1; omr = ksub(omr, r[j]);
+        for (int t = threadIdx.x; t < half; t += blockDim.x) { const K8d x = e[t]; e[t | half] = mauth::k8_mul(x, r[j]); e[t] = mauth::k8_mul(x, omr); }
+        __syncthreads();
+    }
+}
+/// The three eq tables of `mle2_kernel`: block b builds tab[256b..256b+256)
+/// (el, em, eh), entry t = Π_j (bit_j(t) ? r_j : 1 − r_j) (no dependent levels).
+__global__ void __launch_bounds__(256) eq3_kernel(const K8d* __restrict__ point, int nlo, int nmid, int nhi, K8d* __restrict__ tab) {
+    const int b = blockIdx.x, t = threadIdx.x;
+    const int nb = b == 0 ? nlo : b == 1 ? nmid : nhi;
+    const K8d* r = point + (b == 0 ? 0 : b == 1 ? nlo : nlo + nmid);
+    if (t >= (1 << nb)) return;
+    K8d acc = kzero(); acc.c[0] = 1;
+    for (int j = 0; j < nb; j++) {
+        K8d f;
+        if ((t >> j) & 1) f = r[j]; else { f = kzero(); f.c[0] = 1; f = ksub(f, r[j]); }
+        acc = j == 0 ? f : mauth::k8_mul(acc, f);
+    }
+    tab[256 * b + t] = kcanon(acc);
+}
+__global__ void __launch_bounds__(256) mle2_kernel(const u64* __restrict__ vals, const K8d* __restrict__ tab, int nlo, int nmid, int nhi,
+                                                   K8d* __restrict__ partial) {
+    __shared__ K8d wsum[8];
+    const K8d* el = tab; const K8d* em = tab + 256; const K8d* eh = tab + 512;
+    const uint64_t nrows = 1ULL << (nmid + nhi);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const uint64_t gw = (uint64_t)blockIdx.x * 8 + warp, nw = (uint64_t)gridDim.x * 8;
+    K8d accw = kzero();
+    for (uint64_t row = gw; row < nrows; row += nw) {
+        K8d acc = kzero();
+        const u64* vr = vals + (row << nlo);
+        for (uint32_t l = lane; l < (1u << nlo); l += 32) {
+            const u64 v = vr[l];
+            if (v) acc = kadd(acc, v == 1 ? el[l] : kmulb(el[l], v));
+        }
+        acc = kcanon(acc);
+        for (int off = 16; off > 0; off >>= 1) acc = kadd(acc, shfl_down_k(acc, off));
+        if (lane == 0 && !mlink::kzero_p(acc)) {
+            const K8d w = mauth::k8_mul(eh[row >> nmid], em[row & ((1ULL << nmid) - 1)]);
+            accw = kadd(accw, mauth::k8_mul(acc, w));
+        }
+    }
+    if (lane == 0) wsum[warp] = kcanon(accw);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        K8d s = kzero();
+        for (int w = 0; w < 8; w++) s = kadd(s, wsum[w]);
+        partial[blockIdx.x] = kcanon(s);
+    }
+}
+
+/// 256 threads = 32 outputs × 8 f-lanes./// 256 threads = 32 outputs × 8 f-lanes.
 __global__ void __launch_bounds__(256) pe_kernel(const u64* __restrict__ vals, VarMap rest, VarMap fix,
                                                  const K8d* __restrict__ e, uint64_t nrest, uint64_t nfix, K8d* __restrict__ out) {
     __shared__ K8d part[8][32];

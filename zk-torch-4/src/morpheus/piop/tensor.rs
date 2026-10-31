@@ -19,12 +19,15 @@ pub fn mle(vals: &[u64], point: &[K8]) -> K8 {
     let el = eq_table(&point[..lo]);
     let eh = eq_table(&point[lo..]);
     let l = el.len();
-    eh.par_iter().enumerate().map(|(h, w)| {
+    let row = |(h, w): (usize, &K8)| -> K8 {
         let row = &vals[h * l..(h + 1) * l];
         let mut acc = K8::ZERO;
         for (e, &v) in el.iter().zip(row) { if v != 0 { acc = acc.add(&kmul_base(e, v)); } }
         acc.mul(w)
-    }).reduce(|| K8::ZERO, |a, b| a.add(&b))
+    };
+    // Small tables: no thread-pool round trip.
+    if n < 12 { return eh.iter().enumerate().map(row).fold(K8::ZERO, |a, b| a.add(&b)); }
+    eh.par_iter().enumerate().map(row).reduce(|| K8::ZERO, |a, b| a.add(&b))
 }
 
 /// MLE of a K-valued table.
