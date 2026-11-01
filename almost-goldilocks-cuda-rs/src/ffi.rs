@@ -53,6 +53,8 @@ extern "C" {
     pub fn agl_morpheus_permute(d_src: *const i8, d_dst: *mut i8, n: u64) -> c_int;
     pub fn agl_morpheus_unpack2(d_src: *const u8, d_dst: *mut i8, n: u64, phys: c_int) -> c_int;
     pub fn agl_morpheus_permute2(d_src: *const u8, d_dst: *mut u8, ncols: u64) -> c_int;
+    pub fn agl_mauth_ev_packed_batch(d_w_src: *const u8, stride: u64, nsrc: c_int, cols: c_int, d_w: *const u64, h_out: *mut u64) -> c_int;
+    pub fn agl_mauth_combine_tc(h_v: *const *const u8, packed: c_int, nsrc: c_int, cols: c_int, h_beta: *const i8, d_z0: *mut i64, d_z1: *mut i64) -> c_int;
     pub fn agl_mauth_combine_packed(h_v: *const *const u8, nsrc: c_int, cols: c_int, h_beta: *const i8, d_z0: *mut i64, d_z1: *mut i64) -> c_int;
     pub fn agl_mpiop_pe(d_vals: *const u64, rest_pos: *const c_int, nrest_v: c_int, fix_pos: *const c_int, nfix_v: c_int, d_e: *const u64, d_out: *mut u64) -> c_int;
     pub fn agl_mpiop_eq(h_point: *const u64, n: c_int, d_out: *mut u64) -> c_int;

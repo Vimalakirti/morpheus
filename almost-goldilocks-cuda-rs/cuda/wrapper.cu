@@ -3261,6 +3261,25 @@ int agl_mauth_ev(const void* d_W, int w_bytes, int cols, const uint64_t* d_w, ui
     return (int)e;
 }
 
+/// agl_mauth_ev for nsrc packed sources at d_W + s · stride bytes (cols
+/// columns each): h_out[s][64][8].
+int agl_mauth_ev_packed_batch(const uint8_t* d_W, uint64_t stride, int nsrc, int cols, const uint64_t* d_w, uint64_t* h_out) {
+    if (nsrc <= 0) return 0;
+    int blocks = (ma_sms() * 4 + nsrc - 1) / nsrc;
+    if (blocks < 1) blocks = 1;
+    if (blocks > cols) blocks = cols;
+    void *part = nullptr, *out = nullptr;
+    if (cuda_malloc(&part, (size_t)nsrc * blocks * 64 * 64) || cuda_malloc(&out, (size_t)nsrc * 64 * 64)) return -1;
+    dim3 grid(blocks, nsrc);
+    mauth::ev_partial_kernel<int8_t, true><<<grid, 256>>>((const int8_t*)d_W, cols, (const mauth::K8d*)d_w, (mauth::K8d*)part, (size_t)stride);
+    mauth::ev_reduce_kernel<<<nsrc, 512>>>((const mauth::K8d*)part, blocks, (mauth::K8d*)out);
+    cudaMemcpy(h_out, out, (size_t)nsrc * 64 * 64, cudaMemcpyDeviceToHost);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = agl_sync_mine();
+    cuda_free(part); cuda_free(out);
+    return (int)e;
+}
+
 // h_out[c][m] = Σ_h 2^h col_c[h + 64 m] mod q.
 int agl_mauth_decode(const int64_t* d_cols, int ncols, uint64_t* h_out) {
     void* out = nullptr;
@@ -3308,6 +3327,27 @@ int agl_mauth_combine_packed(const uint8_t* const* h_V, int nsrc, int cols, cons
     cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) e = agl_sync_mine();
     cuda_free(db);
+    return (int)e;
+}
+
+/// Tensor-core combine (mauth::combine_tc_kernel): packed (1024-byte) or
+/// int8 (4096-byte) physical columns; same result as agl_mauth_combine_multi.
+int agl_mauth_combine_tc(const uint8_t* const* h_V, int packed, int nsrc, int cols, const int8_t* h_beta, int64_t* d_Z0, int64_t* d_Z1) {
+    if (nsrc <= 0 || cols <= 0) return 0;
+    void *dp = nullptr, *db = nullptr, *dc = nullptr;
+    const size_t pb = (size_t)nsrc * sizeof(void*), bb = (size_t)nsrc * 128, cb = (size_t)nsrc * 8192;
+    if (cuda_malloc(&dp, pb) || cuda_malloc(&db, bb) || cuda_malloc(&dc, cb)) return -1;
+    cudaMemcpy(dp, h_V, pb, cudaMemcpyHostToDevice);
+    cudaMemcpy(db, h_beta, bb, cudaMemcpyHostToDevice);
+    mauth::build_c_kernel<<<ma_sms() * 8, 256>>>((const int8_t*)db, nsrc, (int8_t*)dc);
+    int blocks = ma_sms() * 4;
+    int need = (cols + mauth::TC_COLS - 1) / mauth::TC_COLS;
+    if (blocks > need) blocks = need;
+    if (packed) mauth::combine_tc_kernel<true><<<blocks, 256>>>((const uint8_t* const*)dp, nsrc, cols, (const int8_t*)dc, d_Z0, d_Z1);
+    else mauth::combine_tc_kernel<false><<<blocks, 256>>>((const uint8_t* const*)dp, nsrc, cols, (const int8_t*)dc, d_Z0, d_Z1);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = agl_sync_mine();
+    cuda_free(dp); cuda_free(db); cuda_free(dc);
     return (int)e;
 }
 

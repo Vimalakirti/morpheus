@@ -175,13 +175,18 @@ impl<'a> Phase1 for CpuPhase1<'a> {
 }
 
 /// Link masks and auxiliary witness.
-pub struct Masks { pub u: Vec<AElem>, pub r_cols: Vec<Vec<Vec<i64>>>, pub a_aux: Vec<AElem>, pub s_o: Vec<Vec<i64>> }
+/// `r8`, when present (GPU services), holds every source's whole link witness
+/// as int8 digits (sl·N, logical columns) and `r_cols` only its first
+/// A_ENC_COLS columns (the encoded u, decoded for the targets).
+pub struct Masks { pub u: Vec<AElem>, pub r_cols: Vec<Vec<Vec<i64>>>, pub a_aux: Vec<AElem>, pub s_o: Vec<Vec<i64>>, pub r8: Option<Vec<Vec<i8>>> }
 
 /// The non-sumcheck work of the link: private coins, link/aux commitments
 /// and the raw evaluation endpoints (CPU reference or GPU).
 pub trait LinkServices {
     fn masks(&mut self, p: &Profile, coins: &Coins, opening: u64, n: usize) -> Masks;
     fn commit_link(&mut self, p: &Profile, seed: &KeySeed, r_cols: &[Vec<Vec<i64>>]) -> Vec<Vec<Vec<u64>>>;
+    /// Same, from int8 link witnesses (Masks::r8).
+    fn commit_link8(&mut self, _p: &Profile, _seed: &KeySeed, _r8: &[Vec<i8>]) -> Vec<Vec<Vec<u64>>> { unimplemented!("int8 link witnesses") }
     fn commit_aux(&mut self, p: &Profile, seed: &KeySeed, s_o: &[Vec<i64>]) -> Vec<Vec<u64>>;
     /// Ev_raw(W_e; ξ) for every source.
     fn ev(&mut self, p: &Profile, raw: &dyn super::packed::Sources, xi: &[K8]) -> Vec<AElem>;
@@ -204,7 +209,7 @@ impl LinkServices for CpuServices {
         let r_cols = (0..n).map(|e| [enc(&u[e]), super::link::ternary_cols_pub(coins, Purpose::LinkSecret, owner(e), p.hiding), super::link::ternary_cols_pub(coins, Purpose::LinkError, owner(e), p.rank)].concat()).collect();
         let a_aux: Vec<AElem> = (0..p.aux_coeffs).map(|i| ua(Purpose::AuxPayload, opening, (i * 512) as u32)).collect();
         let s_o = [a_aux.iter().flat_map(enc).collect::<Vec<_>>(), super::link::ternary_cols_pub(coins, Purpose::AuxSecret, opening, p.hiding), super::link::ternary_cols_pub(coins, Purpose::AuxError, opening, p.rank)].concat();
-        Masks { u, r_cols, a_aux, s_o }
+        Masks { u, r_cols, a_aux, s_o, r8: None }
     }
     fn commit_link(&mut self, p: &Profile, seed: &KeySeed, r_cols: &[Vec<Vec<i64>>]) -> Vec<Vec<Vec<u64>>> {
         let indices: Vec<usize> = (0..p.link_cols()).collect();
@@ -394,9 +399,9 @@ pub fn prove_with_sources(
     let ell = p.ell();
     let n = st.n;
     let degs = p.degs();
-    let Masks { u, r_cols, a_aux, s_o } = svc.masks(p, coins, opening, n);
+    let Masks { u, r_cols, a_aux, s_o, r8 } = svc.masks(p, coins, opening, n);
     lap("masks");
-    let g_commit = svc.commit_link(p, seed, &r_cols);
+    let g_commit = match &r8 { Some(r8) => svc.commit_link8(p, seed, r8), None => svc.commit_link(p, seed, &r_cols) };
     lap("link commitments");
     let c_o = svc.commit_aux(p, seed, &s_o);
     for g in &g_commit { for c in g { tr.absorb(Item::LinkCommitment, c); } }
@@ -629,7 +634,7 @@ pub fn prove_with_sources(
     tr.absorb_k(Item::Endpoint, &target_o.t.0);
     let proof = LinkProof { g_commit, c_o, rounds, a_hat, t_o: target_o.t.clone() };
     let _ = (DS, &a_aux);
-    LinkOutput { proof, point, sources: if sources.is_empty() { r_cols.into_iter().map(|r| SourceVec { w: Vec::new(), r }).collect() } else { sources }, s_o, targets, target_o }
+    LinkOutput { proof, point, sources: if sources.is_empty() { r_cols.into_iter().map(|r| SourceVec { w: Vec::new(), r }).collect() } else { sources }, s_o, targets, target_o, r8 }
 }
 
 pub(crate) fn eqt_k(a: &K8, r: &K8) -> K8 { a.mul(r).add(&K8::ONE.sub(a).mul(&K8::ONE.sub(r))) }

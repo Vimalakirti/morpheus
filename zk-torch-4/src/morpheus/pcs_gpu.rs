@@ -155,15 +155,11 @@ impl PcsGpu {
     }
 
     /// Drop the resident sources (keeps the key caches).
-    pub fn unload(&mut self) { self.src.clear(); self.err.clear(); self.flat = None; self.kept.lock().unwrap().clear(); *self.pre_raw.lock().unwrap() = None; self.cols.clear(); self.col_devs.clear(); }
+    pub fn unload(&mut self) { self.src.clear(); self.err.clear(); self.flat = None; self.kept.lock().unwrap().clear(); *self.pre_raw.lock().unwrap() = None; self.cols.clear(); self.col_devs.clear(); self.col_keys.clear(); }
     /// Column-sharded authentication over `devs` for this opening.
-    pub fn use_cols(&mut self, devs: Vec<i32>) {
-        if self.col_keys.len() != devs.len() || self.col_keys.iter().zip(&devs).any(|(k, &d)| k.dev != d) {
-            self.col_keys = super::auth_gpu::col_keys(&self.p, &self.seed, &devs);
-            almost_goldilocks_cuda::set_device(0).unwrap();
-        }
-        self.col_devs = devs;
-    }
+    /// The column keys are built after the link (ev) and released with the
+    /// opening, so the link has the devices' memory.
+    pub fn use_cols(&mut self, devs: Vec<i32>) { self.col_devs = devs; }
 
     /// Kept shards in physical column order (in place, per source).
     pub fn kept_to_phys(&self) {
@@ -220,10 +216,19 @@ impl PcsGpu {
 
     /// Device sources for the authentication; takes the resident physical
     /// columns (the opening is the last use of them).
-    pub fn dev_sources(&mut self, r_cols: &[Vec<Vec<i64>>]) -> Vec<DevSource> {
-        std::mem::take(&mut self.src).into_iter().zip(r_cols).map(|(w, r)| DevSource { w, r: DeviceBuffer::from_slice(&i8_cols(r)).unwrap() }).collect()
+    pub fn dev_sources(&mut self, r8: &[Vec<i8>]) -> Vec<DevSource> {
+        std::mem::take(&mut self.src).into_iter().zip(r8).map(|(w, r)| DevSource { w, r: DeviceBuffer::from_slice(r).unwrap() }).collect()
     }
 
+    /// commit_cols from int8 digits (columns of N, logical order).
+    fn commit_cols8(&self, cache: &super::commit_gpu::KeyCache, v: &[i8]) -> Vec<Vec<u64>> {
+        let rank = self.p.rank;
+        let ncols = v.len() / N;
+        let body = DeviceBuffer::from_slice(&v[..(ncols - rank) * N]).unwrap();
+        let err = DeviceBuffer::from_slice(&v[(ncols - rank) * N..].iter().map(|&x| x as i64).collect::<Vec<i64>>()).unwrap();
+        let acc = partial(cache, 3, Cols::I8(&body), 1, ncols - rank, None);
+        ring_rows(finish(acc, 1, 3, rank, Some(&err)).to_vec().unwrap())
+    }
     fn commit_cols(&self, cache: &super::commit_gpu::KeyCache, cols: &[Vec<i64>]) -> Vec<Vec<u64>> {
         let rank = self.p.rank;
         let body = DeviceBuffer::from_slice(&i8_cols(&cols[..cols.len() - rank])).unwrap();
@@ -255,29 +260,45 @@ impl LinkServices for PcsGpu {
             ternary_gpu(coins, purpose, owner, cols * N).chunks(N).map(|c| c.iter().map(|&x| x as i64).collect()).collect()
         };
         // Per source in parallel (device 0: the PCS device of this process).
-        let u: Vec<AElem> = (0..n).into_par_iter().map(|e| { dev0(); a_from(&uniform_q_gpu(coins, Purpose::LinkPayload, owner(e), 0, 512)) }).collect();
+        // Coin kernels spread over this process's devices (MORPHEUS_GPUS);
+        // the coins depend only on (purpose, owner, coordinate).
+        let ndev: usize = std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1);
+        let on = |e: usize| almost_goldilocks_cuda::set_device((e % ndev) as i32).expect("set device");
+        // Each task returns its thread to device 0 (the pool is shared).
+        let u: Vec<AElem> = (0..n).into_par_iter().map(|e| { on(e); let x = a_from(&uniform_q_gpu(coins, Purpose::LinkPayload, owner(e), 0, 512)); dev0(); x }).collect();
         let t_u = t.elapsed().as_secs_f64();
-        let r_cols = (0..n).into_par_iter().map(|e| {
+        // Link witnesses as int8 digits (encoded u, then ternary hiding and
+        // error columns); only the encoded-u columns are kept as i64.
+        let (r_cols, r8): (Vec<Vec<Vec<i64>>>, Vec<Vec<i8>>) = (0..n).into_par_iter().map(|e| {
+            on(e);
+            let ec = enc(&u[e]);
+            let mut v8: Vec<i8> = Vec::with_capacity(p.link_cols() * N);
+            for c in &ec { v8.extend(c.iter().map(|&x| x as i8)); }
+            v8.extend(ternary_gpu(coins, Purpose::LinkSecret, owner(e), p.hiding * N));
+            v8.extend(ternary_gpu(coins, Purpose::LinkError, owner(e), p.rank * N));
             dev0();
-            // Moves, not `concat` (which clones every column).
-            let mut v = enc(&u[e]);
-            v.extend(tern_cols(Purpose::LinkSecret, owner(e), p.hiding));
-            v.extend(tern_cols(Purpose::LinkError, owner(e), p.rank));
-            v
-        }).collect();
+            (ec, v8)
+        }).unzip();
         let t_r = t.elapsed().as_secs_f64();
         if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] masks: u {:.2} s, r columns {:.2} s", t_u, t_r - t_u); }
+        dev0();
         let aq = uniform_q_gpu(coins, Purpose::AuxPayload, opening, 0, p.aux_coeffs * 512);
         let a_aux: Vec<AElem> = aq.chunks(512).map(a_from).collect();
         let mut s_o: Vec<Vec<i64>> = a_aux.iter().flat_map(enc).collect();
         s_o.extend(tern_cols(Purpose::AuxSecret, opening, p.hiding));
         s_o.extend(tern_cols(Purpose::AuxError, opening, p.rank));
         self.coin_ms += t.elapsed().as_secs_f64() * 1e3;
-        Masks { u, r_cols, a_aux, s_o }
+        Masks { u, r_cols, a_aux, s_o, r8: Some(r8) }
     }
     fn commit_link(&mut self, _p: &Profile, _seed: &KeySeed, r_cols: &[Vec<Vec<i64>>]) -> Vec<Vec<Vec<u64>>> {
         let t = std::time::Instant::now();
         let out = r_cols.par_iter().map(|r| { dev0(); self.commit_cols(&self.keys.l, r) }).collect();
+        self.commit_ms += t.elapsed().as_secs_f64() * 1e3;
+        out
+    }
+    fn commit_link8(&mut self, _p: &Profile, _seed: &KeySeed, r8: &[Vec<i8>]) -> Vec<Vec<Vec<u64>>> {
+        let t = std::time::Instant::now();
+        let out = r8.par_iter().map(|r| { dev0(); self.commit_cols8(&self.keys.l, r) }).collect();
         self.commit_ms += t.elapsed().as_secs_f64() * 1e3;
         out
     }
@@ -296,6 +317,7 @@ impl LinkServices for PcsGpu {
             // endpoints and then the authentication.
             let t = std::time::Instant::now();
             if self.cols.is_empty() { self.cols = super::auth_gpu::col_shards(p, raw, &self.col_devs); }
+            if self.col_keys.is_empty() { self.col_keys = super::auth_gpu::col_keys(&self.p, &self.seed, &self.col_devs); almost_goldilocks_cuda::set_device(0).unwrap(); }
             if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] column shards {:.2} s", t.elapsed().as_secs_f64()); }
             return super::auth_gpu::ev_cols(p, &self.cols, xi);
         }
@@ -412,8 +434,8 @@ impl AuthReplica {
         self.w.push(phys);
     }
     /// Device sources with the link columns attached (on this replica's device).
-    pub fn sources(&mut self, r_cols: &[Vec<Vec<i64>>]) -> Vec<DevSource> {
+    pub fn sources(&mut self, r8: &[Vec<i8>]) -> Vec<DevSource> {
         almost_goldilocks_cuda::set_device(self.dev).expect("set device");
-        std::mem::take(&mut self.w).into_iter().zip(r_cols).map(|(w, r)| DevSource { w, r: DeviceBuffer::from_slice(&i8_cols(r)).unwrap() }).collect()
+        std::mem::take(&mut self.w).into_iter().zip(r8).map(|(w, r)| DevSource { w, r: DeviceBuffer::from_slice(r).unwrap() }).collect()
     }
 }

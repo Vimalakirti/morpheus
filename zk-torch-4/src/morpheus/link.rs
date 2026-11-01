@@ -214,6 +214,9 @@ pub struct LinkOutput {
     pub proof: LinkProof,
     pub point: Point,
     pub sources: Vec<SourceVec>,
+    /// Int8 link witnesses (GPU services); `sources[e].r` then holds only
+    /// the encoded-u columns.
+    pub r8: Option<Vec<Vec<i8>>>,
     pub s_o: Vec<Vec<i64>>,
     pub targets: Vec<Tuple>,
     pub target_o: AuxTuple,
@@ -343,7 +346,7 @@ pub fn prove(
     for a in &a_hat { tr.absorb_k(Item::Endpoint, &a.0); }
     tr.absorb_k(Item::Endpoint, &target_o.t.0);
     let proof = LinkProof { g_commit, c_o, rounds, a_hat, t_o: target_o.t.clone() };
-    LinkOutput { proof, point, sources, s_o, targets, target_o }
+    LinkOutput { proof, point, sources, s_o, targets, target_o, r8: None }
 }
 
 // ---------------------------------------------------------------- verifier

@@ -618,13 +618,15 @@ fn phases_v2_body<'u>(
         let reduced = d == 4 && claims.is_some() && !alpha[i].is_zero() && !no_claim;
         let use_index = reduced && (1usize << (b0 - i)) <= 128 && i >= 4 && b0 >= 9 && std::env::var("MORPHEUS_NO_INDEX").is_err();
         let rin = RoundIn { i, d, b0, src_len, reduced, use_index, halve: &halve, b_total, bseg: &bseg, r_prev: xi.last().copied(), full: false, b5: &b5, xi: &xi, fac_p, dense_pw: &dense_pw, skip_range: rb1 && i == 1, rb1, a_all: &a_all, b_all: &b_all, tc: &tc, e1: &e1, e2: &e2, e3: &e3, ea: &ea };
+        let dev_ms = std::sync::Mutex::new(vec![0f64; shards.len()]);
         let outs: Vec<(Vec<K8>, Option<OhSums>, Option<Vec<K8>>)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = shards.iter_mut().map(|sh| {
-                let (rin, regions_c, nterms) = (&rin, &regions_c, n_ohw as usize);
-                sc.spawn(move || shard_round(sh, dev_raw, rin, regions_c, alpha, nterms))
+            let hs: Vec<_> = shards.iter_mut().enumerate().map(|(k, sh)| {
+                let (rin, regions_c, nterms, dev_ms) = (&rin, &regions_c, n_ohw as usize, &dev_ms);
+                sc.spawn(move || { let t = std::time::Instant::now(); let r = shard_round(sh, dev_raw, rin, regions_c, alpha, nterms); dev_ms.lock().unwrap()[k] = t.elapsed().as_secs_f64() * 1e3; r })
             }).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        if tm && shards.len() > 1 { eprintln!("[link2]   round {i} per device: {:?} ms", dev_ms.lock().unwrap().iter().map(|x| x.round()).collect::<Vec<_>>()); }
         let mut sum = vec![K8::ZERO; 2 * (d + 1)];
         let mut ohs: Option<OhSums> = None;
         for (s, o, rb) in outs {
@@ -731,7 +733,17 @@ fn phases_v2_body<'u>(
         xi.push(r);
     }
     lap(&format!("phase 1 ({kms:.0} ms kernels)"));
-    // ---- Coarse phase on the devices, each over its own sources.
+    // ---- Coarse phase on the devices, each over its own sources. The plane
+    // rounds' block constants, block lists and B / dense tables are released
+    // first (at full model scale they hold several GB per device).
+    for sh in shards.iter_mut() {
+        almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
+        sh.bdev = None; sh.qdl = None;
+        sh.bc = DeviceBuffer::<u64>::new(1).unwrap();
+        sh.gen_all = DeviceBuffer::<u8>::new(1).unwrap();
+        sh.gen_all_h = Vec::new(); sh.oh = Vec::new();
+    }
+    almost_goldilocks_cuda::set_device(0).unwrap();
     let coarse = 1u64 << (ell - b0);
     let tfold: Vec<K8> = order.par_iter().map(|&t| {
         let rg = &regs[treg[t]];

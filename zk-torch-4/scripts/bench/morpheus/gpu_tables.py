@@ -27,6 +27,11 @@ def parse(path):
     peak = re.search(r"^peak GPU memory \(sum over devices\) (\d+) MiB", t, re.M)
     sup = re.search(r"public response support: (\d+) of (\d+)", t)
     exit_ = re.search(r"^MORPHEUS_EXIT status=(\d+)", t, re.M)
+    # Serialized proof parts of request 0 (bytes): the authentication
+    # responses are full-width over the source columns; the rest depends on
+    # the workload and the reductions.
+    pm = re.search(r"proof parts \(bytes\): (.*)", t)
+    parts = {k.strip(): int(v) for k, v in re.findall(r"([a-z ]+?) (\d+)(?:,|$)", pm.group(1))} if pm else {}
     ok = bool(pro) and len(ver) == len(pro) and all(v[1] == "true" for v in ver) \
         and "panicked" not in t and (exit_ is None or exit_.group(1) == "0")
     p = [float(x[1]) for x in pro]
@@ -47,6 +52,8 @@ def parse(path):
         "peak_gb": int(peak.group(1)) / 1024 if peak else None,
         "attempts": att, "support": f"{sup.group(1)}/{sup.group(2)}" if sup else None,
         "split": split, "vsplit": vsplit,
+        "parts": parts,
+        "nonresp_mib": (sum(parts.values()) - parts.get("responses", 0)) / 2**20 if parts else None,
     }
 
 
@@ -59,10 +66,10 @@ def main():
         print(json.dumps(rows, indent=1))
         return
     f = lambda x, n=2: "-" if x is None else f"{x:.{n}f}"
-    print(f"{'config':24} {'ok':>3} {'n':>2} {'prove':>8} {'min':>8} {'max':>8} {'verify':>7} {'MiB':>8} {'peakGB':>7} attempts  split")
+    print(f"{'config':24} {'ok':>3} {'n':>2} {'prove':>8} {'min':>8} {'max':>8} {'verify':>7} {'MiB':>8} {'nonresp':>8} {'peakGB':>7} attempts  split")
     for k, r in rows.items():
         sp = ", ".join(f"{a} {b:.1f}" for a, b in sorted(r["split"].items(), key=lambda z: -z[1]))
-        print(f"{k:24} {'ok' if r['ok'] else 'FAILED':>3} {r['n']:2} {f(r['prove'])} {f(r['prove_min'])} {f(r['prove_max'])} {f(r['verify'])} {f(r['proof_mib'], 1)} {f(r['peak_gb'], 0)} {r['attempts']}  {sp}")
+        print(f"{k:24} {'ok' if r['ok'] else 'FAILED':>3} {r['n']:2} {f(r['prove'])} {f(r['prove_min'])} {f(r['prove_max'])} {f(r['verify'])} {f(r['proof_mib'], 1)} {f(r['nonresp_mib'], 2)} {f(r['peak_gb'], 0)} {r['attempts']}  {sp}")
 
 
 if __name__ == "__main__":

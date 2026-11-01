@@ -454,7 +454,10 @@ fn commit_streamed(o: &Opts, pc: &mut PcsGpu, raw: &dyn super::packed::Sources) 
 
 impl Opts {
     pub fn streams(&self, nsrc: usize) -> bool {
-        let gb = std::env::var("MORPHEUS_STREAM_GB").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(12.0);
+        // Several devices: always streamed (link shards and column-sharded
+        // authentication beat the resident single-device sources).
+        let multi = std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1) > 1;
+        let gb = std::env::var("MORPHEUS_STREAM_GB").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(if multi { 0.0 } else { 12.0 });
         self.stream.unwrap_or((nsrc << self.profile.ell()) as f64 > gb * 1e9)
     }
 }
@@ -465,6 +468,14 @@ fn key_devs<'k>(pc: &'k PcsGpu, reps: &'k [AuthReplica]) -> Vec<(i32, &'k auth_g
     v
 }
 
+/// Every source's link witness as int8 digits (sl·N each).
+fn link_r8(fast: &link::LinkOutput) -> std::borrow::Cow<'_, [Vec<i8>]> {
+    match &fast.r8 {
+        Some(r) => std::borrow::Cow::Borrowed(r.as_slice()),
+        None => std::borrow::Cow::Owned(fast.sources.par_iter().map(|s| s.r.iter().flatten().map(|&v| v as i8).collect()).collect()),
+    }
+}
+
 /// Streamed authentication over the link's kept per-device source ranges.
 fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::LinkOutput, t1: &MTranscript, runs: &[(usize, usize)], times: &mut Times) -> AuthProof {
     let t = Instant::now();
@@ -473,7 +484,10 @@ fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::L
         // authenticates its columns; device 0 also the link and aux blocks.
         assert_eq!(runs.iter().map(|&(a, b)| b - a).sum::<usize>(), o.profile.source_cols(), "column-sharded authentication needs full support");
         almost_goldilocks_cuda::set_device(0).unwrap();
-        let r_all = DeviceBuffer::from_slice(&fast.sources.iter().flat_map(|s| s.r.iter().flatten().map(|&v| v as i8)).collect::<Vec<_>>()).unwrap();
+        let r8 = link_r8(fast);
+        let sl_n = o.profile.link_cols() * super::ring::N;
+        let mut r_all = DeviceBuffer::<i8>::new(r8.len() * sl_n).unwrap();
+        for (e, r) in r8.iter().enumerate() { r_all.copy_from_slice_at(e * sl_n, r).unwrap(); }
         let s_o = DeviceBuffer::from_slice(&fast.s_o.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
         let mut tm = AuthTiming::default();
         let (apf, _) = auth_gpu::prove_cols(&o.profile, &pc.keys, &pc.col_keys, &pc.cols, &r_all, &s_o, fast.sources.len(), &o.coins, opening, t1, &fast.point, true, &mut tm).expect("authentication");
@@ -489,9 +503,10 @@ fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::L
     let fits = almost_goldilocks_cuda::mem_get_info().map(|(free, _)| free > w_bytes + (6usize << 30)).unwrap_or(false);
     if fits { pc.ensure_w(); }
     let k = pc.kept.lock().unwrap();
+    let r8 = link_r8(fast);
     let shards: Vec<auth_gpu::ShardSrc> = k.iter().map(|sh| {
         almost_goldilocks_cuda::set_device(sh.dev).unwrap();
-        let r: Vec<i8> = sh.srcs.iter().flat_map(|&s| fast.sources[s].r.iter().flatten().map(|&v| v as i8)).collect();
+        let r: Vec<i8> = sh.srcs.iter().flat_map(|&s| r8[s].iter().copied()).collect();
         auth_gpu::ShardSrc { dev: sh.dev, srcs: sh.srcs.clone(), w: sh.buf.as_ptr(), len: sh.buf.len() / sh.srcs.len(), r: DeviceBuffer::from_slice(&r).unwrap() }
     }).collect();
     almost_goldilocks_cuda::set_device(0).unwrap();
@@ -514,9 +529,9 @@ fn authenticate(o: &Opts, opening: u64, pc: &mut PcsGpu, reps: &mut [AuthReplica
     let to_dev = |cols: &[Vec<i64>]| DeviceBuffer::from_slice(&cols.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
     let t = Instant::now();
     pc.ensure_w();
-    let r_cols: Vec<Vec<Vec<i64>>> = fast.sources.iter().map(|s| s.r.clone()).collect();
-    let dsrc: Vec<DevSource> = pc.dev_sources(&r_cols);
-    let rsrc: Vec<Vec<DevSource>> = reps.iter_mut().map(|r| r.sources(&r_cols)).collect();
+    let r8 = link_r8(fast);
+    let dsrc: Vec<DevSource> = pc.dev_sources(&r8);
+    let rsrc: Vec<Vec<DevSource>> = reps.iter_mut().map(|r| r.sources(&r8)).collect();
     let s_os: Vec<DeviceBuffer<i8>> = reps.iter().map(|r| { almost_goldilocks_cuda::set_device(r.dev).unwrap(); to_dev(&fast.s_o) }).collect();
     almost_goldilocks_cuda::set_device(0).unwrap();
     let s_o0 = to_dev(&fast.s_o);

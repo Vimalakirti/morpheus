@@ -12,6 +12,7 @@
 #include <cstdint>
 #include "almost_goldilocks.cuh"
 #include "morpheus_k8.cuh"
+#include <mma.h>
 
 namespace mauth {
 
@@ -40,8 +41,12 @@ __global__ void wtable_kernel(const K8d* __restrict__ el, const K8d* __restrict_
 
 /// Per-block partial sums P_m over a grid-stride set of columns.
 /// 256 threads: m = t % 64, quarter q = t / 64 handles j in [16q, 16q+16).
+/// ev_partial_kernel for many sources at once: source s = blockIdx.y at
+/// W + s · stride elements, partial sums at partial + s · gridDim.x · 64.
 template <typename TW, bool PACKED = false>
-__global__ void ev_partial_kernel(const TW* __restrict__ W, int cols, const K8d* __restrict__ w, K8d* __restrict__ partial) {
+__global__ void ev_partial_kernel(const TW* __restrict__ W, int cols, const K8d* __restrict__ w, K8d* __restrict__ partial, size_t stride = 0) {
+    W += (size_t)blockIdx.y * stride;
+    partial += (size_t)blockIdx.y * gridDim.x * 64;
     // The column tile and the final 4x64x8 reduction share one buffer
     // (int64 tile 33,280 B; reduction 16,384 B), keeping the int64 variant
     // under the 48 KB static limit.
@@ -85,8 +90,10 @@ __global__ void ev_partial_kernel(const TW* __restrict__ W, int cols, const K8d*
     }
 }
 
-/// out[m] = Σ_b partial[b][m]; 512 threads = 64 m x 8 coordinates.
+/// out[m] = Σ_b partial[b][m]; 512 threads = 64 m x 8 coordinates (one
+/// source per blockIdx.x).
 __global__ void ev_reduce_kernel(const K8d* __restrict__ partial, int blocks, K8d* __restrict__ out) {
+    partial += (size_t)blockIdx.x * blocks * 64; out += (size_t)blockIdx.x * 64;
     int t = threadIdx.x, m = t >> 3, a = t & 7;
     u64 s = 0;
     for (int b = 0; b < blocks; b++) s = fadd(s, partial[(size_t)b * 64 + m].c[a]);
@@ -307,6 +314,101 @@ __global__ void permute_kernel(const int8_t* __restrict__ src, int8_t* __restric
         size_t c = i >> 12; int l = (int)(i & 4095);
         int j = l >> 6, k = l & 63;
         dst[(c << 12) + j + 64 * k] = src[i];
+    }
+}
+
+/// Tensor-core combine. For column l and lane j (physical digit j + 64 k),
+///   Z_r[l][j + 64 k] += Σ_e Σ_m' C_e[r·64 + k][m'] · V_e[l][j + 64 m'],
+///   C_e[r·64 + k][m'] = β_{r,e}[(k − m') mod 64] · (k ≥ m' ? 1 : −1),
+/// the negacyclic S action of combine_kernel as one int8 GEMM per column
+/// (M = 128 rows (r, k), N = 64 lanes, K = 64 per source), accumulated
+/// exactly in int32 (|Σ| ≤ 128 · nsrc). build_c_kernel lays out C as
+/// [e][128][64]. A block takes TC_COLS columns and 8 warps; warp w owns output
+/// rows 16w..16w+15 for every column and lane.
+constexpr int TC_COLS = 2;
+__global__ void build_c_kernel(const int8_t* __restrict__ beta /* [n][2][64] */, int nsrc, int8_t* __restrict__ C) {
+    for (size_t id = blockIdx.x * (size_t)blockDim.x + threadIdx.x; id < (size_t)nsrc * 128 * 64; id += (size_t)gridDim.x * blockDim.x) {
+        const int mp = (int)(id & 63), row = (int)((id >> 6) & 127), e = (int)(id >> 13);
+        const int r = row >> 6, k = row & 63, m = (k - mp) & 63;
+        const int b = beta[(size_t)e * 128 + r * 64 + m];
+        C[id] = (int8_t)(k >= mp ? b : -b);
+    }
+}
+/// V_e[l] at Vp[e] + l · colbytes: packed physical columns (PACKED, 1024
+/// bytes) or int8 (4096 bytes).
+template <bool PACKED>
+__global__ void __launch_bounds__(256) combine_tc_kernel(const uint8_t* const* __restrict__ Vp, int nsrc, int cols,
+                                                         const int8_t* __restrict__ C, int64_t* __restrict__ Z0, int64_t* __restrict__ Z1) {
+    using namespace nvcuda;
+    __shared__ __align__(32) int8_t sA[128 * 64];
+    __shared__ __align__(32) int8_t sB[TC_COLS][64 * 64];
+    __shared__ __align__(32) int sOut[8][16 * 16];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const size_t colbytes = PACKED ? 1024 : 4096;
+    for (int l0 = blockIdx.x * TC_COLS; l0 < cols; l0 += gridDim.x * TC_COLS) {
+        const int nc = cols - l0 < TC_COLS ? cols - l0 : TC_COLS;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc[TC_COLS][4];
+#pragma unroll
+        for (int c = 0; c < TC_COLS; c++)
+#pragma unroll
+            for (int t = 0; t < 4; t++) wmma::fill_fragment(acc[c][t], 0);
+        for (int e = 0; e < nsrc; e++) {
+            // A: C_e (8 KB), B: the source's columns (64 m' × 64 j each).
+            const int4* ca = reinterpret_cast<const int4*>(C + (size_t)e * 8192);
+            for (int q = threadIdx.x; q < 512; q += 256) reinterpret_cast<int4*>(sA)[q] = __ldg(ca + q);
+            for (int c = 0; c < TC_COLS; c++) {
+                if (c >= nc) break;
+                const uint8_t* v = Vp[e] + (size_t)(l0 + c) * colbytes;
+                if (PACKED) {
+                    // 1024 bytes: thread t unpacks 4 bytes (16 digits).
+                    const uint32_t x = __ldg(reinterpret_cast<const uint32_t*>(v) + threadIdx.x);
+                    uint32_t w[4];
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        uint32_t o = 0;
+#pragma unroll
+                        for (int b = 0; b < 4; b++) {
+                            const int f = (int)((x >> (2 * (4 * q + b))) & 3u);
+                            o |= (uint32_t)(uint8_t)(int8_t)(f == 1 ? 1 : f == 3 ? -1 : 0) << (8 * b);
+                        }
+                        w[q] = o;
+                    }
+                    reinterpret_cast<int4*>(sB[c])[threadIdx.x] = make_int4((int)w[0], (int)w[1], (int)w[2], (int)w[3]);
+                } else {
+                    reinterpret_cast<int4*>(sB[c])[threadIdx.x] = __ldg(reinterpret_cast<const int4*>(v) + threadIdx.x);
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int kk = 0; kk < 4; kk++) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a;
+                wmma::load_matrix_sync(a, sA + warp * 16 * 64 + kk * 16, 64);
+#pragma unroll
+                for (int c = 0; c < TC_COLS; c++) {
+#pragma unroll
+                    for (int t = 0; t < 4; t++) {
+                        wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::row_major> b;
+                        wmma::load_matrix_sync(b, sB[c] + kk * 16 * 64 + t * 16, 64);
+                        wmma::mma_sync(acc[c][t], a, b, acc[c][t]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        // Rows 16w..16w+15 are (r, k) = (w / 4, 16 (w % 4) + i).
+        const int r = warp >> 2, k0 = (warp & 3) * 16;
+        int64_t* Z = r ? Z1 : Z0;
+        for (int c = 0; c < nc; c++) {
+            for (int t = 0; t < 4; t++) {
+                wmma::store_matrix_sync(sOut[warp], acc[c][t], 16, wmma::mem_row_major);
+                __syncwarp();
+                for (int q = lane; q < 256; q += 32) {
+                    const int i = q >> 4, jj = q & 15;
+                    Z[(size_t)(l0 + c) * 4096 + (t * 16 + jj) + 64 * (k0 + i)] += sOut[warp][q];
+                }
+                __syncwarp();
+            }
+        }
     }
 }
 

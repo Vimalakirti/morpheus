@@ -928,7 +928,11 @@ pub fn ev_cols(p: &Profile, shards: &[ColShard], xi: &[K8]) -> Vec<AElem> {
             almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
             let dp = DevPoint::new(p, pt);
             let nc = sh.c1 - sh.c0;
-            (0..sh.nsrc).map(|s| dp.ev_part(unsafe { sh.raw.as_ptr().add(s * nc * 1024) } as *const c_void, 0, sh.c0, nc)).collect::<Vec<_>>()
+            // Every source in one launch.
+            let mut out = vec![0u64; sh.nsrc * 512];
+            let rc = unsafe { ffi::agl_mauth_ev_packed_batch(sh.raw.as_ptr(), (nc * 1024) as u64, sh.nsrc as i32, nc as i32, dp.w.as_ptr().add(sh.c0 * 64 * 8), out.as_mut_ptr()) };
+            assert_eq!(rc, 0, "batched Ev");
+            out.chunks(512).map(|c| c.to_vec()).collect::<Vec<_>>()
         }) }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -1046,13 +1050,16 @@ pub fn prove_cols(
         let t0 = Instant::now();
         let beta = super::auth::challenges_pub(tr, &d, &d_o, attempt, n);
         let bb: Vec<i8> = (0..n).flat_map(|e| b2(&beta, e)).collect();
+        let dp4a = std::env::var_os("MORPHEUS_COMBINE_DP4A").is_some();
         let zws: Vec<DeviceBuffer<i64>> = std::thread::scope(|sc| {
             let hs: Vec<_> = shards.iter().zip(parts.iter_mut()).map(|(sh, pc)| { let bb = &bb; sc.spawn(move || {
                 almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
                 let nc = sh.c1 - sh.c0;
                 let mut zw = pc.uw.clone_on_device().unwrap();
                 let vp: Vec<*const u8> = (0..sh.nsrc).map(|s| unsafe { sh.raw.as_ptr().add(s * nc * 1024) }).collect();
-                let rc = unsafe { ffi::agl_mauth_combine_packed(vp.as_ptr(), sh.nsrc as i32, nc as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(nc * N)) };
+                // Tensor-core GEMM (MORPHEUS_COMBINE_DP4A=1: the dp4a kernel).
+                let rc = unsafe { if dp4a { ffi::agl_mauth_combine_packed(vp.as_ptr(), sh.nsrc as i32, nc as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(nc * N)) }
+                                  else { ffi::agl_mauth_combine_tc(vp.as_ptr(), 1, sh.nsrc as i32, nc as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(nc * N)) } };
                 assert_eq!(rc, 0, "packed combine");
                 zw
             }) }).collect();
@@ -1061,7 +1068,8 @@ pub fn prove_cols(
         almost_goldilocks_cuda::set_device(0).unwrap();
         let mut zl = ul.clone_on_device().unwrap();
         let vl: Vec<*const i8> = (0..n).map(|e| unsafe { r_all.as_ptr().add(e * sl * N) }).collect();
-        unsafe { assert_eq!(ffi::agl_mauth_combine_multi(vl.as_ptr(), n as i32, sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N)), 0); }
+        unsafe { assert_eq!(if dp4a { ffi::agl_mauth_combine_multi(vl.as_ptr(), n as i32, sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N)) }
+                            else { ffi::agl_mauth_combine_tc(vl.as_ptr() as *const *const u8, 0, n as i32, sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N)) }, 0); }
         let mut zo = uo.clone_on_device().unwrap();
         let bo = b2(&beta, n);
         unsafe { assert_eq!(ffi::agl_mauth_combine(s_o.as_ptr(), so as i32, bo.as_ptr(), zo.as_mut_ptr(), zo.as_mut_ptr().add(so * N)), 0); }
