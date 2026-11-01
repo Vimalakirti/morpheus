@@ -115,7 +115,10 @@ use super::*;use super::super::coins::CoinProfile;
 
 /// Check the public submodule premise without deriving support from values.
 /// Used before block-link allocation as well as before Gaussian authentication.
-pub fn check_raw_support(p:&Profile,s:&Support,raw:&[Vec<i8>]){
-    assert!(s.matches(p));assert!(raw.iter().all(|r|r.len()==p.source_cols()*N));
-    for r in raw {for c in 0..p.source_cols(){if s.columns.binary_search(&c).is_err(){assert!(r[c*N..(c+1)*N].iter().all(|&v|v==0),"source outside registered support");}}}
+pub fn check_raw_support(p:&Profile,s:&Support,raw:&[Vec<i8>]){check_support(p,s,&super::packed::I8s(raw))}
+/// Same, over int8 or packed sources.
+pub fn check_support(p:&Profile,s:&Support,raw:&dyn super::packed::Sources){
+    assert!(s.matches(p));assert!(raw.count()==0||raw.src_len()==p.source_cols()*N);
+    use rayon::prelude::*;
+    (0..raw.count()).into_par_iter().for_each(|e|{for c in 0..p.source_cols(){if s.columns.binary_search(&c).is_err(){assert!(raw.is_zero(e,c*N,N),"source outside registered support");}}});
 }

@@ -184,7 +184,7 @@ pub trait LinkServices {
     fn commit_link(&mut self, p: &Profile, seed: &KeySeed, r_cols: &[Vec<Vec<i64>>]) -> Vec<Vec<Vec<u64>>>;
     fn commit_aux(&mut self, p: &Profile, seed: &KeySeed, s_o: &[Vec<i64>]) -> Vec<Vec<u64>>;
     /// Ev_raw(W_e; ξ) for every source.
-    fn ev(&mut self, p: &Profile, raw: &[Vec<i8>], xi: &[K8]) -> Vec<AElem>;
+    fn ev(&mut self, p: &Profile, raw: &dyn super::packed::Sources, xi: &[K8]) -> Vec<AElem>;
     /// All sources on the device (logical order, concatenated), if resident.
     fn dev_raw(&self) -> Option<&almost_goldilocks_cuda::DeviceBuffer<i8>> { None }
     /// Streamed sources: where the link keeps its per-device source shards.
@@ -213,13 +213,13 @@ impl LinkServices for CpuServices {
     fn commit_aux(&mut self, p: &Profile, seed: &KeySeed, s_o: &[Vec<i64>]) -> Vec<Vec<u64>> {
         super::auth_compact::lin_indexed(p, seed, super::keys::KeyKind::Aux, A_ENC_COLS * p.aux_coeffs, &(0..p.aux_cols()).collect::<Vec<_>>(), &|c| s_o[c].clone())
     }
-    fn ev(&mut self, p: &Profile, raw: &[Vec<i8>], xi: &[K8]) -> Vec<AElem> {
+    fn ev(&mut self, p: &Profile, raw: &dyn super::packed::Sources, xi: &[K8]) -> Vec<AElem> {
         // Stream the ORIGINAL full-domain columns. This changes neither the
         // public Gaussian support nor the endpoint: no i64 source materializes.
         let indices: Vec<usize> = (0..p.source_cols()).collect();
-        raw.iter().map(|r| {
+        (0..raw.count()).map(|e| raw.to_i8(e)).map(|r| {
             assert_eq!(r.len(), p.source_cols() * super::ring::N);
-            super::auth_compact::ev_indexed(xi, &indices, &|c| super::auth_compact::raw_column(r, c))
+            super::auth_compact::ev_indexed(xi, &indices, &|c| super::auth_compact::raw_column(&r, c))
         }).collect()
     }
 }
@@ -370,12 +370,24 @@ pub fn prove_with(
     st: &Statement, raw: &[Vec<i8>], b0: usize, backend: &BackendFactory,
     svc: &mut dyn LinkServices, c_src: Option<&[Vec<Vec<u64>>]>, v2: bool,
 ) -> LinkOutput {
+    prove_with_sources(p, seed, coins, opening, tr, st, &super::packed::I8s(raw), b0, backend, svc, c_src, v2)
+}
+
+/// Same, over int8 or packed sources (the block CPU / v1 paths need int8).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_with_sources(
+    p: &Profile, seed: &KeySeed, coins: &Coins, opening: u64, tr: &mut MTranscript,
+    st: &Statement, src: &dyn super::packed::Sources, b0: usize, backend: &BackendFactory,
+    svc: &mut dyn LinkServices, c_src: Option<&[Vec<Vec<u64>>]>, v2: bool,
+) -> LinkOutput {
+    let raw8 = src.as_i8();
     if !v2 {
+        let raw = raw8.expect("the block CPU / v1 link needs int8 sources");
         let _plan = cpu_memory_plan(p, st, b0).expect("invalid block CPU statement/layout preflight");
         assert_eq!(raw.len(), st.n, "one raw source per statement source");
         assert!(raw.iter().all(|r| r.len() == p.source_cols() * super::ring::N), "full logical source domains required");
     }
-    p.check_caps(raw);
+    p.check_caps(src);
     let tm = std::env::var("MORPHEUS_TIMING").is_ok();
     let mut t0 = std::time::Instant::now();
     let mut lap = |what: &str| { if tm { eprintln!("[link] {what:24} {:8.1} ms", t0.elapsed().as_secs_f64() * 1e3); } t0 = std::time::Instant::now(); };
@@ -399,7 +411,7 @@ pub fn prove_with(
         panic!("CUDA link v2 requested in CPU-only build");
         #[cfg(feature = "cuda")]
         {
-        let o = super::link_gpu::phases_v2(p, st, raw, b0, &alpha, &eta, &gp, &degs, &a_coef, tr, svc.dev_raw(), svc.kept(), svc.take_pre_raw());
+        let o = super::link_gpu::phases_v2(p, st, src, b0, &alpha, &eta, &gp, &degs, &a_coef, tr, svc.dev_raw(), svc.kept(), svc.take_pre_raw());
         lap("v2 phases");
         (o.0, o.1, o.2.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.3.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.4.into_iter().map(|x| vec![x]).collect::<Vec<_>>(), o.5, o.6)
         }
@@ -470,6 +482,7 @@ pub fn prove_with(
         }
     }
     let c_alpha = |id: usize| -> K8 { alpha[b0..].iter().enumerate().fold(K8::ONE, |a, (j, x)| a.mul(&eqb(x, (id >> j) & 1))) };
+    let raw = raw8.expect("the block CPU / v1 link needs int8 sources");
     let mut blocks: Vec<Block> = Vec::new();
     for s in 0..n {
         let nblk = 1usize << (ell - b0);
@@ -594,12 +607,12 @@ pub fn prove_with(
     rounds.push(g);
     let point = Point { xi, rho };
     let sources: Vec<SourceVec> = if c_src.is_none() {
-        raw.iter().zip(&r_cols).map(|(rw, r)| SourceVec { w: raw_to_cols(rw), r: r.clone() }).collect()
+        (0..n).zip(&r_cols).map(|(e, r)| SourceVec { w: raw_to_cols(&src.to_i8(e)), r: r.clone() }).collect()
     } else { Vec::new() };
     let (targets, target_o) = match c_src {
         None => (sources.iter().map(|s| f_x(p, seed, &point, &s.w, &s.r)).collect::<Vec<Tuple>>(), f_ox(p, seed, &point, &s_o)),
         Some(cs) => {
-            let ev = svc.ev(p, raw, &point.xi);
+            let ev = svc.ev(p, src, &point.xi);
             let rf = point.rho.mul(&K8::ONE.sub(&point.rho));
             let targets = (0..n).map(|e| Tuple {
                 c: cs[e].clone(),
@@ -640,7 +653,7 @@ pub mod bounded_cpu_tests {
         let p=Profile::toy(); let seed=KeySeed([81;8]);
         let raw=vec![(0..p.source_cols()*N).map(|i|(i%3) as i8-1).collect::<Vec<_>>()];
         let xi=vec![K8::from_base(11);p.ell()]; let mut svc=CpuServices;
-        assert_eq!(svc.ev(&p,&raw,&xi),vec![super::super::pcs_maps::ev_raw(&raw_to_cols(&raw[0]),&xi)]);
+        assert_eq!(svc.ev(&p,&super::super::packed::I8s(&raw),&xi),vec![super::super::pcs_maps::ev_raw(&raw_to_cols(&raw[0]),&xi)]);
         let link=vec![vec![vec![1;N];p.link_cols()]];
         assert_eq!(svc.commit_link(&p,&seed,&link),vec![super::super::auth::lin(&p,&seed,KeyKind::Link,A_ENC_COLS,&link[0])]);
         let st=Statement{n:3,bits:vec![vec![(0,20)],vec![],vec![]],rows:vec![]};

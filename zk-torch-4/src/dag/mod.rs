@@ -88,6 +88,16 @@ pub enum PolyType {
 /// `data` is `Option` because the witness can be cleared once it's no longer
 /// needed (commit step keeps committed edges; everything else can be freed
 /// during the backward pass to reclaim memory).
+
+/// Lean lookup auxiliaries: the Morpheus prover derives every range/rescale
+/// selector from the dense input and output values (piop::ProverData), so the
+/// sparse selection witnesses of NonNegative / ScaleDown / ScaleUp are not
+/// built (data None, same shape and type). Set by MORPHEUS_LEAN_AUX or
+/// MORPHEUS_AT_RUN.
+pub fn lean_aux() -> bool {
+    static L: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *L.get_or_init(|| std::env::var_os("MORPHEUS_LEAN_AUX").is_some() || std::env::var_os("MORPHEUS_AT_RUN").is_some())
+}
 pub struct Witness {
     pub shape: Vec<usize>,
     pub data: Option<Box<dyn MLPoly>>,
@@ -864,6 +874,10 @@ impl Dag {
             let mut last_rss = if rss_trace { rss() } else { 0.0 };
             let mut prof_map: std::collections::BTreeMap<String, (std::time::Duration, usize)> =
                 std::collections::BTreeMap::new();
+            // Host-memory growth attributed to operator kinds (a level's
+            // growth is split evenly over its nodes).
+            let mut rss_by: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+            let kind_of = |nid: usize| -> String { let s = format!("{:?}", self.nodes[nid].kind); s.split(['(', ' ', '{']).next().unwrap_or("?").to_string() };
             for level in &self.topo_levels {
                 if level.len() == 1 {
                     let nid = level[0];
@@ -882,7 +896,7 @@ impl Dag {
                     for (&eid, out) in node.outputs.iter().zip(outs.into_iter()) {
                         witnesses[eid] = vec![out];
                     }
-                    if rss_trace { let r = rss(); if r - last_rss > 1.0 { eprintln!("[rss] node {nid} {:.60} +{:.1} GB -> {:.1} GB", format!("{:?}", node.kind), r - last_rss, r); } last_rss = r; }
+                    if rss_trace { let r = rss(); *rss_by.entry(kind_of(nid)).or_default() += r - last_rss; if r - last_rss > 1.0 { eprintln!("[rss] node {nid} {:.60} +{:.1} GB -> {:.1} GB", format!("{:?}", node.kind), r - last_rss, r); } last_rss = r; }
                 } else {
                     let results: Vec<(NodeId, Vec<Witness>, String, std::time::Duration)> = level
                         .par_iter()
@@ -910,8 +924,13 @@ impl Dag {
                             witnesses[eid] = vec![out];
                         }
                     }
-                    if rss_trace { let r = rss(); if r - last_rss > 1.0 { eprintln!("[rss] level of {} nodes (first {:.60}) +{:.1} GB -> {:.1} GB", level.len(), format!("{:?}", self.nodes[level[0]].kind), r - last_rss, r); } last_rss = r; }
+                    if rss_trace { let r = rss(); for &nid in level.iter() { *rss_by.entry(kind_of(nid)).or_default() += (r - last_rss) / level.len() as f64; } if r - last_rss > 1.0 { eprintln!("[rss] level of {} nodes (first {:.60}) +{:.1} GB -> {:.1} GB", level.len(), format!("{:?}", self.nodes[level[0]].kind), r - last_rss, r); } last_rss = r; }
                 }
+            }
+            if rss_trace {
+                let mut v: Vec<_> = rss_by.into_iter().collect();
+                v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                for (k, gb) in v.iter().take(12) { eprintln!("[rss] run: {k:22} {gb:+7.2} GB"); }
             }
             if prof {
                 let mut v: Vec<_> = prof_map.into_iter().collect();

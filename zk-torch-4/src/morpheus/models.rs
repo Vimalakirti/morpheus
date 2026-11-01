@@ -180,6 +180,18 @@ fn ar_run(name: &str, ar: Ar, seq: usize, vocab: usize, request: u64) -> Instanc
         if !changed { break; }
     }
     eprintln!("[generate] {} suffix tokens in {passes} forward passes", seq - prompt_len);
+    if tr {
+        // Witness memory by producing operator (8 bytes per stored element).
+        let mut by: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for e in 0..dag.num_edges() {
+            let Some(d) = wit[e][0].data.as_ref() else { continue };
+            let k = dag.producers[e].map(|n| format!("{:?}", dag.nodes[n].kind).split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap().to_string()).unwrap_or("-".into());
+            let x = by.entry(k).or_default(); x.0 += d.len(); x.1 += 1;
+        }
+        let mut v: Vec<_> = by.into_iter().collect(); v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (k, (n, c)) in v.iter().take(15) { eprintln!("[rss]   {k:24} {c:6} tensors {:8.2} GB", *n as f64 * 8.0 / 1e9); }
+        if std::env::var_os("MORPHEUS_RSS_EXIT").is_some() { std::process::exit(0); }
+    }
     if std::env::var("MORPHEUS_RSS").is_ok() { eprintln!("[rss] after generation {:.1} GB", std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok())).unwrap_or(0.0) * 4096.0 / 1e9); }
     if std::env::var("MORPHEUS_GEN_CHECK").is_ok() {
         // Reference: one position per forward pass.

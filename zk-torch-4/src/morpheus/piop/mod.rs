@@ -462,6 +462,42 @@ pub fn tensor_specs(g: &Graph, pd: &ProverData) -> Vec<(TKey, usize, usize, bool
     specs
 }
 
+/// The raw sources `range` of the layout, packed two bits per digit.
+pub fn fill_sources_packed(g: &Graph, pd: &ProverData, lay: &Layout, ell: usize, range: std::ops::Range<usize>) -> Vec<crate::morpheus::packed::Src> {
+    use crate::morpheus::packed::{PackedPtr, Src};
+    let mut raw: Vec<Src> = range.clone().map(|_| Src::zeros(1usize << ell)).collect();
+    let mut ptrs: Vec<Option<PackedPtr>> = vec![None; lay.n_sources];
+    for (k, r) in raw.iter_mut().enumerate() { ptrs[range.start + k] = Some(PackedPtr::of(r)); }
+    lay.tensors.par_iter().filter(|t| t.pieces.iter().all(|pc| range.contains(&pc.region.source))).for_each(|t| {
+        match t.key {
+            TKey::Edge(e) => {
+                let v = pd.v(e).clone();
+                lay.fill_packed(&t.key, &ptrs, &move |b, i| {
+                    let x = v[i];
+                    let (a, s) = if x > Q / 2 { (Q - x, -1i8) } else { (x, 1i8) };
+                    if (a >> b) & 1 == 1 { s } else { 0 }
+                });
+            }
+            TKey::Sel { node, chunk } => {
+                let t = &pd.sel[&node];
+                let shift: usize = g.chunks(node)[..chunk].iter().sum();
+                let w = g.chunks(node)[chunk];
+                lay.fill_packed(&t_key(node, chunk), &ptrs, &move |b, i| (((t[i] >> shift) & ((1 << w) - 1)) as usize == b) as i8);
+            }
+            TKey::Wg => {
+                let bank = &pd.bank;
+                lay.fill_packed(&TKey::Wg, &ptrs, &move |b, s| {
+                    if s >= bank.len() { return 0; }
+                    let (a, h) = (b / 64, b % 64);
+                    ((bank[s].0[a] >> h) & 1) as i8
+                });
+            }
+            TKey::Carry => {}
+        }
+    });
+    raw
+}
+
 /// Raw digit sources of the layout.
 pub fn fill_sources(g: &Graph, pd: &ProverData, lay: &Layout, ell: usize) -> Vec<Vec<i8>> {
     fill_sources_in(g, pd, lay, ell, 0..lay.n_sources)

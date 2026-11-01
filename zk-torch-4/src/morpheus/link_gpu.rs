@@ -143,7 +143,7 @@ fn kvec(words: &[u64]) -> Vec<K8> { words.chunks(8).map(|c| K8(c.try_into().unwr
 /// the M_O prefix — exactly what the CPU phases produce.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn phases_v2(
-    p: &Profile, st: &Statement, raw: &[Vec<i8>], b0: usize, alpha: &[K8], eta: &K8, gp: &[K8],
+    p: &Profile, st: &Statement, raw: &dyn crate::morpheus::packed::Sources, b0: usize, alpha: &[K8], eta: &K8, gp: &[K8],
     degs: &[usize], a_coef: &[Vec<K8>], tr: &mut MTranscript, dev_raw: Option<&DeviceBuffer<i8>>,
     keep: Option<&std::sync::Mutex<Vec<Kept>>>, pre_raw: Option<DeviceBuffer<i8>>,
 ) -> (Vec<Vec<K8>>, Vec<K8>, Vec<K8>, Vec<K8>, Vec<K8>, K8, K8) {
@@ -154,14 +154,14 @@ pub fn phases_v2(
     // blocks stand in for one-hot ones here); streamed mode scales device 0
     // down (MORPHEUS_SHARD0_WEIGHT, default 0.5), it also hosts the
     // authentication.
-    let n = raw.len();
+    let n = raw.count();
     let ngpu = std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1).min(n.max(1));
     let wgen: usize = std::env::var("MORPHEUS_GEN_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let nblk = raw[0].len() >> b0;
+    let nblk = raw.src_len() >> b0;
     let per_src: Vec<usize> = (0..n).into_par_iter().map(|s| {
         let mut bit = vec![false; nblk];
         for &(base, lg) in &st.bits[s] { let (a, c) = (base >> b0, 1usize << lg.saturating_sub(b0)); for x in bit.iter_mut().skip(a).take(c) { *x = true; } }
-        raw[s].par_chunks(1usize << b0).enumerate().map(|(k, c)| if c.iter().any(|&d| d != 0) { if bit[k] { 1 } else { wgen } } else { 0 }).sum::<usize>()
+        (0..nblk).into_par_iter().map(|k| if !raw.is_zero(s, k << b0, 1usize << b0) { if bit[k] { 1 } else { wgen } } else { 0 }).sum::<usize>()
     }).collect();
     let w0: f64 = if keep.is_some() { std::env::var("MORPHEUS_SHARD0_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5) } else { 1.0 };
     let cap: Vec<f64> = (0..ngpu).map(|g| if g == 0 { w0 } else { 1.0 }).collect();
@@ -174,7 +174,7 @@ pub fn phases_v2(
         owner[s] = g;
         load[g] += per_src[s] + 1;
     }
-    let src_len = raw[0].len();
+    let src_len = raw.src_len();
     // A single device's sources may already be resident (uploaded during the PIOP).
     let mut pre_raw = if ngpu == 1 { pre_raw.filter(|b| b.len() == n * src_len) } else { None };
     std::thread::scope(|sc| {
@@ -186,7 +186,8 @@ pub fn phases_v2(
                 almost_goldilocks_cuda::set_device(g as i32).expect("set device");
                 let srcs: Vec<usize> = (0..n).filter(|&s| owner[s] == g).collect();
                 let mut d = DeviceBuffer::<i8>::new((srcs.len() * src_len).max(1)).expect("raw alloc");
-                for (j, &s) in srcs.iter().enumerate() { d.copy_from_slice_at(j * src_len, &raw[s]).expect("raw upload"); }
+                let mut scratch = None;
+                for (j, &s) in srcs.iter().enumerate() { crate::morpheus::packed::upload_i8(raw, s, &mut d, j * src_len, false, &mut scratch); }
                 d
             }))
         }).collect();
@@ -196,7 +197,7 @@ pub fn phases_v2(
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn phases_v2_body<'u>(
-    p: &Profile, st: &Statement, raw: &[Vec<i8>], b0: usize, alpha: &[K8], eta: &K8, gp: &[K8],
+    p: &Profile, st: &Statement, raw: &dyn crate::morpheus::packed::Sources, b0: usize, alpha: &[K8], eta: &K8, gp: &[K8],
     degs: &[usize], a_coef: &[Vec<K8>], tr: &mut MTranscript, dev_raw: Option<&DeviceBuffer<i8>>,
     keep: Option<&std::sync::Mutex<Vec<Kept>>>, owner: Vec<usize>, mut ups: Vec<Option<std::thread::ScopedJoinHandle<'u, DeviceBuffer<i8>>>>,
 ) -> (Vec<Vec<K8>>, Vec<K8>, Vec<K8>, Vec<K8>, Vec<K8>, K8, K8) {
@@ -276,7 +277,7 @@ fn phases_v2_body<'u>(
     let onehot: Vec<bool> = regs.par_iter().map(|r| {
         if r.p == 0 || r.p > DENSE_P || !bits.contains(&(r.src, r.base)) { return false; }
         let np = 1usize << r.p;
-        raw[r.src][r.base..r.base + (1usize << (r.m + r.p))].chunks(np).all(|c| c.iter().filter(|&&d| d != 0).count() == 1 && c.iter().all(|&d| d == 0 || d == 1))
+        (0..1usize << r.m).all(|k| raw.nonzeros(r.src, r.base + k * np, np) == (1, true))
     }).collect();
     lap("one-hot detection");
     // Dense query tables (many-plane regions). When every dense region's terms
@@ -407,8 +408,7 @@ fn phases_v2_body<'u>(
         if rs == s && id < rb + rn { Some((ri, id - rb)) } else { None }
     };
     let blocks: Vec<Blk> = (0..n).into_par_iter().flat_map_iter(|s| {
-        let rw = &raw[s];
-        (0..nblk_src).filter(move |&id| rw[id << b0..(id + 1) << b0].iter().any(|&d| d != 0)).map(move |id| (s, id)).collect::<Vec<_>>()
+        (0..nblk_src).filter(move |&id| !raw.is_zero(s, id << b0, 1usize << b0)).map(move |id| (s, id)).collect::<Vec<_>>()
     }).map(|(s, id)| match find(s, id) { Some((ri, k)) => Blk { src: s as u32, id: id as u32, region: ri as u32, k: k as u32 }, None => Blk { src: s as u32, id: id as u32, region: u32::MAX, k: 0 } }).collect();
     lap("nonzero block scan");
     if std::env::var("MORPHEUS_LINK_STATS").is_ok() {
@@ -417,10 +417,11 @@ fn phases_v2_body<'u>(
         let mut agg: std::collections::BTreeMap<(i64, bool), [u64; 9]> = Default::default();
         for b in &blocks {
             let (p, ht) = if b.region == u32::MAX { (-1i64, false) } else { let r = &regions_c[b.region as usize]; if r.flags & 2 != 0 { continue; } (r.p as i64, r.tcnt > 0 || r.flags & 4 != 0) };
-            let d = &raw[b.src as usize][(b.id as usize) << b0..((b.id as usize) + 1) << b0];
+            let mut d = vec![0i8; 1usize << b0];
+            raw.read(b.src as usize, (b.id as usize) << b0, &mut d);
             let e = agg.entry((p, ht)).or_default();
             e[0] += 1;
-            for &x in d { match x { 0 => e[1] += 1, 1 => e[2] += 1, -1 => e[3] += 1, _ => e[4] += 1 } }
+            for &x in &d { match x { 0 => e[1] += 1, 1 => e[2] += 1, -1 => e[3] += 1, _ => e[4] += 1 } }
             for (k, i) in [(5usize, 1usize), (6, 2), (7, 3)] {
                 let w = 1usize << (i + 1);
                 e[k] += d.chunks(w).filter(|c| c.iter().any(|&x| x != 0)).count() as u64;
@@ -442,7 +443,7 @@ fn phases_v2_body<'u>(
     // balanced by nonzero blocks; each device holds only its range (shard 0
     // may use the resident `dev_raw` holding every source). The coarse phase
     // also runs per shard.
-    let src_len = raw[0].len() as u64;
+    let src_len = raw.src_len() as u64;
     let ca_lo_bits = (ell - b0) / 2;
     let calo_h = eq_table(&alpha[b0..b0 + ca_lo_bits]);
     let cahi_h = eq_table(&alpha[b0 + ca_lo_bits..]);

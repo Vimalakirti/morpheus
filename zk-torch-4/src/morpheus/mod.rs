@@ -5,6 +5,7 @@
 //! place until the switch.
 
 pub mod field8;
+pub mod packed;
 pub mod ring;
 pub mod params;
 pub mod keys;

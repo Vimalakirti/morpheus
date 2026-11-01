@@ -102,13 +102,15 @@ impl Profile {
     /// Σ‖payload‖² ≤ 2^s_max. Payload digits are ternary, so the energy is
     /// at most the payload capacity, and the digits are counted only when
     /// the capacity exceeds the cap (more than 2091 full sources).
-    pub fn check_caps(&self, raw: &[Vec<i8>]) {
+    pub fn check_caps(&self, raw: &dyn super::packed::Sources) {
         use rayon::prelude::*;
-        assert!(raw.len() <= self.n_max, "{} sources exceed n_max = {}", raw.len(), self.n_max);
+        let n = raw.count();
+        assert!(n <= self.n_max, "{} sources exceed n_max = {}", n, self.n_max);
         let cap = (self.source_payload_cols * super::ring::N) as u128;
-        if raw.len() as u128 * cap <= 1u128 << self.s_max_log2 { return; }
-        let pl = cap as usize;
-        let e: u128 = raw.par_iter().map(|r| r[..pl.min(r.len())].iter().map(|&v| (v as i64 * v as i64) as u128).sum::<u128>()).sum();
+        if n as u128 * cap <= 1u128 << self.s_max_log2 { return; }
+        let pl = (cap as usize).min(raw.src_len());
+        // Every digit is in {-1, 0, 1}: the energy counts nonzero digits.
+        let e: u128 = (0..n).into_par_iter().map(|s| raw.nonzeros(s, 0, pl).0 as u128).sum();
         assert!(e <= 1u128 << self.s_max_log2, "payload energy {e} exceeds 2^{}", self.s_max_log2);
     }
     /// Exact integer Euclidean cap R_P^2 = σ^2 [D + 2⌈sqrt(114 D)⌉ + 228].

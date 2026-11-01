@@ -3658,6 +3658,14 @@ int agl_mlink2_onehot_bin(const int8_t* d_raw, uint64_t src_len, int b0, const v
     return (int)e;
 }
 
+/// Packed (2-bit) raw digits -> int8 (phys = 1: physical column order).
+int agl_morpheus_unpack2(const uint8_t* d_src, int8_t* d_dst, uint64_t n, int phys) {
+    int grid = ma_sms() * 32;
+    mauth::unpack2_kernel<<<grid, 256>>>(d_src, d_dst, n, phys);
+    cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
+    return (int)e;
+}
+
 int agl_morpheus_permute(const int8_t* d_src, int8_t* d_dst, uint64_t n) {
     int grid = ma_sms() * 32;
     mauth::permute_kernel<<<grid, 256>>>(d_src, d_dst, n);

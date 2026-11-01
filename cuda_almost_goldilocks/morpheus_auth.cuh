@@ -296,4 +296,17 @@ __global__ void permute_kernel(const int8_t* __restrict__ src, int8_t* __restric
     }
 }
 
+/// Packed raw digits (2 bits each, 00 = 0, 01 = 1, 11 = -1) -> int8,
+/// optionally permuted to physical columns as permute_kernel.
+__device__ __forceinline__ int8_t unpack_digit(const uint8_t* __restrict__ p, size_t i) {
+    return (int8_t)((int8_t)(p[i >> 2] << (6 - 2 * (int)(i & 3))) >> 6);
+}
+__global__ void unpack2_kernel(const uint8_t* __restrict__ src, int8_t* __restrict__ dst, size_t n, int phys) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        int8_t v = unpack_digit(src, i);
+        if (phys) { size_t c = i >> 12; int l = (int)(i & 4095); dst[(c << 12) + (l >> 6) + 64 * (l & 63)] = v; }
+        else dst[i] = v;
+    }
+}
+
 }  // namespace mauth

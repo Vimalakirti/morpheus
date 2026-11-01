@@ -275,7 +275,7 @@ impl LinkServices for PcsGpu {
     fn dev_raw(&self) -> Option<&DeviceBuffer<i8>> { self.flat.as_ref() }
     fn kept(&self) -> Option<&std::sync::Mutex<Vec<super::link_gpu::Kept>>> { if self.streamed { Some(&self.kept) } else { None } }
     fn take_pre_raw(&self) -> Option<DeviceBuffer<i8>> { self.pre_raw.lock().unwrap().take() }
-    fn ev(&mut self, p: &Profile, _raw: &[Vec<i8>], xi: &[K8]) -> Vec<AElem> {
+    fn ev(&mut self, p: &Profile, _raw: &dyn super::packed::Sources, xi: &[K8]) -> Vec<AElem> {
         if self.streamed {
             self.kept_to_phys();
             let k = self.kept.lock().unwrap();
@@ -305,14 +305,14 @@ impl LinkServices for PcsGpu {
 /// Commitments of host sources streamed through the devices `devs`
 /// (device id, its W key cache), contiguous chunks per device; nothing stays
 /// resident.
-pub fn commit_streamed(p: &Profile, devs: &[(i32, &Keys)], raw: &[Vec<i8>]) -> Vec<Vec<Vec<u64>>> {
+pub fn commit_streamed(p: &Profile, devs: &[(i32, &Keys)], raw: &dyn super::packed::Sources) -> Vec<Vec<Vec<u64>>> {
     commit_streamed_on(p, None, devs, raw)
 }
 
 /// Same; devices in `extra` (id) build a temporary 3-prime source key cache
 /// from `seed` for the duration of the commitment.
-pub fn commit_streamed_on(p: &Profile, extra: Option<(&KeySeed, &[i32])>, devs: &[(i32, &Keys)], raw: &[Vec<i8>]) -> Vec<Vec<Vec<u64>>> {
-    let n = raw.len();
+pub fn commit_streamed_on(p: &Profile, extra: Option<(&KeySeed, &[i32])>, devs: &[(i32, &Keys)], raw: &dyn super::packed::Sources) -> Vec<Vec<Vec<u64>>> {
+    let n = raw.count();
     let mut all: Vec<(i32, Option<&Keys>)> = devs.iter().map(|&(d, k)| (d, Some(k))).collect();
     if let Some((_, ex)) = extra { for &d in ex { all.push((d, None)); } }
     let g = all.len().max(1).min(n.max(1));
@@ -329,22 +329,20 @@ pub fn commit_streamed_on(p: &Profile, extra: Option<(&KeySeed, &[i32])>, devs: 
                 };
                 let (lo, hi) = ((k * per).min(n), ((k + 1) * per).min(n));
                 if lo == hi { return (lo, Vec::new()); }
-                let len = raw[0].len();
+                let len = raw.src_len();
                 let rank = p.rank;
                 let ncols = p.source_payload_cols + p.hiding;
                 // Up to MORPHEUS_COMMIT_V sources per pass over the key cache
                 // (multi-vector MAC: each key element read once per pass).
                 let bv = commit_batch(ncols, len);
-                let mut flat = DeviceBuffer::<i8>::new(len).unwrap();
+                let mut scratch: Option<DeviceBuffer<u8>> = None;
                 let mut phys = DeviceBuffer::<i8>::new(len * bv).unwrap();
                 let mut v = Vec::with_capacity(hi - lo);
                 for s0 in (lo..hi).step_by(bv) {
                     let nb = bv.min(hi - s0);
                     let mut err8: Vec<i8> = Vec::with_capacity(nb * rank * N);
                     for q in 0..nb {
-                        flat.copy_from_slice(&raw[s0 + q]).unwrap();
-                        let rc = unsafe { ffi::agl_morpheus_permute(flat.as_ptr(), phys.as_mut_ptr().add(q * len), len as u64) };
-                        assert_eq!(rc, 0);
+                        super::packed::upload_i8(raw, s0 + q, &mut phys, q * len, true, &mut scratch);
                         err8.extend(phys.read_slice(q * len + (len / N - rank) * N, rank * N).unwrap());
                     }
                     let err = DeviceBuffer::from_slice(&err8.iter().map(|&x| x as i64).collect::<Vec<_>>()).unwrap();

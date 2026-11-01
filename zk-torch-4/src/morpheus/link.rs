@@ -182,11 +182,20 @@ pub fn raw_to_cols(raw: &[i8]) -> Vec<Vec<i64>> {
 /// Same as `fill_source_suffix`, sampling the coins on the GPU.
 pub fn fill_source_suffix_gpu(p: &Profile, coins: &Coins, source_id: u64, raw: &mut [i8]) {
     let start = p.source_payload_cols * N;
+    let suf = source_suffix_gpu(p, coins, source_id);
+    raw[start..start + suf.len()].copy_from_slice(&suf);
+}
+
+/// The suffix digits (hiding then identity error columns, logical order) of
+/// source `source_id`, which start at digit `source_payload_cols · N`.
+pub fn source_suffix_gpu(p: &Profile, coins: &Coins, source_id: u64) -> Vec<i8> {
     let hid = super::pcs_gpu::ternary_gpu(coins, Purpose::SourceSecret, source_id, p.hiding * N);
     let err = super::pcs_gpu::ternary_gpu(coins, Purpose::SourceError, source_id, p.rank * N);
+    let mut out = vec![0i8; (p.hiding + p.rank) * N];
     for (c, col) in hid.chunks(N).chain(err.chunks(N)).enumerate() {
-        for l in 0..N { raw[start + c * N + l] = col[phys_of_logical(l)]; }
+        for l in 0..N { out[c * N + l] = col[phys_of_logical(l)]; }
     }
+    out
 }
 
 /// Fill a source's suffix (hiding then identity error) from its coins.

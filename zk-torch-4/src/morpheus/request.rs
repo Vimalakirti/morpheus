@@ -15,6 +15,7 @@
 //! commitment and transcript digest. Requests are accepted only together
 //! with their finalization.
 
+use super::packed::Sources;
 use super::auth::{AuthProof, Point, Tuple, AuxTuple};
 use super::auth_gpu::{self, AuthDev, AuthTiming, DevSource};
 use super::coins::Coins;
@@ -107,7 +108,15 @@ fn req_owner(j: u64, e: usize) -> u64 {
 }
 
 pub type Times = BTreeMap<&'static str, f64>;
-fn lap(t: &mut Times, k: &'static str, t0: Instant) -> f64 { let s = t0.elapsed().as_secs_f64(); *t.entry(k).or_default() += s; s }
+fn lap(t: &mut Times, k: &'static str, t0: Instant) -> f64 {
+    let s = t0.elapsed().as_secs_f64(); *t.entry(k).or_default() += s;
+    // MORPHEUS_RSS=1: host memory after every timed stage.
+    if std::env::var_os("MORPHEUS_RSS").is_some() {
+        let gb = std::fs::read_to_string("/proc/self/statm").ok().and_then(|m| m.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok())).unwrap_or(0.0) * 4096.0 / 1e9;
+        eprintln!("[rss] after {k}: {gb:.1} GB");
+    }
+    s
+}
 
 /// A compiled request instance: graph, prover data, source layout.
 pub struct Prepared<'a> {
@@ -123,7 +132,7 @@ pub struct Prepared<'a> {
     pub ar: Option<super::ar_statement::ArStatement>,
 }
 
-pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &mut Opts) -> Prepared<'a> {
+pub fn prepare<'a>(dag: &'a Dag, wit: &[Vec<Witness>], public: &[usize], o: &mut Opts) -> Prepared<'a> {
     // The carry bank (2^carry_log slots of 512 bit planes) fits one source.
     let cap = o.profile.source_payload_cols * super::ring::N;
     let max_lg = (usize::BITS - 1 - cap.leading_zeros()) as usize;
@@ -153,6 +162,12 @@ pub fn prepare<'a>(dag: &'a Dag, wit: &'a [Vec<Witness>], public: &[usize], o: &
     let t_pd0 = t.elapsed().as_secs_f64();
     let pd = ProverData::new(&g, wit, Vec::new());
     let t_pd = t.elapsed().as_secs_f64();
+    if std::env::var_os("MORPHEUS_RSS").is_some() {
+        let gb = std::fs::read_to_string("/proc/self/statm").ok().and_then(|m| m.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok())).unwrap_or(0.0) * 4096.0 / 1e9;
+        let vals: usize = pd.vals.iter().flatten().map(|v| v.len() * 8).sum();
+        let sel: usize = pd.sel.values().map(|v| v.len() * 8).sum();
+        eprintln!("[rss] after prover data: {gb:.1} GB (edge values {:.1} GB, selectors {:.1} GB)", vals as f64 / 1e9, sel as f64 / 1e9);
+    }
     let specs = piop::tensor_specs(&g, &pd);
     // Never co-pack immutable inputs/model with proof-local masks/selectors.
     let (mut m, mut x, mut r) = (Vec::new(), Vec::new(), Vec::new());
@@ -188,6 +203,13 @@ fn remap(rows: &[Row], map: &(dyn Fn(usize) -> usize + Sync)) -> Vec<Row> {
     }).collect()
 }
 
+fn fill_suffixes_packed(p: &Profile, coins: &Coins, raw: &mut [super::packed::Src], owner: &dyn Fn(usize) -> u64) {
+    let owners: Vec<u64> = (0..raw.len()).map(owner).collect();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().expect("suffix pool");
+    let start = p.source_payload_cols * super::ring::N;
+    pool.install(|| raw.par_iter_mut().zip(&owners).for_each(|(r, &w)| r.put(start, &link::source_suffix_gpu(p, coins, w))));
+}
+
 fn fill_suffixes(p: &Profile, coins: &Coins, raw: &mut [Vec<i8>], owner: &dyn Fn(usize) -> u64) {
     // Sources are independent (own coin owner); a few in flight at once.
     let owners: Vec<u64> = (0..raw.len()).map(owner).collect();
@@ -198,7 +220,7 @@ fn fill_suffixes(p: &Profile, coins: &Coins, raw: &mut [Vec<i8>], owner: &dyn Fn
 // ---------------------------------------------------------------- model registration
 
 pub struct ModelReg {
-    raw: Vec<Vec<i8>>,
+    raw: Vec<super::packed::Src>,
     c: Vec<Vec<Vec<u64>>>,
     pub secs: f64,
     /// Canonical immutable program/type identity; contains no private weights.
@@ -234,7 +256,7 @@ fn registration_matches(pp: &Prepared, o: &Opts, model: RegisteredModel<'_>) -> 
 /// Prover-owned hidden input openings. Reuse this object to prove the SAME
 /// registered input again; a different input requires a fresh registration.
 pub struct InputReg {
-    raw: Vec<Vec<i8>>,
+    raw: Vec<super::packed::Src>,
     c: Vec<Vec<Vec<u64>>>,
     statement: Vec<u64>,
     layout: Vec<u64>,
@@ -271,8 +293,16 @@ fn input_registration_matches(pp: &Prepared, o: &Opts, input: RegisteredInput<'_
 /// Register every nonpublic leaf Role::Input, without registering fresh graph
 /// masks. Allocated suffix-owner addresses are irreversibly consumed on failure.
 pub fn register_inputs(pp: &Prepared, o: &Opts, pc: &mut PcsGpu) -> InputReg {
-    let r = register_inputs_with(pp, o, &|raw, owner| fill_suffixes(&o.profile, &o.coins, raw, owner), &mut |raw| if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, raw) });
-    pc.ensure_w(); r
+    let t = Instant::now();
+    let statement = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
+        .expect("invalid input registration program");
+    let owners = o.coins.allocate_input_registration(pp.input.len()).expect("input registration source budget exhausted");
+    let mut raw = piop::fill_sources_packed(&pp.g, &pp.pd, &pp.lay, o.profile.ell(), pp.input.clone());
+    assert_eq!(raw.len() as u64, owners.end - owners.start, "input suffix owner allocation mismatch");
+    fill_suffixes_packed(&o.profile, &o.coins, &mut raw, &|e| owners.start + e as u64);
+    let c = if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, &super::packed::Packs(&raw)) };
+    pc.ensure_w();
+    InputReg { raw, c, statement, layout: group_layout_words(pp, &pp.input), secs: t.elapsed().as_secs_f64() }
 }
 pub fn register_inputs_cpu(pp: &Prepared, o: &Opts) -> InputReg {
     register_inputs_with(pp, o, &|raw, owner| fill_suffixes_cpu(o, raw, owner), &mut |raw| commit_cpu(o, raw))
@@ -286,6 +316,7 @@ fn register_inputs_with(pp: &Prepared, o: &Opts, fill: &dyn Fn(&mut [Vec<i8>], &
     assert_eq!(raw.len() as u64, owners.end - owners.start, "input suffix owner allocation mismatch");
     fill(&mut raw, &|e| owners.start + e as u64);
     let c = commit(&raw);
+    let raw = raw.iter().map(|r| super::packed::Src::from_i8(r)).collect();
     InputReg { raw, c, statement, layout: group_layout_words(pp, &pp.input), secs: t.elapsed().as_secs_f64() }
 }
 
@@ -294,8 +325,15 @@ fn register_inputs_with(pp: &Prepared, o: &Opts, fill: &dyn Fn(&mut [Vec<i8>], &
 /// not from the proof or an untrusted prover-supplied ModelReg.
 pub fn register(pp: &Prepared, o: &Opts, pc: &mut PcsGpu, reps: &Replicas) -> ModelReg {
     let _ = reps;
-    let r = register_with(pp, o, &|raw, owner| fill_suffixes(&o.profile, &o.coins, raw, owner), &mut |raw| if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, raw) });
-    pc.ensure_w(); r
+    o.coins.claim_model_registration().expect("model registration namespace already consumed");
+    let t = Instant::now();
+    let mut raw = piop::fill_sources_packed(&pp.g, &pp.pd, &pp.lay, o.profile.ell(), pp.model.clone());
+    fill_suffixes_packed(&o.profile, &o.coins, &mut raw, &model_owner);
+    let c = if raw.is_empty() { Vec::new() } else { commit_streamed(o, pc, &super::packed::Packs(&raw)) };
+    let statement = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
+        .expect("invalid registered program");
+    pc.ensure_w();
+    ModelReg { raw, c, secs: t.elapsed().as_secs_f64(), statement, layout: model_layout_words(pp) }
 }
 pub fn register_cpu(pp: &Prepared, o: &Opts) -> ModelReg {
     register_with(pp, o, &|raw, owner| fill_suffixes_cpu(o, raw, owner), &mut |raw| commit_cpu(o, raw))
@@ -306,6 +344,7 @@ fn register_with(pp: &Prepared, o: &Opts, fill: &dyn Fn(&mut [Vec<i8>], &dyn Fn(
     let mut raw = piop::fill_sources_in(&pp.g, &pp.pd, &pp.lay, o.profile.ell(), pp.model.clone());
     fill(&mut raw, &model_owner);
     let c = commit(&raw);
+    let raw = raw.iter().map(|r| super::packed::Src::from_i8(r)).collect();
     let statement = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
         .expect("invalid registered program");
     ModelReg { raw, c, secs: t.elapsed().as_secs_f64(), statement, layout: model_layout_words(pp) }
@@ -406,7 +445,7 @@ fn extra_devs() -> Vec<i32> {
 
 /// Streamed commitments: device 0 with its key cache, the other devices
 /// with temporary 3-prime caches.
-fn commit_streamed(o: &Opts, pc: &mut PcsGpu, raw: &[Vec<i8>]) -> Vec<Vec<Vec<u64>>> {
+fn commit_streamed(o: &Opts, pc: &mut PcsGpu, raw: &dyn super::packed::Sources) -> Vec<Vec<Vec<u64>>> {
     let ex = extra_devs();
     if ex.is_empty() { pc.ensure_w(); }
     let devs: Vec<(i32, &auth_gpu::Keys)> = if pc.keys.w.buf.len() > 1 { vec![(0, &pc.keys)] } else { vec![] };
@@ -522,32 +561,33 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     // Streamed sources uploaded for the link while the PIOP runs (one device).
     let pre_raw: std::sync::Mutex<Option<DeviceBuffer<i8>>> = std::sync::Mutex::new(None);
     let one_gpu = std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) == 1;
-    let (raw_req, mut rep_vec, c_req, piop_out) = std::thread::scope(|sc| {
+    // Registered sources, by reference: the model's payload AND hiding suffix
+    // (monolithic) and the input's. Only request sources get fresh suffixes.
+    let reg_refs: Vec<&super::packed::Src> = if defer { Vec::new() } else { model.raw.iter().collect() };
+    let reg_refs: Vec<&super::packed::Src> = reg_refs.into_iter().chain(input.raw.iter()).collect();
+    let (raw_req, raw8, mut rep_vec, c_req, piop_out) = std::thread::scope(|sc| {
         let pdr = pd;
         sc.spawn(move || pdr.prefetch());
         let t = Instant::now();
-        let mut raw = piop::fill_sources_in(g, pd, lay, ell, req.clone());
+        // Request sources, packed two bits per digit (packed.rs).
+        let mut raw = piop::fill_sources_packed(g, pd, lay, ell, req.clone());
         let t_fs = t.elapsed().as_secs_f64();
-        fill_suffixes(&o.profile, &o.coins, &mut raw, &|e| req_owner(j, e));
+        fill_suffixes_packed(&o.profile, &o.coins, &mut raw, &|e| req_owner(j, e));
         let t_sx = t.elapsed().as_secs_f64();
-        // Copies in parallel (fresh GB-scale buffers fault their pages; one
-        // thread per source).
-        let par_clone = |v: &[Vec<i8>]| -> Vec<Vec<i8>> { v.par_iter().cloned().collect() };
-        raw = par_clone(&input.raw).into_iter().chain(raw).collect();
-        if !defer {
-            // Preserve the registered model's payload AND hiding suffix. Only
-            // request sources above receive fresh masks/suffixes.
-            raw = par_clone(&model.raw).into_iter().chain(raw).collect();
-        }
-        if o.timing { eprintln!("[fill] sources {:.2} s, suffixes {:.2} s, model/input copies {:.2} s", t_fs, t_sx - t_fs, t.elapsed().as_secs_f64() - t_sx); }
-        lap(&mut times, "fill", t);
         let raw = std::sync::Arc::new(raw);
-        let stream = o.streams(raw.len() + defer as usize);
-        let jobs = if o.auth && !stream { load_replicas(sc, std::mem::take(&mut reps.r), raw.clone()) } else { Vec::new() };
+        let all = |r: &std::sync::Arc<Vec<super::packed::Src>>| -> Vec<*const super::packed::Src> { reg_refs.iter().map(|&x| x as *const _).chain(r.iter().map(|x| x as *const _)).collect() };
+        let refs: Vec<&super::packed::Src> = all(&raw).into_iter().map(|x| unsafe { &*x }).collect();
+        let stream = o.streams(refs.len() + defer as usize);
+        // Small requests (non-streamed) keep int8 copies for the resident
+        // device sources and the authentication replicas.
+        let raw8: Option<std::sync::Arc<Vec<Vec<i8>>>> = (!stream).then(|| std::sync::Arc::new(refs.par_iter().map(|r| r.unpack()).collect()));
+        if o.timing { eprintln!("[fill] sources {:.2} s, suffixes {:.2} s, int8 copies {:.2} s", t_fs, t_sx - t_fs, t.elapsed().as_secs_f64() - t_sx); }
+        lap(&mut times, "fill", t);
+        let jobs = if o.auth && !stream { load_replicas(sc, std::mem::take(&mut reps.r), raw8.clone().unwrap()) } else { Vec::new() };
         let t = Instant::now();
         let c_req = if stream {
             pc.streamed = true;
-            let c = commit_streamed(o, pc, &raw);
+            let c = commit_streamed(o, pc, &super::packed::Refs(&refs));
             // The source key cache (43 GB at the ternary profile) is freed
             // for the link's resident sources and rebuilt for the
             // authentication, also on a single GPU.
@@ -555,7 +595,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
             c
         } else {
             pc.streamed = false;
-            pc.load_sources(&raw);
+            pc.load_sources(raw8.as_ref().unwrap());
             let c = pc.commit_sources();
             // MORPHEUS_DROP_W=1 (one device): free the source key cache (43 GB)
             // until the authentication rebuilds it (~1.3 s), so the PIOP can
@@ -566,14 +606,17 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         };
         lap(&mut times, "commit", t);
         if stream && one_gpu && std::env::var("MORPHEUS_NO_PRE_RAW").is_err() {
-            let (raw, pre_raw) = (raw.clone(), &pre_raw);
+            let (raw, pre_raw, reg_refs) = (raw.clone(), &pre_raw, &reg_refs);
             sc.spawn(move || {
                 almost_goldilocks_cuda::set_device(0).expect("set device");
-                let len = raw[0].len();
+                let refs: Vec<&super::packed::Src> = reg_refs.iter().copied().chain(raw.iter()).collect();
+                let src = super::packed::Refs(&refs);
+                let len = src.src_len();
                 let t = Instant::now();
-                if let Ok(mut d) = DeviceBuffer::<i8>::new(len * raw.len()) {
-                    for (s, r) in raw.iter().enumerate() { d.copy_from_slice_at(s * len, r).expect("raw upload"); }
-                    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] sources uploaded during the PIOP: {:.1} GB in {:.2} s", (len * raw.len()) as f64 / 1e9, t.elapsed().as_secs_f64()); }
+                if let Ok(mut d) = DeviceBuffer::<i8>::new(len * refs.len()) {
+                    let mut scratch = None;
+                    for s in 0..refs.len() { super::packed::upload_i8(&src, s, &mut d, s * len, false, &mut scratch); }
+                    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] sources uploaded during the PIOP: {:.1} GB in {:.2} s", (len * refs.len()) as f64 / 1e9, t.elapsed().as_secs_f64()); }
                     *pre_raw.lock().unwrap() = Some(d);
                 }
             });
@@ -610,7 +653,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         if o.timing { for (k, v) in &ctx.stats { eprintln!("  {k:12} {:6} calls {:.3}s", v.0, v.1); } }
         println!("{}", ctx.census_line());
         let reps: Vec<AuthReplica> = if stream { std::mem::take(&mut reps.r) } else { jobs.into_iter().map(|h| h.join().expect("replica")).collect() };
-        (raw, reps, c_req, ctx)
+        (raw, raw8, reps, c_req, ctx)
     });
     let mut ctx = piop_out;
     if std::env::var("MORPHEUS_UNCLAIMED").is_ok() {
@@ -624,7 +667,11 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         }
     }
     *pc.pre_raw.lock().unwrap() = pre_raw.into_inner().unwrap();
-    let mut raw: Vec<Vec<i8>> = std::sync::Arc::try_unwrap(raw_req).unwrap_or_else(|a| (*a).clone());
+    // Every scoped thread has joined: the request's sources are owned again
+    // (never copied).
+    let raw_req: Vec<super::packed::Src> = std::sync::Arc::try_unwrap(raw_req).unwrap_or_else(|_| panic!("request sources still shared"));
+    let mut raw8: Option<Vec<Vec<i8>>> = raw8.map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|_| panic!("int8 sources still shared")));
+    let mut carry_src: Option<super::packed::Src> = None;
     let mut c_src = c_req;
     let mut t1 = ctx.tr.clone();
     let (mut carry_raw, mut deferred, mut ncarry) = (None, Vec::new(), 0);
@@ -632,12 +679,13 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         let t = Instant::now();
         let mut cr = piop::fill_carry(lay, &d.carries, ell, carry.start);
         link::fill_source_suffix_gpu(&o.profile, &o.coins, req_owner(j, req.len()), &mut cr);
-        let cc = if pc.streamed { commit_streamed(o, pc, std::slice::from_ref(&cr)).pop().unwrap() } else { pc.push_source(&cr) };
+        let cc = if pc.streamed { commit_streamed(o, pc, &super::packed::I8s(std::slice::from_ref(&cr))).pop().unwrap() } else { pc.push_source(&cr) };
         for x in &cc { t1.absorb(Item::SourceCommitment, x); }
         if !pc.streamed { for r in rep_vec.iter_mut() { r.push(&cr); } }
         almost_goldilocks_cuda::set_device(0).unwrap();
         c_src.push(cc);
-        raw.push(cr.clone());
+        if let Some(r) = raw8.as_mut() { r.push(cr.clone()); }
+        carry_src = Some(super::packed::Src::from_i8(&cr));
         carry_raw = Some(cr);
         deferred = d.rows.clone();
         ncarry = d.used() as usize;
@@ -646,19 +694,25 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     // Π_link over the request sources (+ carry bank).
     let base = if defer { pp.input.start } else { pp.model.start };
     let span = base..if defer { carry.end } else { req.end };
-    let st = Statement { n: raw.len(), bits: lay.bit_blocks_in(&span), rows: remap(&ctx.rows, &|s| s - base) };
+    let refs: Vec<&super::packed::Src> = reg_refs.iter().copied().chain(raw_req.iter()).chain(carry_src.iter()).collect();
+    let packs = super::packed::Refs(&refs);
+    let i8s = raw8.as_deref().map(super::packed::I8s);
+    let src: &dyn super::packed::Sources = match &i8s { Some(r) => r, None => &packs };
+    let st = Statement { n: src.count(), bits: lay.bit_blocks_in(&span), rows: remap(&ctx.rows, &|s| s - base) };
     let t = Instant::now();
+    // Debug link implementations take int8 sources.
+    let dbg8 = || -> Vec<Vec<i8>> { (0..src.count()).map(|e| src.to_i8(e).into_owned()).collect() };
     let fast = match std::env::var("LINK_IMPL").ok().as_deref() {
-        Some("ref") => link::prove(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, &raw),
-        Some("cpu") => link_fast::prove(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, &raw, o.b0),
-        Some("v1") => link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, &raw, o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), false),
-        _ => link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, &raw, o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), true),
+        Some("ref") => link::prove(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, &dbg8()),
+        Some("cpu") => link_fast::prove(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, &dbg8(), o.b0),
+        Some("v1") => link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, &dbg8(), o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), false),
+        _ => link_fast::prove_with_sources(&o.profile, &o.seed, &o.coins, opening, &mut t1, &st, src, o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), true),
     };
     lap(&mut times, "link", t);
     // The logical source copy served the link; the authentication uses the
     // physical columns.
     if o.auth && !pc.streamed && !defer { pc.flat = None; }
-    if o.auth && support.len() < o.profile.source_cols() { super::auth_compact::check_raw_support(&o.profile, &support, &raw); }
+    if o.auth && support.len() < o.profile.source_cols() { super::auth_compact::check_support(&o.profile, &support, src); }
     let auth = if !o.auth { None } else if pc.streamed { Some(authenticate_streamed(o, opening, pc, &fast, &t1, &runs, &mut times)) } else { Some(authenticate(o, opening, pc, &mut rep_vec, &fast, &t1, &runs, &mut times)) };
     auth_gpu::clear_presampled();
     reps.r = rep_vec;
@@ -672,6 +726,13 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     let pf = wire::RequestProof { salt, piop: std::mem::take(&mut ctx.proof), c_src, link: fast.proof, auth };
     let bytes = if o.auth { wire::encode_request_compact(&o.profile, &support, &pf).expect("compact request encode") } else { wire::encode_request(&o.profile, &pf) };
     lap(&mut times, "serialize", t);
+    // MORPHEUS_DIGEST=1: a digest of the serialized proof, to check that a
+    // systems change leaves proofs byte-identical (with MORPHEUS_COIN_SEED).
+    if std::env::var_os("MORPHEUS_DIGEST").is_some() {
+        use sha3::{Digest, Sha3_256};
+        let h = Sha3_256::digest(&bytes);
+        eprintln!("[digest] request {j}: {} bytes, sha3 {}", bytes.len(), h.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    }
     RequestOut { bytes, piop_len, c_carry, carry_raw, deferred, digest: dg, literal_prefix: t1.literal_prefix().to_vec(), times, rows: ctx.rows.len(), carries: ncarry }
 }
 
@@ -810,9 +871,8 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
     let salt = o.coins.begin_opening(opening).expect("opening identifier already consumed or lifetime exhausted");
     let t = Instant::now();
     let st = final_statement(pp, q);
-    let nm = model.raw.len();
-    model.raw.extend(carries);
-    let raw = std::mem::take(&mut model.raw);
+    // The registered model sources stay packed; this opening uses int8 copies.
+    let raw: Vec<Vec<i8>> = model.raw.iter().map(|r| r.unpack()).chain(carries).collect();
     let raw = std::sync::Arc::new(raw);
     let mut c_src = model.c.clone();
     for e in q { c_src.push(e.c_carry.to_vec()); }
@@ -827,7 +887,7 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
         (v, raw)
     });
     lap(&mut times, "load", t);
-    let raw: Vec<Vec<i8>> = std::sync::Arc::try_unwrap(raw).unwrap_or_else(|a| (*a).clone());
+    let raw: Vec<Vec<i8>> = std::sync::Arc::try_unwrap(raw).unwrap_or_else(|_| panic!("final sources still shared"));
     let t = Instant::now();
     let fast = link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut tr, &st, &raw, o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), true);
     lap(&mut times, "link", t);
@@ -838,9 +898,7 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
     reps.r = rep_vec;
     pc.streamed = false;
     pc.unload();
-    let mut raw = raw;
-    raw.truncate(nm);
-    model.raw = raw;
+    drop(raw);
     let t = Instant::now();
     let fp = wire::FinalProof { salt, link: fast.proof, auth };
     let bytes = if o.auth { wire::encode_final_compact(&o.profile, &support, &fp).expect("compact final encode") } else { wire::encode_final(&o.profile, &fp) };
@@ -1036,8 +1094,8 @@ fn prove_request_cpu_inner(pp: &mut Prepared, o: &Opts, j: u64, model: &ModelReg
     pp.pd.bank = piop::sample_bank(&o.coins, opening, 1usize << o.cfg.slots_log);
     let mut raw = piop::fill_sources_in(&pp.g, &pp.pd, &pp.lay, o.profile.ell(), pp.req.clone());
     fill_suffixes_cpu(o, &mut raw, &|e| req_owner(j, e));
-    raw = input.raw.iter().cloned().chain(raw).collect();
-    if !o.defer { raw = model.raw.iter().cloned().chain(raw).collect(); }
+    raw = input.raw.iter().map(|r| r.unpack()).chain(raw).collect();
+    if !o.defer { raw = model.raw.iter().map(|r| r.unpack()).chain(raw).collect(); }
     let mut c_src = commit_cpu(o, &raw);
     let model_prefix = if o.defer { 0 } else { pp.model.len() };
     let input_end = model_prefix + pp.input.len();
@@ -1088,7 +1146,7 @@ fn finalize_cpu_inner(pp: &Prepared, o: &Opts, b: u64, model: &ModelReg, q: &[Qu
     assert_eq!(q.len(), carries.len(), "one private carry bank per verified request");
     let opening = fin_opening(b);
     let salt = o.coins.begin_opening(opening).expect("finalization opening already consumed");
-    let raw: Vec<Vec<i8>> = model.raw.iter().cloned().chain(carries.iter().cloned()).collect();
+    let raw: Vec<Vec<i8>> = model.raw.iter().map(|r| r.unpack()).chain(carries.iter().cloned()).collect();
     let mut c_src = model.c.clone();
     let actual_carry = commit_cpu(o, carries);
     for (entry, actual) in q.iter().zip(actual_carry) {

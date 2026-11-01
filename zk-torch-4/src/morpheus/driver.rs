@@ -23,7 +23,7 @@ fn show(label: &str, t: &Times) -> f64 {
 /// Entry from `Dag::run` (MORPHEUS_AT_RUN): every leaf Role::Input edge is
 /// a public request input. MORPHEUS_NAME / MORPHEUS_UNITS / MORPHEUS_UNIT
 /// label the report.
-pub fn run_hook(dag: &Dag, wit: &[Vec<Witness>]) {
+pub fn run_hook(dag: &Dag, wit: &mut [Vec<Witness>]) {
     let public: Vec<usize> = (0..dag.num_edges()).filter(|&e| dag.producers[e].is_none() && wit[e].first().map(|w| w.role == Role::Input && w.data.is_some()).unwrap_or(false)).collect();
     let name = std::env::var("MORPHEUS_NAME").unwrap_or_else(|_| "model".into());
     let unit: &'static str = Box::leak(std::env::var("MORPHEUS_UNIT").unwrap_or_else(|_| "request".into()).into_boxed_str());
@@ -31,11 +31,11 @@ pub fn run_hook(dag: &Dag, wit: &[Vec<Witness>]) {
     run(&name, dag, wit, &public, ev("MORPHEUS_UNITS", 1), unit);
 }
 
-pub fn run(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize], units: usize, unit: &str) {
+pub fn run(name: &str, dag: &Dag, wit: &mut [Vec<Witness>], public: &[usize], units: usize, unit: &str) {
     run_with_ar(name, dag, wit, public, units, unit, None);
 }
 
-pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize], units: usize, unit: &str, ar: Option<super::ar_statement::ArStatement>) {
+pub fn run_with_ar(name: &str, dag: &Dag, wit: &mut [Vec<Witness>], public: &[usize], units: usize, unit: &str, ar: Option<super::ar_statement::ArStatement>) {
     let n = ev("N_REQUESTS", 1);
     let mut o = Opts::from_env();
     let mut req_secs = Vec::new();
@@ -67,8 +67,28 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &[Vec<Witness>], public: &[usize]
         }
         for (k, v) in by { println!("  {k:28} {:6} tensors {:>14} indices {:>14} digit slots", v.0, v.1, v.2); }
     }
+    // The prover data holds every value the prover needs; the forward pass's
+    // own copies are released (MORPHEUS_KEEP_WITNESS=1 keeps them).
+    if std::env::var_os("MORPHEUS_KEEP_WITNESS").is_none() {
+        use rayon::prelude::*;
+        wit.par_iter_mut().for_each(|w| for x in w.iter_mut() { x.data = None; });
+        if std::env::var_os("MORPHEUS_RSS").is_some() { eprintln!("[rss] witnesses released: {:.1} GB", std::fs::read_to_string("/proc/self/statm").ok().and_then(|m| m.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok())).unwrap_or(0.0) * 4096.0 / 1e9); }
+    }
     if let Some(s) = crate::morpheus::request::request_support(&pp, &o) {
         println!("public response support: {} of {} source columns", s.len(), o.profile.source_cols());
+    }
+    // MORPHEUS_LOOKUPS=1: every lookup node's checked size and its input's producer.
+    if std::env::var_os("MORPHEUS_LOOKUPS").is_some() {
+        let mut by: std::collections::BTreeMap<String, (usize, u128)> = Default::default();
+        for (&node, _) in pp.g.lookups.iter() {
+            let nd = &dag.nodes[node];
+            let e = nd.inputs[0];
+            let prod = dag.producers[e].map(|p| format!("{:?}", dag.nodes[p].kind).split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap().to_string()).unwrap_or("-".into());
+            let k = format!("{} <- {} {:?}", format!("{:?}", nd.kind).split(|c: char| c == '(' || c == ' ').next().unwrap(), prod, wit[e][0].shape);
+            let x = by.entry(k).or_default(); x.0 += 1; x.1 += 1u128 << pp.g.nvars[e];
+        }
+        let mut v: Vec<_> = by.into_iter().collect(); v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        for (k, (c, n)) in v.iter().take(25) { println!("  lookup {c:5} x {k:70} {n:>13} indices"); }
     }
     if std::env::var("LAYOUT_ONLY").is_ok() { return; }
     let t = Instant::now();

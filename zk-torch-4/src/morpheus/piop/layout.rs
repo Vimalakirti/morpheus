@@ -262,6 +262,30 @@ impl RawPtrs { #[inline] pub fn ptr(&self) -> *mut i8 { self.0 } }
 impl Layout {
     /// Same as `fill`, writing through raw pointers: callers may fill
     /// different tensors concurrently (pieces never overlap).
+    /// fill_ptr into packed sources (crate::morpheus::packed): each row of
+    /// 2^p digits is built then stored (byte-aligned rows directly).
+    pub fn fill_packed(&self, k: &TKey, ptrs: &[Option<crate::morpheus::packed::PackedPtr>], digit: &(dyn Fn(usize, usize) -> i8 + Sync)) {
+        let t = self.get(k);
+        for pc in &t.pieces {
+            let (m, pp) = (pc.region.m, pc.region.p);
+            let Some(base) = ptrs[pc.region.source] else { continue };
+            let n = t.n;
+            use rayon::prelude::*;
+            // Rows of fewer than 4 digits are grouped so each task writes
+            // whole bytes where it can.
+            let g = if pp >= 2 { 1 } else { 1usize << (2 - pp).min(m) };
+            (0..(1usize << m) / g).into_par_iter().for_each(|q| {
+                let mut row = vec![0i8; g << pp];
+                let mut any = false;
+                for r in 0..g {
+                    let i = q * g + r;
+                    if m > n && i >= 1usize << n { continue; }
+                    for b in 0..1usize << pp { let d = digit(pc.plane0 + b, (pc.hb << m) | i); row[(r << pp) + b] = d; any |= d != 0; }
+                }
+                if any { base.write(pc.region.base + ((q * g) << pp), &row); }
+            });
+        }
+    }
     pub fn fill_ptr(&self, k: &TKey, ptrs: &[RawPtrs], digit: &(dyn Fn(usize, usize) -> i8 + Sync)) {
         let t = self.get(k);
         for pc in &t.pieces {
