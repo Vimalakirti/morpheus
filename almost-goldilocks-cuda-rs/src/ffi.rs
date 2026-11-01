@@ -31,12 +31,12 @@ extern "C" {
     pub fn agl_mlink_fold(d_raw: *const i8, src_len: u64, b0: c_int, d_blocks: *const c_void, nblocks: u32, d_efull: *const u64, d_out: *mut u64) -> c_int;
     pub fn agl_morpheus_coins(h_base: *const u64, purpose: c_int, coord0: u32, n: u32, mode: c_int, d_out: *mut c_void, d_flag: *mut u8) -> c_int;
     pub fn agl_mlink2_consts(d_blks: *const c_void, nblk: u32, h_consts: *const c_void, d_bc: *mut u64) -> c_int;
-    pub fn agl_mlink2_round(d_raw: *const i8, src_len: u64, b0: c_int, i: c_int, d: c_int, reduced: c_int, h_consts: *const c_void, d_onehot: *const c_void, n_onehot: u32, d_generic: *const c_void, d_lists: *const *const u32, n_lists: *const u32, d_bc: *const u64, d_e1: *const u64, d_e2: *const u64, d_e3: *const u64, d_ealpha: *const u64, skip_range: c_int, h_out: *mut u64) -> c_int;
-    pub fn agl_mlink2_range_bin1(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc: *const u64, d_ea1: *const u64, d_r: *mut u64) -> c_int;
-    pub fn agl_mlink2_coarse_init(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_rid: *const u32, d_k: *const u32, nrb: u64, d_tfold: *const u64, d_efull: *const u64, coarse: u64, nsrc: u32, d_w: *mut u64, d_q: *mut u64, d_chi: *mut u64) -> c_int;
+    pub fn agl_mlink2_round(d_raw: *const u8, src_len: u64, b0: c_int, i: c_int, d: c_int, reduced: c_int, h_consts: *const c_void, d_onehot: *const c_void, n_onehot: u32, d_generic: *const c_void, d_lists: *const *const u32, n_lists: *const u32, d_bc: *const u64, d_e1: *const u64, d_e2: *const u64, d_e3: *const u64, d_ealpha: *const u64, skip_range: c_int, h_out: *mut u64) -> c_int;
+    pub fn agl_mlink2_range_bin1(d_raw: *const u8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc: *const u64, d_ea1: *const u64, d_r: *mut u64) -> c_int;
+    pub fn agl_mlink2_coarse_init(d_raw: *const u8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_rid: *const u32, d_k: *const u32, nrb: u64, d_tfold: *const u64, d_efull: *const u64, coarse: u64, nsrc: u32, d_w: *mut u64, d_q: *mut u64, d_chi: *mut u64) -> c_int;
     pub fn agl_i64_to_i32(s: *const i64, d: *mut i32, n: u64) -> i32;
     pub fn agl_add_i32_i64(d: *mut i64, s: *const i32, n: u64) -> i32;
-    pub fn agl_mlink2_coarse_init2(d_raw_virtual: *const i8, src_len: u64, b0: i32, h_consts: *const c_void,
+    pub fn agl_mlink2_coarse_init2(d_raw_virtual: *const u8, src_len: u64, b0: i32, h_consts: *const c_void,
         d_blks: *const c_void, nblk: u32, d_rid: *const u32, d_k: *const u32, nrb: u64,
         d_tfold: *const u64, d_efull: *const u64, qbits: i32, coarse: u64, src_base: u32, nsrc: u32,
         d_w: *mut u64, d_q: *mut u64, d_chi: *mut u64) -> i32;
@@ -46,9 +46,9 @@ extern "C" {
         ntab: u64, d_out: *mut u64) -> c_int;
     pub fn agl_mlink2_coarse_round(d_w: *const u64, d_q: *const u64, d_chi: *const u64, nsrc: u32, len: u64, d_grange: *const u64, d_gbit: *const u64, d_ealpha: *const u64, d: c_int, h_out: *mut u64) -> c_int;
     pub fn agl_mlink2_coarse_fold(d_in: *const u64, d_out: *mut u64, nsrc: u32, len: u64, h_r: *const u64) -> c_int;
-    pub fn agl_mlink2_onehot3(d_raw: *const i8, src_len: u64, b0: c_int, i: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_e1: *const u64, d_e2: *const u64, d_e3: *const u64, d_eai: *const u64, d_eai_off: *const u32, d_eapr: *const u64, d_eapr_off: *const u32, h_out: *mut u64) -> c_int;
-    pub fn agl_mlink2_onehot_pre(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc_oh: *const u64, d_eai: *const u64, d_eai_off: *const u32, d_g: *mut u64, d_w: *mut u64) -> c_int;
-    pub fn agl_mlink2_onehot_bin(d_raw: *const i8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc_oh: *const u64, d_ea1: *const u64, d_ea5: *const u64, d_b5: *const u64, d_gv: *mut u64, d_u: *mut u64, d_j: *mut u64, d_j5: *mut u64) -> c_int;
+    pub fn agl_mlink2_onehot3(d_raw: *const u8, src_len: u64, b0: c_int, i: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_e1: *const u64, d_e2: *const u64, d_e3: *const u64, d_eai: *const u64, d_eai_off: *const u32, d_eapr: *const u64, d_eapr_off: *const u32, h_out: *mut u64) -> c_int;
+    pub fn agl_mlink2_onehot_pre(d_raw: *const u8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc_oh: *const u64, d_eai: *const u64, d_eai_off: *const u32, d_g: *mut u64, d_w: *mut u64) -> c_int;
+    pub fn agl_mlink2_onehot_bin(d_raw: *const u8, src_len: u64, b0: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc_oh: *const u64, d_ea1: *const u64, d_ea5: *const u64, d_b5: *const u64, d_gv: *mut u64, d_u: *mut u64, d_j: *mut u64, d_j5: *mut u64) -> c_int;
     pub fn agl_mlink2_rep_reduce(d_in: *const u64, rep: c_int, n: u64, d_out: *mut u64) -> c_int;
     pub fn agl_morpheus_permute(d_src: *const i8, d_dst: *mut i8, n: u64) -> c_int;
     pub fn agl_morpheus_unpack2(d_src: *const u8, d_dst: *mut i8, n: u64, phys: c_int) -> c_int;
@@ -67,7 +67,7 @@ extern "C" {
     pub fn agl_mpiop_sc_round(h_tabs: *const *const u64, ntab: c_int, len: u64, d: c_int, h_out: *mut u64) -> c_int;
     pub fn agl_mpiop_sc_fold(d_in: *const u64, d_out: *mut u64, len: u64, h_r: *const u64) -> c_int;
     pub fn agl_mpiop_sc_fold_round(h_tabs: *const *const u64, h_outs: *const *mut u64, ntab: i32, len: u64, h_r: *const u64, d: i32, h_out: *mut u64) -> i32;
-    pub fn agl_mlink2_index(d_raw: *const i8, src_len: u64, b0: c_int, i: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc: *const u64, d_epre: *const u64, d_ealpha: *const u64, h_out: *mut u64) -> c_int;
+    pub fn agl_mlink2_index(d_raw: *const u8, src_len: u64, b0: c_int, i: c_int, h_consts: *const c_void, d_blks: *const c_void, nblk: u32, d_bc: *const u64, d_epre: *const u64, d_ealpha: *const u64, h_out: *mut u64) -> c_int;
     pub fn agl_morpheus_gauss_scatter(d_out: *mut i64, h_idx: *const u32, h_val: *const i64, m: u32) -> c_int;
 
     pub fn cuda_malloc(ptr: *mut *mut c_void, size: usize) -> c_int;

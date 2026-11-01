@@ -235,3 +235,12 @@ pub fn upload_i8(raw: &dyn Sources, s: usize, dst: &mut almost_goldilocks_cuda::
         assert_eq!(rc, 0, "permute");
     }
 }
+
+/// Upload source s of `raw` packed into `dst` at byte offset `at`.
+#[cfg(feature = "cuda")]
+pub fn upload_packed(raw: &dyn Sources, s: usize, dst: &mut almost_goldilocks_cuda::DeviceBuffer<u8>, at: usize) {
+    match raw.packed(s) {
+        Some(p) => dst.copy_from_slice_at(at, &p.b).expect("packed upload"),
+        None => dst.copy_from_slice_at(at, &Src::from_i8(&raw.to_i8(s)).b).expect("packed upload"),
+    }
+}

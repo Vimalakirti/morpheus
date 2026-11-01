@@ -145,8 +145,11 @@ fn kvec(words: &[u64]) -> Vec<K8> { words.chunks(8).map(|c| K8(c.try_into().unwr
 pub fn phases_v2(
     p: &Profile, st: &Statement, raw: &dyn crate::morpheus::packed::Sources, b0: usize, alpha: &[K8], eta: &K8, gp: &[K8],
     degs: &[usize], a_coef: &[Vec<K8>], tr: &mut MTranscript, dev_raw: Option<&DeviceBuffer<i8>>,
-    keep: Option<&std::sync::Mutex<Vec<Kept>>>, pre_raw: Option<DeviceBuffer<i8>>,
+    keep: Option<&std::sync::Mutex<Vec<Kept>>>, pre_raw: Option<DeviceBuffer<u8>>,
 ) -> (Vec<Vec<K8>>, Vec<K8>, Vec<K8>, Vec<K8>, Vec<K8>, K8, K8) {
+    // The device sources are packed (two bits per digit, packed.rs); the
+    // resident int8 copy of small requests is not used here.
+    let dev_raw: Option<&DeviceBuffer<i8>> = { let _ = dev_raw; None };
     // Device shards (MORPHEUS_GPUS): sources go to devices greedily by
     // weighted load, from the raw digits and the declared bit blocks alone,
     // so the uploads run while the host prepares terms and tables. Plane
@@ -176,18 +179,17 @@ pub fn phases_v2(
     }
     let src_len = raw.src_len();
     // A single device's sources may already be resident (uploaded during the PIOP).
-    let mut pre_raw = if ngpu == 1 { pre_raw.filter(|b| b.len() == n * src_len) } else { None };
+    let mut pre_raw = if ngpu == 1 { pre_raw.filter(|b| b.len() == n * src_len / 4) } else { None };
     std::thread::scope(|sc| {
-        let ups: Vec<Option<std::thread::ScopedJoinHandle<'_, DeviceBuffer<i8>>>> = (0..ngpu).map(|g| {
+        let ups: Vec<Option<std::thread::ScopedJoinHandle<'_, DeviceBuffer<u8>>>> = (0..ngpu).map(|g| {
             if g == 0 && dev_raw.is_some() { return None; }
             if g == 0 { if let Some(b) = pre_raw.take() { return Some(sc.spawn(move || b)); } }
             let owner = &owner;
             Some(sc.spawn(move || {
                 almost_goldilocks_cuda::set_device(g as i32).expect("set device");
                 let srcs: Vec<usize> = (0..n).filter(|&s| owner[s] == g).collect();
-                let mut d = DeviceBuffer::<i8>::new((srcs.len() * src_len).max(1)).expect("raw alloc");
-                let mut scratch = None;
-                for (j, &s) in srcs.iter().enumerate() { crate::morpheus::packed::upload_i8(raw, s, &mut d, j * src_len, false, &mut scratch); }
+                let mut d = DeviceBuffer::<u8>::new((srcs.len() * src_len / 4).max(1)).expect("raw alloc");
+                for (j, &s) in srcs.iter().enumerate() { crate::morpheus::packed::upload_packed(raw, s, &mut d, j * src_len / 4); }
                 d
             }))
         }).collect();
@@ -199,7 +201,7 @@ pub fn phases_v2(
 fn phases_v2_body<'u>(
     p: &Profile, st: &Statement, raw: &dyn crate::morpheus::packed::Sources, b0: usize, alpha: &[K8], eta: &K8, gp: &[K8],
     degs: &[usize], a_coef: &[Vec<K8>], tr: &mut MTranscript, dev_raw: Option<&DeviceBuffer<i8>>,
-    keep: Option<&std::sync::Mutex<Vec<Kept>>>, owner: Vec<usize>, mut ups: Vec<Option<std::thread::ScopedJoinHandle<'u, DeviceBuffer<i8>>>>,
+    keep: Option<&std::sync::Mutex<Vec<Kept>>>, owner: Vec<usize>, mut ups: Vec<Option<std::thread::ScopedJoinHandle<'u, DeviceBuffer<u8>>>>,
 ) -> (Vec<Vec<K8>>, Vec<K8>, Vec<K8>, Vec<K8>, Vec<K8>, K8, K8) {
     let tm = std::env::var("MORPHEUS_TIMING").is_ok();
     let mut t0 = std::time::Instant::now();
@@ -850,7 +852,18 @@ fn phases_v2_body<'u>(
     if let Some(k) = keep {
         let mut k = k.lock().unwrap();
         for sh in shards.into_iter() {
-            if let Some(buf) = sh.raw { if !sh.owned.is_empty() { k.push(Kept { dev: sh.dev, srcs: sh.owned, buf, phys: false }); } }
+            if let Some(pk) = sh.raw { if !sh.owned.is_empty() {
+                // The authentication reads int8 digits in physical column order.
+                almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
+                let len = src_len as usize;
+                let mut buf = DeviceBuffer::<i8>::new(sh.owned.len() * len).expect("kept sources");
+                for j in 0..sh.owned.len() {
+                    let rc = unsafe { ffi::agl_morpheus_unpack2(pk.as_ptr().add(j * len / 4), buf.as_mut_ptr().add(j * len), len as u64, 1) };
+                    assert_eq!(rc, 0, "unpack kept sources");
+                }
+                drop(pk);
+                k.push(Kept { dev: sh.dev, srcs: sh.owned, buf, phys: true });
+            } }
         }
     }
     almost_goldilocks_cuda::set_device(0).unwrap();
@@ -861,7 +874,7 @@ fn phases_v2_body<'u>(
 /// one-hot regions; see `onehot_pre_kernel`.
 #[allow(clippy::too_many_arguments)]
 fn onehot_sums(
-    raw_ptr: *const i8, src_len: u64, b0: usize, consts: &ConstsC, oh: &[Blk], d_bc: &DeviceBuffer<u64>,
+    raw_ptr: *const u8, src_len: u64, b0: usize, consts: &ConstsC, oh: &[Blk], d_bc: &DeviceBuffer<u64>,
     n_gen_base: usize, regions_c: &[RegionC], alpha: &[K8], nterms: usize, b5: &[K8],
 ) -> OhSums {
     let maxp = regions_c.iter().map(|r| r.p as usize).max().unwrap_or(0);
@@ -1149,7 +1162,7 @@ pub struct Kept { pub dev: i32, pub srcs: Vec<usize>, pub buf: DeviceBuffer<i8>,
 /// One device's share of the plane rounds.
 struct Shard {
     dev: i32,
-    raw: Option<DeviceBuffer<i8>>,
+    raw: Option<DeviceBuffer<u8>>,
     /// Local numbering: local index j is global source srcs[j] (`raw`,
     /// γ powers, blocks and regions use it); `owned` are this device's sources.
     srcs: Vec<usize>, owned: Vec<usize>,
@@ -1164,8 +1177,8 @@ struct Shard {
 }
 
 impl Shard {
-    fn raw_ptr(&self, dev_raw: Option<&DeviceBuffer<i8>>, _src_len: u64) -> *const i8 {
-        match &self.raw { Some(b) => b.as_ptr(), None => dev_raw.expect("raw sources").as_ptr() }
+    fn raw_ptr(&self, _dev_raw: Option<&DeviceBuffer<i8>>, _src_len: u64) -> *const u8 {
+        self.raw.as_ref().expect("packed shard sources").as_ptr()
     }
     fn consts(&self, d_terms: &DeviceBuffer<u8>, a: u64, b: u64, qd: u64) -> ConstsC {
         ConstsC {

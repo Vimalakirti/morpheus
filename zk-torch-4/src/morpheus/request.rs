@@ -559,7 +559,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     let runs = auth_gpu::runs_of(&support);
     let Prepared { g, pd, lay, req, carry, .. } = &*pp;
     // Streamed sources uploaded for the link while the PIOP runs (one device).
-    let pre_raw: std::sync::Mutex<Option<DeviceBuffer<i8>>> = std::sync::Mutex::new(None);
+    let pre_raw: std::sync::Mutex<Option<DeviceBuffer<u8>>> = std::sync::Mutex::new(None);
     let one_gpu = std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) == 1;
     // Registered sources, by reference: the model's payload AND hiding suffix
     // (monolithic) and the input's. Only request sources get fresh suffixes.
@@ -613,10 +613,9 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
                 let src = super::packed::Refs(&refs);
                 let len = src.src_len();
                 let t = Instant::now();
-                if let Ok(mut d) = DeviceBuffer::<i8>::new(len * refs.len()) {
-                    let mut scratch = None;
-                    for s in 0..refs.len() { super::packed::upload_i8(&src, s, &mut d, s * len, false, &mut scratch); }
-                    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] sources uploaded during the PIOP: {:.1} GB in {:.2} s", (len * refs.len()) as f64 / 1e9, t.elapsed().as_secs_f64()); }
+                if let Ok(mut d) = DeviceBuffer::<u8>::new(len / 4 * refs.len()) {
+                    for s in 0..refs.len() { super::packed::upload_packed(&src, s, &mut d, s * len / 4); }
+                    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] packed sources uploaded during the PIOP: {:.1} GB in {:.2} s", (len / 4 * refs.len()) as f64 / 1e9, t.elapsed().as_secs_f64()); }
                     *pre_raw.lock().unwrap() = Some(d);
                 }
             });

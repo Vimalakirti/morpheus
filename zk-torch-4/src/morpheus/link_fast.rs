@@ -191,7 +191,7 @@ pub trait LinkServices {
     fn kept(&self) -> Option<&std::sync::Mutex<Vec<super::link_gpu::Kept>>> { None }
     /// Streamed sources already uploaded to device 0 (logical order,
     /// concatenated), e.g. during the PIOP.
-    fn take_pre_raw(&self) -> Option<almost_goldilocks_cuda::DeviceBuffer<i8>> { None }
+    fn take_pre_raw(&self) -> Option<almost_goldilocks_cuda::DeviceBuffer<u8>> { None }
 }
 
 pub struct CpuServices;

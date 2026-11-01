@@ -37,6 +37,21 @@ struct Term {
 };
 struct Blk { uint32_t src, id, region, k; };   // region 0xffffffff: no terms, no flags
 
+// Raw source digits are packed two bits each (zk-torch-4 morpheus/packed.rs):
+// digit k is bits 2(k mod 4)..2(k mod 4)+2 of byte k/4, 00 = 0, 01 = 1,
+// 11 = -1. A block starts on a byte boundary (2^b0 digits, b0 >= 2).
+__device__ __forceinline__ const uint8_t* blk_bytes(const uint8_t* raw, uint64_t src_len, const Blk& b, int b0) {
+    return raw + (((uint64_t)b.src * src_len + ((uint64_t)b.id << b0)) >> 2);
+}
+__device__ __forceinline__ int dig(const uint8_t* __restrict__ bp, uint32_t k) {
+    return (int)((int8_t)(__ldg(bp + (k >> 2)) << (6 - 2 * (int)(k & 3))) >> 6);
+}
+/// 16 digits starting at digit k (k a multiple of 16) as one word: field j
+/// (bits 2j, 2j+1) is digit k + j.
+__device__ __forceinline__ uint32_t dig16(const uint8_t* __restrict__ bp, uint32_t k) {
+    return __ldg(reinterpret_cast<const uint32_t*>(bp + (k >> 2)));
+}
+
 __device__ __forceinline__ K8d kmul(const K8d& a, const K8d& b) { return mauth::k8_mul(a, b); }
 __device__ __forceinline__ K8d kscale(const K8d& a, u64 s) { K8d r; for (int j = 0; j < 8; j++) r.c[j] = mauth::fmul(a.c[j], s); return r; }
 
@@ -85,7 +100,7 @@ __global__ void block_consts_kernel(const Blk* __restrict__ blks, uint32_t nblk,
 // ------------------------------------------------------------- one-hot
 /// Plane round i < p of one-hot regions. Output per CUDA block: NACC K.
 __global__ void __launch_bounds__(256) onehot_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i, int d,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0, int i, int d,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C,
     const K8d* __restrict__ E1, const K8d* __restrict__ E2, const K8d* __restrict__ E3,
     const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
@@ -111,13 +126,13 @@ __global__ void __launch_bounds__(256) onehot_kernel(
         __syncthreads();
         const int p = s_p;
         const int nidx = 1 << (b0 - p);
-        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
         K8d acc[10];  // S1[2], S2[2], S3[2], P0[2], P1[2]
         for (int k = 0; k < 10; k++) acc[k] = kzero();
         for (int idx = threadIdx.x; idx < nidx; idx += blockDim.x) {
-            const int8_t* pl = dg + ((size_t)idx << p);
+            const uint32_t pl = (uint32_t)idx << p;
             int ts = -1;
-            for (int q = 0; q < (1 << p); q++) if (pl[q] == 1) { ts = q; break; }
+            for (int q = 0; q < (1 << p); q++) if (dig(dg, pl + q) == 1) { ts = q; break; }
             if (ts < 0) continue;
             const int bit = (ts >> i) & 1, low = ts & ((1 << i) - 1), pr = ts >> (i + 1);
             const int pa = p - i - 1;
@@ -183,7 +198,7 @@ constexpr int GCH = 128;
 /// 0 range only (no query), 1 range + fast query, 2 range + general query.
 template <int MINB, int MODE>
 __global__ void __launch_bounds__(160, MINB) generic_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i, int d, int reduced_dbg,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0, int i, int d, int reduced_dbg,
     const Blk* __restrict__ blks, const uint32_t* __restrict__ list, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
     const K8d* __restrict__ e_pre, const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
 {
@@ -220,7 +235,7 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
             if (threadIdx.x == 1) s_cb = o[1];
             for (int k = (int)threadIdx.x - 2; k < s_tcnt; k += blockDim.x) if (k >= 0) s_ct[k] = o[2 + k];
         }
-        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
         const int tcnt = s_tcnt;
         const uint32_t toff = s_toff, qd = s_qd;
         K8d b3 = kzero(), b2 = kzero();          // this lane's Σ ea(w³ − w), Σ ea(w² − w) in the block
@@ -245,8 +260,8 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
                     const bool live = yl < cy;
                     K8d sacc = kzero();
                     if (live) {
-                        const int8_t* p0 = dg + ((size_t)(y0 + yl) << i);
-                        for (int p = gl; p < (1 << i); p += G) { int8_t v = p0[p]; if (v == 1) sacc = kadd(sacc, e_pre[p]); else if (v == -1) sacc = ksub(sacc, e_pre[p]); }
+                        const uint32_t p0 = (uint32_t)(y0 + yl) << i;
+                        for (int p = gl; p < (1 << i); p += G) { int v = dig(dg, p0 + p); if (v == 1) sacc = kadd(sacc, e_pre[p]); else if (v == -1) sacc = ksub(sacc, e_pre[p]); }
                     }
                     if (G > 1) {
                         sacc = kcanon(sacc);
@@ -263,7 +278,7 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
             // Compact the nonzero pairs.
             for (int r = threadIdx.x; r < cp; r += blockDim.x) {
                 bool z;
-                if (i == 0) z = dg[y0 + 2 * r] == 0 && dg[y0 + 2 * r + 1] == 0;
+                if (i == 0) z = dig(dg, y0 + 2 * r) == 0 && dig(dg, y0 + 2 * r + 1) == 0;
                 else z = kzero_p(F[2 * r]) && kzero_p(F[2 * r + 1]);
                 if (!z) { int pos = atomicAdd(&s_cnt, 1); nz[pos] = (uint16_t)r; }
             }
@@ -275,7 +290,7 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
                 for (int r = threadIdx.x; r < cp; r += blockDim.x) {
                     const int ir = (c0 + r) >> pa;
                     if (i == 0) {
-                        const int8_t d0 = dg[y0 + 2 * r], d1 = dg[y0 + 2 * r + 1];
+                        const int d0 = dig(dg, y0 + 2 * r), d1 = dig(dg, y0 + 2 * r + 1);
                         if ((d0 | d1) == 0) continue;
                         const K8d bb0 = C.B[T0.boff + ir];
                         if (d0 == 1) S00 = kadd(S00, bb0); else if (d0 == -1) S00 = ksub(S00, bb0);
@@ -323,7 +338,7 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
                     }
                     if (i == 0) {
                         // Digits: w_t = a + t (c − a) is a small integer.
-                        const long long a = dg[y0 + 2 * rl], c = dg[y0 + 2 * rl + 1];
+                        const long long a = dig(dg, y0 + 2 * rl), c = dig(dg, y0 + 2 * rl + 1);
                         const long long wv = a + (long long)t * (c - a);
                         auto fe = [](long long x) -> u64 { return x >= 0 ? (u64)x : mauth::Q - (u64)(-x); };
                         if (wv != 0) {
@@ -390,16 +405,16 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
 // ------------------------------------------------------------- coarse init
 /// w_coarse[src][id] = Σ_p e_full[p]·digit[p] for each nonzero block.
 __global__ void __launch_bounds__(256) fold_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0, const Blk* __restrict__ blks, uint32_t nblk,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0, const Blk* __restrict__ blks, uint32_t nblk,
     const K8d* __restrict__ e_full, uint64_t coarse, K8d* __restrict__ w)
 {
     __shared__ K8d wsum[8];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (uint32_t bi = blockIdx.x; bi < nblk; bi += gridDim.x) {
         const Blk b = blks[bi];
-        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
         K8d s = kzero();
-        for (int p = threadIdx.x; p < (1 << b0); p += blockDim.x) { int8_t v = dg[p]; if (v == 1) s = kadd(s, e_full[p]); else if (v == -1) s = ksub(s, e_full[p]); }
+        for (int p = threadIdx.x; p < (1 << b0); p += blockDim.x) { int v = dig(dg, p); if (v == 1) s = kadd(s, e_full[p]); else if (v == -1) s = ksub(s, e_full[p]); }
         s = kcanon(s);
         for (int off = 16; off > 0; off >>= 1) s = kadd(s, shfl_down_k(s, off));
         if (lane == 0) wsum[warp] = kcanon(s);
@@ -548,7 +563,7 @@ __global__ void coarse_fold_kernel(const K8d* __restrict__ in, K8d* __restrict__
 /// with λ = 1 − t (bit 0) or t (bit 1). Coefficients (degree ≤ 3) are reduced
 /// once per CUDA block: partial[block][0..3] range, [4..6] query.
 __global__ void __launch_bounds__(128) onehot3_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C,
     const K8d* __restrict__ E1, const K8d* __restrict__ E2, const K8d* __restrict__ E3,
     const K8d* __restrict__ eai,      // per p: eq(α_[p..B0), idx), at offsets eai_off[p]
@@ -584,14 +599,14 @@ __global__ void __launch_bounds__(128) onehot3_kernel(
         if (lane >= np) continue;
         // Bin t = lane: scan the block's indices.
         const int nidx = 1 << (b0 - p);
-        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
         const K8d* ea_i = eai + eai_off[p];
         K8d Cb = kzero();
         K8d CB[4] = {kzero(), kzero(), kzero(), kzero()};   // up to 4 structured terms here
         const int tc = (int)s_tcnt[warp] < 4 ? (int)s_tcnt[warp] : 4;
         bool any = false;
         for (int idx = 0; idx < nidx; idx++) {
-            if (dg[((size_t)idx << p) + lane] != 1) continue;
+            if (dig(dg, ((uint32_t)idx << p) + lane) != 1) continue;
             any = true;
             Cb = kadd(Cb, ea_i[idx]);
             for (int k = 0; k < tc; k++) {
@@ -664,7 +679,7 @@ __device__ __forceinline__ void kacc_atomic(u64* dst, const K8d& v) {
     }
 }
 __global__ void __launch_bounds__(128) onehot_pre_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc_oh,
     const K8d* __restrict__ eai, const uint32_t* __restrict__ eai_off, uint32_t per_warp,
     u64* __restrict__ G, u64* __restrict__ W)
@@ -696,13 +711,13 @@ __global__ void __launch_bounds__(128) onehot_pre_kernel(
         const int p = cp;
         if (lane >= (1 << p)) continue;
         const int nidx = 1 << (b0 - p);
-        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
         const K8d* ea_i = eai + eai_off[p];
         K8d Cb = kzero(), CB0 = kzero(), CB1 = kzero(), CB2 = kzero(), CB3 = kzero();
         const Term* Ts = C.terms + ctoff;
         bool any = false;
         for (int idx = 0; idx < nidx; idx++) {
-            if (dg[((size_t)idx << p) + lane] != 1) continue;
+            if (dig(dg, ((uint32_t)idx << p) + lane) != 1) continue;
             any = true;
             Cb = kadd(Cb, ea_i[idx]);
             if (ctc > 0) CB0 = kadd(CB0, C.B[Ts[0].boff + idx]);
@@ -749,7 +764,7 @@ constexpr int J5_REP = 8;   // replicas of the round-5 bins (spread hot-bin atom
 __device__ unsigned long long g_bin_prof[8];
 #define BPROF(k) do { if (prof && lane == 0) { long long _t = clock64(); atomicAdd(&g_bin_prof[k], (unsigned long long)(_t - _t0)); _t0 = _t; } } while (0)
 __global__ void __launch_bounds__(128) onehot_bin_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc_oh,
     const K8d* __restrict__ ea1, const K8d* __restrict__ ea5, const K8d* __restrict__ B5, uint32_t chunk, int prof_dbg,
     u64* __restrict__ GV, u64* __restrict__ U, u64* __restrict__ J, u64* __restrict__ J5)
@@ -799,16 +814,13 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
         if ((int)b.src != jsrc || chi != jchi) { flush_j(); jsrc = (int)b.src; jchi = chi; }
         BPROF(0);
         // Selected plane of each of the 128 indices (16 bytes each).
-        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
         #pragma unroll
         for (int q = 0; q < 4; q++) {
             const int idx = lane * 4 + q;
-            const int4 v = __ldg(reinterpret_cast<const int4*>(dg) + idx);
-            const uint32_t wv[4] = {(uint32_t)v.x, (uint32_t)v.y, (uint32_t)v.z, (uint32_t)v.w};
-            int s = 0;
-            #pragma unroll
-            for (int k = 3; k >= 0; k--) if (wv[k]) s = k * 4 + ((__ffs(wv[k]) - 1) >> 3);
-            sel[idx] = (uint8_t)s;
+            // The index's 16 plane digits; the selected plane is the lowest nonzero.
+            const uint32_t w = dig16(dg, (uint32_t)idx * 16);
+            sel[idx] = (uint8_t)(w ? (__ffs(w) - 1) >> 1 : 0);
         }
         const K8d ca = (dbg & 8) ? C.ca_lo[b.id & mlo] : kmul(C.ca_lo[b.id & mlo], C.ca_hi[b.id >> C.ca_lo_bits]);
         V[lane] = (dbg & 8) ? ea1[lane] : kmul(ca, ea1[lane]);
@@ -887,7 +899,7 @@ __global__ void __launch_bounds__(128) onehot_bin_kernel(
 /// (dominant class by complement: Σ_y B5c_T[y] = c_T); the run sums of U live
 /// in shared memory (RU[term·2 + b][lane]).
 __global__ void __launch_bounds__(128, 3) onehot_q5_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc_oh,
     const K8d* __restrict__ ea5, const K8d* __restrict__ B5, uint32_t chunk,
     u64* __restrict__ U, u64* __restrict__ J5)
@@ -926,16 +938,13 @@ __global__ void __launch_bounds__(128, 3) onehot_q5_kernel(
         const Region R = C.regions[b.region];
         if (!(R.flags & 8)) continue;
         if ((int)b.region != cur) { flush(); cur = (int)b.region; cw = R.qd_off; ctc = (int)R.tcnt; }
-        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0);
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
         #pragma unroll
         for (int q = 0; q < 4; q++) {
             const int idx = lane * 4 + q;
-            const int4 v = __ldg(reinterpret_cast<const int4*>(dg) + idx);
-            const uint32_t wv[4] = {(uint32_t)v.x, (uint32_t)v.y, (uint32_t)v.z, (uint32_t)v.w};
-            int s = 0;
-            #pragma unroll
-            for (int k = 3; k >= 0; k--) if (wv[k]) s = k * 4 + ((__ffs(wv[k]) - 1) >> 3);
-            sel[idx] = (uint8_t)s;
+            // The index's 16 plane digits; the selected plane is the lowest nonzero.
+            const uint32_t w = dig16(dg, (uint32_t)idx * 16);
+            sel[idx] = (uint8_t)(w ? (__ffs(w) - 1) >> 1 : 0);
         }
         const K8d* o = bc_oh + C.bco[C.oh_base + nblk - 1 - bi];
         for (int t = 0; t < ctc; t++) B5c[t * 32 + lane] = kmul(o[2 + t], B5[(size_t)(cw + t) * 32 + lane]);
@@ -1019,7 +1028,7 @@ constexpr int IDX_WARPS = 4;
 constexpr int IDX_MAXY = 128;
 template <int MINB>
 __global__ void __launch_bounds__(128, MINB) index_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
     const K8d* __restrict__ e_pre, const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
 {
@@ -1053,24 +1062,21 @@ __global__ void __launch_bounds__(128, MINB) index_kernel(
         const K8d* o = bc + C.bco[bi];
         for (int k = lane; k < 2 + (int)tcnt; k += 32) s_c[warp][k] = o[k];
         // ---- A: fold the digits.
-        const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0) + (size_t)lane * P;
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
+        const uint32_t dg0 = (uint32_t)lane * P;
         for (int s = 0; s < nys; s++) {
             const int start = lane * P + s * span;
             const int poff = start & ((1 << i) - 1);
             K8d acc = kzero();
             for (int c = 0; c < span; c += 16) {
-                const int4 v = __ldg(reinterpret_cast<const int4*>(dg + s * span + c));
-                const uint32_t wv[4] = {(uint32_t)v.x, (uint32_t)v.y, (uint32_t)v.z, (uint32_t)v.w};
-                #pragma unroll
-                for (int q = 0; q < 4; q++) {
-                    uint32_t x = wv[q];
-                    while (x) {
-                        const int bt = __ffs(x) - 1, by = bt >> 3;
-                        const int8_t dv = (int8_t)((x >> (by * 8)) & 0xff);
-                        x &= ~(0xffu << (by * 8));
-                        const K8d e = e_pre[poff + c + q * 4 + by];
-                        acc = dv == 1 ? kadd(acc, e) : ksub(acc, e);
-                    }
+                // 16 digits: each nonzero 2-bit field is +1 (01) or -1 (11).
+                uint32_t x = dig16(dg, dg0 + s * span + c);
+                while (x) {
+                    const int fd = (__ffs(x) - 1) >> 1;
+                    const uint32_t code = (x >> (2 * fd)) & 3u;
+                    x &= ~(3u << (2 * fd));
+                    const K8d e = e_pre[poff + c + fd];
+                    acc = code == 1u ? kadd(acc, e) : ksub(acc, e);
                 }
             }
             if (G > 1) {
@@ -1161,7 +1167,7 @@ __global__ void __launch_bounds__(128, MINB) index_kernel(
 /// scales its classes by cr, cb into per-warp run bins (flushed once).
 constexpr int RB1_C = 81;
 __global__ void __launch_bounds__(128) range_bin1_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
     const K8d* __restrict__ ea1, u64* __restrict__ R)
 {
@@ -1176,14 +1182,15 @@ __global__ void __launch_bounds__(128) range_bin1_kernel(
     const int npair = 1 << (b0 - 2);
     for (uint64_t bi = gw; bi < nblk; bi += nw) {
         const Blk b = blks[bi];
-        const uint32_t* dg = reinterpret_cast<const uint32_t*>(raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0));
+        const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
         for (int r = lane; r < npair; r += 32) {
+            // Four digits in one byte.
             const uint32_t x = __ldg(dg + r);
-            // Every digit must be ternary (checked: R[2·81] counts violations).
-            if ((__vadd4(x, 0x01010101u) & 0xfcfcfcfcu) != 0) { atomicAdd(R + 2 * RB1_C * 16, 1ULL); continue; }
+            // Every digit must be ternary: code 10 is not (R[2·81] counts violations).
+            if (((x >> 1) & ~x & 0x55u) != 0) { atomicAdd(R + 2 * RB1_C * 16, 1ULL); continue; }
             int c = 0, m = 1;
             #pragma unroll
-            for (int j = 0; j < 4; j++) { c += ((int)(int8_t)((x >> (8 * j)) & 0xff) + 1) * m; m *= 3; }
+            for (int j = 0; j < 4; j++) { const uint32_t f = (x >> (2 * j)) & 3u; c += (f == 1u ? 2 : f == 3u ? 0 : 1) * m; m *= 3; }
             if (c == 40) continue;   // all-zero digits: w ≡ 0
             const K8d e = ea1[r];
             u64* h = H + (size_t)c * 16;
@@ -1220,7 +1227,7 @@ __global__ void __launch_bounds__(128) range_bin1_kernel(
 /// index_kernel.
 constexpr int IB_SLOTS = 10;
 __global__ void __launch_bounds__(128, 4) index_batch_kernel(
-    const int8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
+    const uint8_t* __restrict__ raw, uint64_t src_len, int b0, int i,
     const Blk* __restrict__ blks, uint32_t nblk, Consts C, const K8d* __restrict__ bc,
     const K8d* __restrict__ e_pre, const K8d* __restrict__ e_alpha, K8d* __restrict__ partial)
 {
@@ -1250,24 +1257,21 @@ __global__ void __launch_bounds__(128, 4) index_batch_kernel(
                 if (R.flags & 4) { uint32_t qi = C.qidx[R.qd_off + b.k]; qd = qi == 0xffffffffu ? 0xffffffffu : (qi << (b0 - i)); }
             }
             K8d* F = Fw + q * ny;
-            const int8_t* dg = raw + (uint64_t)b.src * src_len + ((uint64_t)b.id << b0) + (size_t)lane * P;
+            const uint8_t* dg = blk_bytes(raw, src_len, b, b0);
+            const uint32_t dg0 = (uint32_t)lane * P;
             for (int s = 0; s < nys; s++) {
                 const int start = lane * P + s * span;
                 const int poff = start & ((1 << i) - 1);
                 K8d acc = kzero();
                 for (int c = 0; c < span; c += 16) {
-                    const int4 v = __ldg(reinterpret_cast<const int4*>(dg + s * span + c));
-                    const uint32_t wv[4] = {(uint32_t)v.x, (uint32_t)v.y, (uint32_t)v.z, (uint32_t)v.w};
-                    #pragma unroll
-                    for (int qq = 0; qq < 4; qq++) {
-                        uint32_t x = wv[qq];
-                        while (x) {
-                            const int bt = __ffs(x) - 1, by = bt >> 3;
-                            const int8_t dv = (int8_t)((x >> (by * 8)) & 0xff);
-                            x &= ~(0xffu << (by * 8));
-                            const K8d e = e_pre[poff + c + qq * 4 + by];
-                            acc = dv == 1 ? kadd(acc, e) : ksub(acc, e);
-                        }
+                    // 16 digits: each nonzero 2-bit field is +1 (01) or -1 (11).
+                    uint32_t x = dig16(dg, dg0 + s * span + c);
+                    while (x) {
+                        const int fd = (__ffs(x) - 1) >> 1;
+                        const uint32_t code = (x >> (2 * fd)) & 3u;
+                        x &= ~(3u << (2 * fd));
+                        const K8d e = e_pre[poff + c + fd];
+                        acc = code == 1u ? kadd(acc, e) : ksub(acc, e);
                     }
                 }
                 if (G > 1) {

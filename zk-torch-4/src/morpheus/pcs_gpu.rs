@@ -34,7 +34,8 @@ pub struct PcsGpu {
     pub streamed: bool,
     pub kept: std::sync::Mutex<Vec<super::link_gpu::Kept>>,
     /// Streamed request sources uploaded ahead of the link (device 0).
-    pub pre_raw: std::sync::Mutex<Option<DeviceBuffer<i8>>>,
+    /// Packed sources uploaded to device 0 during the PIOP (one device).
+    pub pre_raw: std::sync::Mutex<Option<DeviceBuffer<u8>>>,
 }
 
 fn ternary_cpu(coins: &Coins, purpose: Purpose, owner: u64, coord: u32) -> i8 {
@@ -274,7 +275,7 @@ impl LinkServices for PcsGpu {
     }
     fn dev_raw(&self) -> Option<&DeviceBuffer<i8>> { self.flat.as_ref() }
     fn kept(&self) -> Option<&std::sync::Mutex<Vec<super::link_gpu::Kept>>> { if self.streamed { Some(&self.kept) } else { None } }
-    fn take_pre_raw(&self) -> Option<DeviceBuffer<i8>> { self.pre_raw.lock().unwrap().take() }
+    fn take_pre_raw(&self) -> Option<DeviceBuffer<u8>> { self.pre_raw.lock().unwrap().take() }
     fn ev(&mut self, p: &Profile, _raw: &dyn super::packed::Sources, xi: &[K8]) -> Vec<AElem> {
         if self.streamed {
             self.kept_to_phys();

@@ -3429,7 +3429,7 @@ int agl_mlink2_consts(const void* d_blks, uint32_t nblk, const void* h_consts, u
     return mp_ret();
 }
 
-int agl_mlink2_round(const int8_t* d_raw, uint64_t src_len, int b0, int i, int d, int reduced, const void* h_consts,
+int agl_mlink2_round(const uint8_t* d_raw, uint64_t src_len, int b0, int i, int d, int reduced, const void* h_consts,
                      const void* d_onehot, uint32_t n_onehot, const void* d_generic, const uint32_t* const* d_lists, const uint32_t* n_lists, const uint64_t* d_bc,
                      const uint64_t* d_e1, const uint64_t* d_e2, const uint64_t* d_e3, const uint64_t* d_ealpha,
                      int skip_range, uint64_t* h_out) {
@@ -3466,7 +3466,7 @@ int agl_mlink2_round(const int8_t* d_raw, uint64_t src_len, int b0, int i, int d
     return 0;
 }
 
-int agl_mlink2_coarse_init(const int8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
+int agl_mlink2_coarse_init(const uint8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
                            const void* d_blks, uint32_t nblk, const uint32_t* d_rid, const uint32_t* d_k, uint64_t nrb,
                            const uint64_t* d_tfold, const uint64_t* d_efull, uint64_t coarse, uint32_t nsrc,
                            uint64_t* d_w, uint64_t* d_q, uint64_t* d_chi) {
@@ -3482,7 +3482,7 @@ int agl_mlink2_coarse_init(const int8_t* d_raw, uint64_t src_len, int b0, const 
 
 // Coarse init of the sources [src_base, src_base + nsrc) into local arrays
 // (indexing stays global: the kernels see base-shifted pointers).
-int agl_mlink2_coarse_init2(const int8_t* d_raw_virtual, uint64_t src_len, int b0, const void* h_consts,
+int agl_mlink2_coarse_init2(const uint8_t* d_raw_virtual, uint64_t src_len, int b0, const void* h_consts,
                             const void* d_blks, uint32_t nblk, const uint32_t* d_rid, const uint32_t* d_k, uint64_t nrb,
                             const uint64_t* d_tfold, const uint64_t* d_efull, int qbits, uint64_t coarse, uint32_t src_base, uint32_t nsrc,
                             uint64_t* d_w, uint64_t* d_q, uint64_t* d_chi) {
@@ -3507,7 +3507,7 @@ int agl_mlink2_dense_expand(const uint64_t* d_af, int afn, const uint64_t* d_pf,
     return (int)e;
 }
 
-int agl_mlink2_range_bin1(const int8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
+int agl_mlink2_range_bin1(const uint8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
                           const void* d_blks, uint32_t nblk, const uint64_t* d_bc, const uint64_t* d_ea1, uint64_t* d_R) {
     if (nblk == 0) return 0;
     mlink2::Consts C; memcpy(&C, h_consts, sizeof(C));
@@ -3570,7 +3570,7 @@ int agl_mlink2_coarse_fold(const uint64_t* d_in, uint64_t* d_out, uint32_t nsrc,
 }
 
 // One-hot plane round (v3): returns 7 K coefficients (range c0..c3, query c0..c2).
-int agl_mlink2_onehot3(const int8_t* d_raw, uint64_t src_len, int b0, int i, const void* h_consts,
+int agl_mlink2_onehot3(const uint8_t* d_raw, uint64_t src_len, int b0, int i, const void* h_consts,
                        const void* d_blks, uint32_t nblk, const uint64_t* d_e1, const uint64_t* d_e2, const uint64_t* d_e3,
                        const uint64_t* d_eai, const uint32_t* d_eai_off, const uint64_t* d_eapr, const uint32_t* d_eapr_off,
                        uint64_t* h_out) {
@@ -3594,7 +3594,7 @@ int agl_mlink2_onehot3(const int8_t* d_raw, uint64_t src_len, int b0, int i, con
     return (int)e;
 }
 
-int agl_mlink2_onehot_pre(const int8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
+int agl_mlink2_onehot_pre(const uint8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
                           const void* d_blks, uint32_t nblk, const uint64_t* d_bc_oh,
                           const uint64_t* d_eai, const uint32_t* d_eai_off, uint64_t* d_G, uint64_t* d_W) {
     if (nblk == 0) return 0;
@@ -3628,7 +3628,7 @@ int agl_mlink2_rep_reduce(const uint64_t* d_in, int rep, uint64_t n, uint64_t* d
     return (int)agl_sync_mine();
 }
 
-int agl_mlink2_onehot_bin(const int8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
+int agl_mlink2_onehot_bin(const uint8_t* d_raw, uint64_t src_len, int b0, const void* h_consts,
                           const void* d_blks, uint32_t nblk, const uint64_t* d_bc_oh,
                           const uint64_t* d_ea1, const uint64_t* d_ea5, const uint64_t* d_B5,
                           uint64_t* d_GV, uint64_t* d_U, uint64_t* d_J, uint64_t* d_J5) {
@@ -3833,7 +3833,7 @@ int agl_mpiop_sc_fold(const uint64_t* d_in, uint64_t* d_out, uint64_t len, const
 }
 
 // Late block-local round (v2 index kernel): 7 K values (range t=0..3, query t=0..2).
-int agl_mlink2_index(const int8_t* d_raw, uint64_t src_len, int b0, int i, const void* h_consts,
+int agl_mlink2_index(const uint8_t* d_raw, uint64_t src_len, int b0, int i, const void* h_consts,
                      const void* d_blks, uint32_t nblk, const uint64_t* d_bc, const uint64_t* d_epre,
                      const uint64_t* d_ealpha, uint64_t* h_out) {
     for (int k = 0; k < 7 * 8; k++) h_out[k] = 0;
