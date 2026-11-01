@@ -1049,6 +1049,7 @@ pub fn prove_cols(
         // Responses.
         let t0 = Instant::now();
         let beta = super::auth::challenges_pub(tr, &d, &d_o, attempt, n);
+        let t_beta = t0.elapsed().as_secs_f64() * 1e3;
         let bb: Vec<i8> = (0..n).flat_map(|e| b2(&beta, e)).collect();
         let dp4a = std::env::var_os("MORPHEUS_COMBINE_DP4A").is_some();
         let zws: Vec<DeviceBuffer<i64>> = std::thread::scope(|sc| {
@@ -1066,6 +1067,7 @@ pub fn prove_cols(
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         almost_goldilocks_cuda::set_device(0).unwrap();
+        let t_cols = t0.elapsed().as_secs_f64() * 1e3;
         let mut zl = ul.clone_on_device().unwrap();
         let vl: Vec<*const i8> = (0..n).map(|e| unsafe { r_all.as_ptr().add(e * sl * N) }).collect();
         unsafe { assert_eq!(if dp4a { ffi::agl_mauth_combine_multi(vl.as_ptr(), n as i32, sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N)) }
@@ -1073,6 +1075,7 @@ pub fn prove_cols(
         let mut zo = uo.clone_on_device().unwrap();
         let bo = b2(&beta, n);
         unsafe { assert_eq!(ffi::agl_mauth_combine(s_o.as_ptr(), so as i32, bo.as_ptr(), zo.as_mut_ptr(), zo.as_mut_ptr().add(so * N)), 0); }
+        if std::env::var_os("MORPHEUS_AUTH_TRACE").is_some() { eprintln!("[auth] attempt {attempt}: challenges {t_beta:.1} ms, column responses {:.1} ms, link/aux responses {:.1} ms", t_cols - t_beta, t0.elapsed().as_secs_f64() * 1e3 - t_cols); }
         timing.respond_ms += t0.elapsed().as_secs_f64() * 1e3;
         // Decision: exact norms summed over devices.
         let t0 = Instant::now();

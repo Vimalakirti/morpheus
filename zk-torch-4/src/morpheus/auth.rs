@@ -137,7 +137,7 @@ fn gaussian_cols(coins: &Coins, opening: u64, attempt: u16, fs: &FastSigma, coor
 pub(crate) fn challenges_pub(tr: &MTranscript, d: &[Tuple], d_o: &[AuxTuple], attempt: u16, n: usize) -> Vec<Vec<[i8; 64]>> { challenges(tr, d, d_o, attempt, n) }
 
 fn challenges(tr: &MTranscript, d: &[Tuple], d_o: &[AuxTuple], attempt: u16, n: usize) -> Vec<Vec<[i8; 64]>> {
-    let mut t = tr.clone();
+    let mut t = tr.fork();
     for (x, y) in d.iter().zip(d_o) {
         for v in x.c.iter().chain(&x.g).chain(&y.c) { t.absorb(Item::FirstMessage, v); }
         t.absorb_k(Item::FirstMessage, &x.a.0);

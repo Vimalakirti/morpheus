@@ -63,6 +63,10 @@ pub struct MTranscript {
     absorbed: usize,
     /// Incremental state of `registered_cardinality` over prefix[..parsed].
     parse: ParseState,
+    /// Bytes of the address held by the transcript this one was forked from
+    /// (`fork`): `prefix` holds address bytes base.. only; `absorbed` and
+    /// `parse.parsed` stay absolute.
+    base: usize,
 }
 
 /// `registered_cardinality`'s parser, resumable over appended frames.
@@ -89,14 +93,18 @@ impl ParseState {
     fn new() -> Self { ParseState { parsed: 0, frame_number: 0, pending: None, failed: false } }
     /// Consume the complete frames of address[self.parsed..] (same checks as
     /// `registered_cardinality::parse`, frame by frame).
-    fn advance(&mut self, address: &[u8]) {
+    fn advance(&mut self, address: &[u8]) { self.advance_at(address, 0) }
+    /// Same over address bytes base.. (`tail`).
+    fn advance_at(&mut self, tail: &[u8], base: usize) {
         if self.failed { return; }
         if self.parsed == 0 {
+            assert_eq!(base, 0, "parser state of a forked transcript");
+            let address = tail;
             if address.len() as u64 > MAX_ADDRESS_BYTES || !address.starts_with(FS_DOMAIN) { self.failed = true; return; }
             self.parsed = FS_DOMAIN.len();
         }
-        while self.parsed < address.len() {
-            let rest = &address[self.parsed..];
+        while self.parsed < base + tail.len() {
+            let rest = &tail[self.parsed - base..];
             match parse_frame(rest, self.frame_number, &mut self.pending) {
                 Some(used) => { self.parsed += used; self.frame_number += 1; }
                 None => { self.failed = true; return; }
@@ -342,13 +350,24 @@ fn k_from_sponge(h: sha3::Shake256) -> [u64; 8] {
 
 impl MTranscript {
     pub fn new(profile: &str, salt: &[u8; 64]) -> Self {
-        let mut t = Self { prefix: FS_DOMAIN.to_vec(), sponge: sha3::Shake256::default(), absorbed: 0, parse: ParseState::new() };
+        let mut t = Self { prefix: FS_DOMAIN.to_vec(), sponge: sha3::Shake256::default(), absorbed: 0, parse: ParseState::new(), base: 0 };
         t.absorb_bytes(Item::Profile, profile.as_bytes());
         t.absorb_bytes(Item::Salt, salt);
         t
     }
     /// Complete public prefix for verifier-owned deferred finalization state.
-    pub fn literal_prefix(&self) -> &[u8] { &self.prefix }
+    pub fn literal_prefix(&self) -> &[u8] { assert_eq!(self.base, 0, "literal prefix of a forked transcript"); &self.prefix }
+    /// A transcript that continues this one exactly like a clone, without
+    /// copying its (possibly GB-scale) prefix: the sponge and the cardinality
+    /// parser are caught up and only bytes appended after the fork are kept.
+    pub fn fork(&self) -> Self {
+        let end = self.base + self.prefix.len();
+        let mut sponge = self.sponge.clone();
+        sponge.update(&self.prefix[self.absorbed - self.base..]);
+        let mut parse = self.parse.clone();
+        parse.advance_at(&self.prefix, self.base);
+        MTranscript { prefix: Vec::new(), sponge, absorbed: end, parse, base: end }
+    }
     /// Canonical field residues, except Statement/Layout which encode arbitrary
     /// public u64 metadata exactly (including q itself), with a separate tag.
     pub fn absorb(&mut self, item: Item, words: &[u64]) {
@@ -393,14 +412,14 @@ impl MTranscript {
         let mut a = Vec::with_capacity(40);
         for w in [ty as u64, stage as u64, attempt, index, arity64] { a.extend_from_slice(&w.to_be_bytes()); }
         frame(&mut self.prefix, 4, 0, &a);
-        assert!(u64::try_from(self.prefix.len()).unwrap() <= MAX_ADDRESS_BYTES, "address cap exceeded");
-        self.parse.advance(&self.prefix);
+        assert!(u64::try_from(self.base + self.prefix.len()).unwrap() <= MAX_ADDRESS_BYTES, "address cap exceeded");
+        self.parse.advance_at(&self.prefix, self.base);
         assert_eq!(self.parse.cardinality(), n, "builder/parser mismatch");
-        self.sponge.update(&self.prefix[self.absorbed..]);
-        self.absorbed = self.prefix.len();
+        self.sponge.update(&self.prefix[self.absorbed - self.base..]);
+        self.absorbed = self.base + self.prefix.len();
         let r = typed_rank_from(self.sponge.clone(), &n);
         #[cfg(test)]
-        {
+        if self.base == 0 {
             assert_eq!(registered_cardinality(&self.prefix), n, "incremental parser differs");
             assert_eq!(typed_rank(&self.prefix, &n), r, "incremental sponge differs");
         }
@@ -421,15 +440,15 @@ impl MTranscript {
         let mut a = Vec::with_capacity(40);
         for w in [ChalType::K as u64, stage as u64, attempt, index, 1] { a.extend_from_slice(&w.to_be_bytes()); }
         frame(&mut self.prefix, 4, 0, &a);
-        assert!(u64::try_from(self.prefix.len()).unwrap() <= MAX_ADDRESS_BYTES, "address cap exceeded");
-        self.parse.advance(&self.prefix);
+        assert!(u64::try_from(self.base + self.prefix.len()).unwrap() <= MAX_ADDRESS_BYTES, "address cap exceeded");
+        self.parse.advance_at(&self.prefix, self.base);
         assert!(self.parse.is_q8(), "builder/parser mismatch");
-        self.sponge.update(&self.prefix[self.absorbed..]);
-        self.absorbed = self.prefix.len();
+        self.sponge.update(&self.prefix[self.absorbed - self.base..]);
+        self.absorbed = self.base + self.prefix.len();
         let d = k_from_sponge(self.sponge.clone());
         let r_be = rank_be(&d);
         #[cfg(test)]
-        {
+        if self.base == 0 {
             let n = krank().q8.clone();
             assert_eq!(registered_cardinality(&self.prefix), n, "incremental parser differs");
             let slow = typed_rank(&self.prefix, &n);
@@ -467,6 +486,23 @@ fn unrank_k(mut r: BigUint, count: usize) -> Vec<K8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fork_equals_clone() {
+        let mut t = MTranscript::new("p", &[7u8; 64]);
+        t.absorb(Item::FirstMessage, &[1, 2, 3]);
+        let _ = t.challenge_k(Stage::LinkRound, 0, 0);
+        t.absorb(Item::FirstMessage, &[4, 5]);
+        for _ in 0..2 {
+            let (mut a, mut b) = (t.clone(), t.fork());
+            for x in [&mut a, &mut b] { x.absorb(Item::FirstMessage, &[9; 300]); x.absorb_k(Item::FirstMessage, &[K8([3; 8])]); }
+            assert_eq!(a.challenge_k(Stage::AuthColumn, 1, 2), b.challenge_k(Stage::AuthColumn, 1, 2));
+            assert_eq!(a.challenge_c0_tuple(Stage::AuthColumn, 1, 5), b.challenge_c0_tuple(Stage::AuthColumn, 1, 5));
+            let (mut c, mut d) = (a.clone(), b.fork());
+            c.absorb(Item::FirstMessage, &[1]); d.absorb(Item::FirstMessage, &[1]);
+            assert_eq!(c.challenge_k_not01(Stage::LinkRound, 0, 3), d.challenge_k_not01(Stage::LinkRound, 0, 3));
+            t.absorb(Item::FirstMessage, &[6]);
+        }
+    }
     #[test]
     fn rank_be_equals_biguint() {
         let mut x = 1u64;
