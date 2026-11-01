@@ -468,6 +468,19 @@ fn key_devs<'k>(pc: &'k PcsGpu, reps: &'k [AuthReplica]) -> Vec<(i32, &'k auth_g
 /// Streamed authentication over the link's kept per-device source ranges.
 fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::LinkOutput, t1: &MTranscript, runs: &[(usize, usize)], times: &mut Times) -> AuthProof {
     let t = Instant::now();
+    if !pc.cols.is_empty() {
+        // Column shards (built for the link endpoints): every device
+        // authenticates its columns; device 0 also the link and aux blocks.
+        assert_eq!(runs.iter().map(|&(a, b)| b - a).sum::<usize>(), o.profile.source_cols(), "column-sharded authentication needs full support");
+        almost_goldilocks_cuda::set_device(0).unwrap();
+        let r_all = DeviceBuffer::from_slice(&fast.sources.iter().flat_map(|s| s.r.iter().flatten().map(|&v| v as i8)).collect::<Vec<_>>()).unwrap();
+        let s_o = DeviceBuffer::from_slice(&fast.s_o.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
+        let mut tm = AuthTiming::default();
+        let (apf, _) = auth_gpu::prove_cols(&o.profile, &pc.keys, &pc.col_keys, &pc.cols, &r_all, &s_o, fast.sources.len(), &o.coins, opening, t1, &fast.point, true, &mut tm).expect("authentication");
+        let secs = lap(times, "auth", t);
+        if o.timing { eprintln!("[auth, columns] {:.2}s, attempt {} {:?}", secs, apf.attempt, tm); }
+        return apf;
+    }
     pc.kept_to_phys();
     // Rebuild the resident source key cache if it fits next to the kept
     // shards; otherwise the authentication generates it in column chunks.
@@ -587,6 +600,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         let t = Instant::now();
         let c_req = if stream {
             pc.streamed = true;
+            if o.auth && o.auth_gpus > 1 && std::env::var("MORPHEUS_AUTH_COLS").as_deref() != Ok("0") { pc.use_cols((0..o.auth_gpus as i32).collect()); }
             let c = commit_streamed(o, pc, &super::packed::Refs(&refs));
             // The source key cache (43 GB at the ternary profile) is freed
             // for the link's resident sources and rebuilt for the
@@ -627,7 +641,8 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
             // coordinates, ~0.5 s to sample); smaller masks are cheaper to
             // draw on demand than the PIOP slowdown of drawing them alongside.
             let coords = o.profile.tau * (support.len() + o.profile.link_cols() + o.profile.aux_cols()) * super::ring::N;
-            let n: u16 = std::env::var("MORPHEUS_PRESAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(if coords >= 1 << 27 { 3 } else { 0 });
+            // Column-sharded authentication samples each device's columns itself.
+            let n: u16 = if !pc.col_devs.is_empty() { 0 } else { std::env::var("MORPHEUS_PRESAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(if coords >= 1 << 27 { 3 } else { 0 }) };
             let (prof, coins, runs) = (&o.profile, &o.coins, &runs);
             if n > 0 { sc.spawn(move || auth_gpu::presample(prof, coins, opening, n, Some(runs))); }
         }

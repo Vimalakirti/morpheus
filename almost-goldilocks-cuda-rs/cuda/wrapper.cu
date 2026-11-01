@@ -3250,7 +3250,8 @@ int agl_mauth_ev(const void* d_W, int w_bytes, int cols, const uint64_t* d_w, ui
     if (blocks > cols) blocks = cols;
     void *part = nullptr, *out = nullptr;
     if (cuda_malloc(&part, (size_t)blocks * 64 * 64) || cuda_malloc(&out, 64 * 64)) return -1;
-    if (w_bytes == 1) mauth::ev_partial_kernel<int8_t><<<blocks, 256>>>((const int8_t*)d_W, cols, (const mauth::K8d*)d_w, (mauth::K8d*)part);
+    if (w_bytes == 0) mauth::ev_partial_kernel<int8_t, true><<<blocks, 256>>>((const int8_t*)d_W, cols, (const mauth::K8d*)d_w, (mauth::K8d*)part);
+    else if (w_bytes == 1) mauth::ev_partial_kernel<int8_t><<<blocks, 256>>>((const int8_t*)d_W, cols, (const mauth::K8d*)d_w, (mauth::K8d*)part);
     else mauth::ev_partial_kernel<int64_t><<<blocks, 256>>>((const int64_t*)d_W, cols, (const mauth::K8d*)d_w, (mauth::K8d*)part);
     mauth::ev_reduce_kernel<<<1, 512>>>((const mauth::K8d*)part, blocks, (mauth::K8d*)out);
     cudaMemcpy(h_out, out, 64 * 64, cudaMemcpyDeviceToHost);
@@ -3285,10 +3286,36 @@ int agl_mauth_combine_multi(const int8_t* const* h_V, int nsrc, int cols, const 
     int blocks = ma_sms() * 4;
     if (blocks > cols) blocks = cols;
     if (getenv("MORPHEUS_COMBINE_SCALAR")) mauth::combine_multi_kernel<<<blocks, 512>>>((const int8_t* const*)db, nsrc, cols, (const int8_t*)((char*)db + pb), d_Z0, d_Z1);
-    else mauth::combine_dp4a_kernel<<<blocks, 512>>>((const int8_t* const*)db, nsrc, cols, (const int8_t*)((char*)db + pb), d_Z0, d_Z1);
+    else mauth::combine_dp4a_kernel<false><<<blocks, 512>>>((const int8_t* const*)db, nsrc, cols, (const int8_t*)((char*)db + pb), d_Z0, d_Z1);
     cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) e = agl_sync_mine();
     cuda_free(db);
+    return (int)e;
+}
+
+/// agl_mauth_combine_multi over packed physical columns (1024 bytes each).
+int agl_mauth_combine_packed(const uint8_t* const* h_V, int nsrc, int cols, const int8_t* h_beta, int64_t* d_Z0, int64_t* d_Z1) {
+    if (nsrc <= 0 || cols <= 0) return 0;
+    void* db = nullptr;
+    const size_t pb = (size_t)nsrc * sizeof(void*), bb = (size_t)nsrc * 128;
+    if (cuda_malloc(&db, pb + bb)) return -1;
+    std::vector<uint8_t> tmp(pb + bb);
+    memcpy(tmp.data(), h_V, pb); memcpy(tmp.data() + pb, h_beta, bb);
+    cudaMemcpy(db, tmp.data(), pb + bb, cudaMemcpyHostToDevice);
+    int blocks = ma_sms() * 4;
+    if (blocks > cols) blocks = cols;
+    mauth::combine_dp4a_kernel<true><<<blocks, 512>>>((const int8_t* const*)db, nsrc, cols, (const int8_t*)((char*)db + pb), d_Z0, d_Z1);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = agl_sync_mine();
+    cuda_free(db);
+    return (int)e;
+}
+
+/// Packed logical columns -> packed physical columns.
+int agl_morpheus_permute2(const uint8_t* d_src, uint8_t* d_dst, uint64_t ncols) {
+    int grid = ma_sms() * 32;
+    mauth::permute2_kernel<<<grid, 256>>>(d_src, d_dst, ncols);
+    cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
     return (int)e;
 }
 

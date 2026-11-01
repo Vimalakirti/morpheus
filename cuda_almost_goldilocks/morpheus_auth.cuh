@@ -40,7 +40,7 @@ __global__ void wtable_kernel(const K8d* __restrict__ el, const K8d* __restrict_
 
 /// Per-block partial sums P_m over a grid-stride set of columns.
 /// 256 threads: m = t % 64, quarter q = t / 64 handles j in [16q, 16q+16).
-template <typename TW>
+template <typename TW, bool PACKED = false>
 __global__ void ev_partial_kernel(const TW* __restrict__ W, int cols, const K8d* __restrict__ w, K8d* __restrict__ partial) {
     // The column tile and the final 4x64x8 reduction share one buffer
     // (int64 tile 33,280 B; reduction 16,384 B), keeping the int64 variant
@@ -54,8 +54,14 @@ __global__ void ev_partial_kernel(const TW* __restrict__ W, int cols, const K8d*
 #pragma unroll
     for (int a = 0; a < 8; a++) acc[a] = 0;
     for (int l = blockIdx.x; l < cols; l += gridDim.x) {
-        const TW* col = W + (size_t)l * 4096;
-        for (int i = t; i < 4096; i += 256) s[(i >> 6) * 65 + (i & 63)] = col[i];  // phys i = j + 64 m -> s[m][j]
+        if (PACKED) {
+            // Packed physical column (1024 bytes, 2 bits per digit).
+            const uint8_t* col = reinterpret_cast<const uint8_t*>(W) + (size_t)l * 1024;
+            for (int i = t; i < 4096; i += 256) s[(i >> 6) * 65 + (i & 63)] = (TW)(int8_t)((int8_t)(col[i >> 2] << (6 - 2 * (i & 3))) >> 6);
+        } else {
+            const TW* col = W + (size_t)l * 4096;
+            for (int i = t; i < 4096; i += 256) s[(i >> 6) * 65 + (i & 63)] = col[i];  // phys i = j + 64 m -> s[m][j]
+        }
         if (t < 64) sw[t] = w[(size_t)l * 64 + t];
         __syncthreads();
         for (int j = qtr * 16; j < qtr * 16 + 16; j++) {
@@ -175,6 +181,7 @@ __global__ void __launch_bounds__(512) combine_multi_kernel(const int8_t* const*
 ///   y_k = Σ_m β_m ext[k − m + 64] = Σ_u βr[u] ext[k + 1 + u],  βr[u] = β[63 − u],
 /// a 64-byte window: 16 __dp4a per row. Four byte-shifted, word-packed copies
 /// E[sh][w][j] = ext[4w + sh .. 4w + sh + 3] make every window word-aligned.
+template <bool PACKED = false>
 __global__ void __launch_bounds__(512) combine_dp4a_kernel(const int8_t* const* __restrict__ Vp, int nsrc, int cols,
                                                            const int8_t* __restrict__ beta, int64_t* __restrict__ Z0, int64_t* __restrict__ Z1) {
     __shared__ __align__(16) int8_t s[4096];
@@ -186,8 +193,15 @@ __global__ void __launch_bounds__(512) combine_dp4a_kernel(const int8_t* const* 
 #pragma unroll
         for (int q = 0; q < 8; q++) { a0[q] = 0; a1[q] = 0; }
         for (int e = 0; e < nsrc; e++) {
-            const int8_t* col = Vp[e] + (size_t)l * 4096;
-            reinterpret_cast<long long*>(s)[tid] = __ldg(reinterpret_cast<const long long*>(col) + tid);
+            if (PACKED) {
+                // Packed physical column: thread tid unpacks digits 8 tid .. 8 tid + 7.
+                const uint16_t x = __ldg(reinterpret_cast<const uint16_t*>(Vp[e] + (size_t)l * 1024) + tid);
+#pragma unroll
+                for (int q = 0; q < 8; q++) s[8 * tid + q] = (int8_t)((int8_t)((x >> (2 * q)) << 6) >> 6);
+            } else {
+                const int8_t* col = Vp[e] + (size_t)l * 4096;
+                reinterpret_cast<long long*>(s)[tid] = __ldg(reinterpret_cast<const long long*>(col) + tid);
+            }
             if (tid < 32) {
                 // Reversed rows packed: word w = βr[4w .. 4w+3], βr[u] = β[63 − u].
                 const int r = tid >> 4, w = tid & 15;
@@ -293,6 +307,23 @@ __global__ void permute_kernel(const int8_t* __restrict__ src, int8_t* __restric
         size_t c = i >> 12; int l = (int)(i & 4095);
         int j = l >> 6, k = l & 63;
         dst[(c << 12) + j + 64 * k] = src[i];
+    }
+}
+
+/// Packed logical columns -> packed physical columns (as permute_kernel):
+/// output digit j + 64 k of a column is input digit 64 j + k. One thread per
+/// output byte; ncols columns of 1024 bytes.
+__global__ void permute2_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, size_t ncols) {
+    for (size_t ob = blockIdx.x * (size_t)blockDim.x + threadIdx.x; ob < ncols * 1024; ob += (size_t)gridDim.x * blockDim.x) {
+        const size_t c = ob >> 10;
+        const uint8_t* col = src + (c << 10);
+        uint32_t out = 0;
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int p = (int)((ob & 1023) * 4 + q), j = p & 63, k = p >> 6, l = 64 * j + k;
+            out |= (uint32_t)((col[l >> 2] >> (2 * (l & 3))) & 3) << (2 * q);
+        }
+        dst[ob] = (uint8_t)out;
     }
 }
 

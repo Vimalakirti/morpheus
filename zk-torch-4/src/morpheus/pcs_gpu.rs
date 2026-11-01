@@ -36,6 +36,12 @@ pub struct PcsGpu {
     /// Streamed request sources uploaded ahead of the link (device 0).
     /// Packed sources uploaded to device 0 during the PIOP (one device).
     pub pre_raw: std::sync::Mutex<Option<DeviceBuffer<u8>>>,
+    /// Streamed, several authentication devices: the source block is split
+    /// by columns (auth_gpu::prove_cols). `col_devs` are the devices; the
+    /// column keys persist, the column shards are per opening.
+    pub col_devs: Vec<i32>,
+    pub col_keys: Vec<super::auth_gpu::ColKey>,
+    pub cols: Vec<super::auth_gpu::ColShard>,
 }
 
 fn ternary_cpu(coins: &Coins, purpose: Purpose, owner: u64, coord: u32) -> i8 {
@@ -83,7 +89,7 @@ fn i8_cols(cols: &[Vec<i64>]) -> Vec<i8> { cols.iter().flat_map(|c| c.iter().map
 impl PcsGpu {
     pub fn new(p: Profile, seed: KeySeed) -> Self {
         let keys = Keys::build(&p, &seed);
-        PcsGpu { p, seed, keys, src: Vec::new(), err: Vec::new(), flat: None, coin_ms: 0.0, commit_ms: 0.0, streamed: false, kept: std::sync::Mutex::new(Vec::new()), pre_raw: std::sync::Mutex::new(None) }
+        PcsGpu { p, seed, keys, src: Vec::new(), err: Vec::new(), flat: None, coin_ms: 0.0, commit_ms: 0.0, streamed: false, kept: std::sync::Mutex::new(Vec::new()), pre_raw: std::sync::Mutex::new(None), col_devs: Vec::new(), col_keys: Vec::new(), cols: Vec::new() }
     }
 
     /// Upload the sources (raw logical order) once; physical columns are
@@ -149,7 +155,15 @@ impl PcsGpu {
     }
 
     /// Drop the resident sources (keeps the key caches).
-    pub fn unload(&mut self) { self.src.clear(); self.err.clear(); self.flat = None; self.kept.lock().unwrap().clear(); *self.pre_raw.lock().unwrap() = None; }
+    pub fn unload(&mut self) { self.src.clear(); self.err.clear(); self.flat = None; self.kept.lock().unwrap().clear(); *self.pre_raw.lock().unwrap() = None; self.cols.clear(); self.col_devs.clear(); }
+    /// Column-sharded authentication over `devs` for this opening.
+    pub fn use_cols(&mut self, devs: Vec<i32>) {
+        if self.col_keys.len() != devs.len() || self.col_keys.iter().zip(&devs).any(|(k, &d)| k.dev != d) {
+            self.col_keys = super::auth_gpu::col_keys(&self.p, &self.seed, &devs);
+            almost_goldilocks_cuda::set_device(0).unwrap();
+        }
+        self.col_devs = devs;
+    }
 
     /// Kept shards in physical column order (in place, per source).
     pub fn kept_to_phys(&self) {
@@ -274,9 +288,17 @@ impl LinkServices for PcsGpu {
         out
     }
     fn dev_raw(&self) -> Option<&DeviceBuffer<i8>> { self.flat.as_ref() }
-    fn kept(&self) -> Option<&std::sync::Mutex<Vec<super::link_gpu::Kept>>> { if self.streamed { Some(&self.kept) } else { None } }
+    fn kept(&self) -> Option<&std::sync::Mutex<Vec<super::link_gpu::Kept>>> { if self.streamed && self.col_devs.is_empty() { Some(&self.kept) } else { None } }
     fn take_pre_raw(&self) -> Option<DeviceBuffer<u8>> { self.pre_raw.lock().unwrap().take() }
-    fn ev(&mut self, p: &Profile, _raw: &dyn super::packed::Sources, xi: &[K8]) -> Vec<AElem> {
+    fn ev(&mut self, p: &Profile, raw: &dyn super::packed::Sources, xi: &[K8]) -> Vec<AElem> {
+        if self.streamed && !self.col_devs.is_empty() {
+            // The link's shards are released; the column shards serve the
+            // endpoints and then the authentication.
+            let t = std::time::Instant::now();
+            if self.cols.is_empty() { self.cols = super::auth_gpu::col_shards(p, raw, &self.col_devs); }
+            if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] column shards {:.2} s", t.elapsed().as_secs_f64()); }
+            return super::auth_gpu::ev_cols(p, &self.cols, xi);
+        }
         if self.streamed {
             self.kept_to_phys();
             let k = self.kept.lock().unwrap();

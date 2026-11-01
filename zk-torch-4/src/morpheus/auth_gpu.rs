@@ -840,3 +840,297 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------- column shards
+
+/// The authentication's source block split by columns over devices: device
+/// `dev` holds source columns c0..c1 of every source, packed two bits per
+/// digit in physical order ([source][column][1024 bytes]). Masks, A·u,
+/// Ev and responses of those columns stay on the device; only the partial
+/// A·u products, Ev sums and norms (a few MB) cross devices.
+pub struct ColShard { pub dev: i32, pub c0: usize, pub c1: usize, pub nsrc: usize, pub raw: DeviceBuffer<u8> }
+unsafe impl Send for ColShard {}
+unsafe impl Sync for ColShard {}
+
+/// The source key over columns c0..c1 (payload and hiding columns only).
+pub struct ColKey { pub dev: i32, pub c0: usize, pub c1: usize, pub key: Option<KeyCache> }
+unsafe impl Send for ColKey {}
+unsafe impl Sync for ColKey {}
+
+/// Contiguous column ranges of the source block, one per device.
+pub fn col_ranges(p: &Profile, g: usize) -> Vec<(usize, usize)> {
+    let sw = p.source_cols();
+    (0..g).map(|d| (sw * d / g, sw * (d + 1) / g)).collect()
+}
+
+/// Source keys of the column ranges (built once per process and device).
+pub fn col_keys(p: &Profile, seed: &KeySeed, devs: &[i32]) -> Vec<ColKey> {
+    let c = p.source_cols() - p.rank;
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = devs.iter().zip(col_ranges(p, devs.len())).map(|(&dev, (c0, c1))| sc.spawn(move || {
+            almost_goldilocks_cuda::set_device(dev).expect("set device");
+            let key = (c0 < c.min(c1)).then(|| KeyCache::build(seed, KeyKind::Source, p.rank, c0 as u64, c.min(c1) - c0, 5));
+            ColKey { dev, c0, c1, key }
+        })).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Column shards of `raw` (logical packed host sources) on `devs`.
+pub fn col_shards(p: &Profile, raw: &dyn super::packed::Sources, devs: &[i32]) -> Vec<ColShard> {
+    let n = raw.count();
+    let out = std::thread::scope(|sc| {
+        let hs: Vec<_> = devs.iter().zip(col_ranges(p, devs.len())).map(|(&dev, (c0, c1))| sc.spawn(move || {
+            almost_goldilocks_cuda::set_device(dev).expect("set device");
+            let nc = c1 - c0;
+            let mut buf = DeviceBuffer::<u8>::new((n * nc * 1024).max(1)).expect("column shard");
+            let mut stage = DeviceBuffer::<u8>::new(nc * 1024).expect("column shard staging");
+            for s in 0..n {
+                let own;
+                let bytes: &[u8] = match raw.packed(s) { Some(x) => &x.b, None => { own = super::packed::Src::from_i8(&raw.to_i8(s)); &own.b } };
+                stage.copy_from_slice_at(0, &bytes[c0 * 1024..c1 * 1024]).expect("column upload");
+                let rc = unsafe { ffi::agl_morpheus_permute2(stage.as_ptr(), buf.as_mut_ptr().add(s * nc * 1024), nc as u64) };
+                assert_eq!(rc, 0, "permute2");
+            }
+            ColShard { dev, c0, c1, nsrc: n, raw: buf }
+        })).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    almost_goldilocks_cuda::set_device(0).unwrap();
+    out
+}
+
+impl DevPoint {
+    /// The 64×8 raw Ev sums (before g_k) of `ncols` columns at ptr starting
+    /// at source column c0 (bytes 0: packed, 1: int8, 8: int64).
+    pub fn ev_part(&self, ptr: *const c_void, bytes: i32, c0: usize, ncols: usize) -> Vec<u64> {
+        let mut out = vec![0u64; 64 * 8];
+        if ncols == 0 { return out; }
+        let rc = unsafe { ffi::agl_mauth_ev(ptr, bytes, ncols as i32, self.w.as_ptr().add(c0 * 64 * 8), out.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        out
+    }
+    /// Ev from the summed raw sums.
+    pub fn ev_finish(&self, out: &[u64]) -> AElem {
+        let pm = AElem((0..DS).map(|m| K8(std::array::from_fn(|a| out[m * 8 + a]))).collect());
+        mul_a(&self.gk, &pm)
+    }
+}
+
+fn add_mod(a: &mut [u64], b: &[u64]) { for (x, y) in a.iter_mut().zip(b) { *x = ((*x as u128 + *y as u128) % Q as u128) as u64; } }
+
+/// Ev_raw(W_e; ξ) of every source from the column shards.
+pub fn ev_cols(p: &Profile, shards: &[ColShard], xi: &[K8]) -> Vec<AElem> {
+    let pt = Point { xi: xi.to_vec(), rho: K8::ZERO };
+    let n = shards.first().map_or(0, |s| s.nsrc);
+    let parts: Vec<Vec<Vec<u64>>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = shards.iter().map(|sh| { let pt = &pt; sc.spawn(move || {
+            almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
+            let dp = DevPoint::new(p, pt);
+            let nc = sh.c1 - sh.c0;
+            (0..sh.nsrc).map(|s| dp.ev_part(unsafe { sh.raw.as_ptr().add(s * nc * 1024) } as *const c_void, 0, sh.c0, nc)).collect::<Vec<_>>()
+        }) }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    almost_goldilocks_cuda::set_device(0).unwrap();
+    let dp = DevPoint::new(p, &pt);
+    (0..n).map(|s| { let mut acc = vec![0u64; 512]; for d in &parts { add_mod(&mut acc, &d[s]); } dp.ev_finish(&acc) }).collect()
+}
+
+/// One device's share of an attempt.
+struct ColPart { uw: DeviceBuffer<i64>, part: Vec<u32>, pm: [Vec<u64>; 2], err: Option<[Vec<i64>; 2]> }
+
+/// Column-sharded prover (attempts in order, every device working on its
+/// columns); equals `prove` / `prove_sharded` on the same inputs. `r_all`
+/// holds every source's link witness (int8, sl·N each) on device 0. Full
+/// response support only.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_cols(
+    p: &Profile, keys: &Keys, ckeys: &[ColKey], shards: &[ColShard], r_all: &DeviceBuffer<i8>, s_o: &DeviceBuffer<i8>, n: usize,
+    coins: &Coins, opening: u64, tr: &MTranscript, pt: &Point, keep_z: bool, timing: &mut AuthTiming,
+) -> Result<AuthOut, AuthError> {
+    let (sw, sl, so) = (p.source_cols(), p.link_cols(), p.aux_cols());
+    let c = sw - p.rank;
+    let row = ((sw + sl + so) * N) as u64;
+    let fs = FastSigma::new(p.sigma);
+    let degs = p.degs();
+    let half = K8::ONE.scale((Q + 1) / 2);
+    assert_eq!(shards.len(), ckeys.len());
+    // Per-device evaluation tables (the point is fixed for the opening).
+    let dps: Vec<DevPoint> = shards.iter().map(|sh| { almost_goldilocks_cuda::set_device(sh.dev).unwrap(); DevPoint::new(p, pt) }).collect();
+    almost_goldilocks_cuda::set_device(0).unwrap();
+    let dp0 = DevPoint::new(p, pt);
+    let b2 = |beta: &Vec<Vec<[i8; 64]>>, e: usize| -> [i8; 128] { std::array::from_fn(|i| beta[i / 64][e][i % 64]) };
+    for attempt in 0..p.attempts as u16 {
+        timing.attempts += 1;
+        // Masks of the device's columns, its A·u partial product, raw Ev
+        // sums and (last device) the identity error columns.
+        let t0 = Instant::now();
+        let parts: Vec<Result<ColPart, AuthError>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = shards.iter().zip(ckeys).zip(&dps).map(|((sh, ck), dp)| { let fs = &fs; sc.spawn(move || -> Result<ColPart, AuthError> {
+                almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
+                let nc = sh.c1 - sh.c0;
+                let mut uw = DeviceBuffer::<i64>::new(2 * nc * N).unwrap();
+                for r in 0..p.tau {
+                    unsafe { sample_into(coins, opening, attempt, fs, (r as u64 * row + (sh.c0 * N) as u64) as u32, (nc * N) as u32, uw.as_mut_ptr().add(r * nc * N)).map_err(AuthError::Sampler)?; }
+                }
+                let part = match &ck.key { Some(k) => partial_raw(k, 5, uw.as_ptr() as *const c_void, 8, 2, c.min(sh.c1) - sh.c0, nc * N, None).to_vec().unwrap(), None => Vec::new() };
+                let pm = [0, 1].map(|r| dp.ev_part(unsafe { uw.as_ptr().add(r * nc * N) } as *const c_void, 8, sh.c0, nc));
+                let err = (sh.c1 > c).then(|| [0, 1].map(|r| {
+                    let mut e = vec![0i64; p.rank * N];
+                    let src = unsafe { uw.as_ptr().add((r * nc + (c - sh.c0)) * N) };
+                    assert_eq!(unsafe { ffi::cuda_memcpy_dtoh(e.as_mut_ptr() as *mut c_void, src as *const c_void, p.rank * N * 8) }, 0);
+                    e
+                }));
+                Ok(ColPart { uw, part, pm, err })
+            }) }).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut parts: Vec<ColPart> = parts.into_iter().collect::<Result<_, _>>()?;
+        almost_goldilocks_cuda::set_device(0).unwrap();
+        // Link and auxiliary masks (device 0).
+        let mut ul = DeviceBuffer::<i64>::new(2 * sl * N).unwrap();
+        let mut uo = DeviceBuffer::<i64>::new(2 * so * N).unwrap();
+        for r in 0..p.tau {
+            let b = r as u64 * row;
+            unsafe {
+                sample_into(coins, opening, attempt, &fs, (b + (sw * N) as u64) as u32, (sl * N) as u32, ul.as_mut_ptr().add(r * sl * N)).map_err(AuthError::Sampler)?;
+                sample_into(coins, opening, attempt, &fs, (b + ((sw + sl) * N) as u64) as u32, (so * N) as u32, uo.as_mut_ptr().add(r * so * N)).map_err(AuthError::Sampler)?;
+            }
+        }
+        timing.sample_ms += t0.elapsed().as_secs_f64() * 1e3;
+        // First message.
+        let t0 = Instant::now();
+        let mut acc: Option<DeviceBuffer<u32>> = None;
+        for pc in parts.iter().filter(|x| !x.part.is_empty()) {
+            let d = DeviceBuffer::from_slice(&pc.part).unwrap();
+            match acc.as_mut() { Some(a) => super::commit_gpu::add(a, &d, 2, 5, p.rank), None => acc = Some(d) }
+        }
+        let cw = ring_rows(finish(acc.expect("source key columns"), 2, 5, p.rank, None).to_vec().unwrap(), p.rank);
+        let cl = ring_rows(finish(partial_raw(&keys.l, 5, ul.as_ptr() as *const c_void, 8, 2, sl - p.rank, sl * N, None), 2, 5, p.rank, None).to_vec().unwrap(), p.rank);
+        let co = ring_rows(finish(partial_raw(&keys.o, 5, uo.as_ptr() as *const c_void, 8, 2, so - p.rank, so * N, None), 2, 5, p.rank, None).to_vec().unwrap(), p.rank);
+        let add_e = |cm: &Vec<Vec<u64>>, e: &[i64]| -> Vec<Vec<u64>> {
+            cm.iter().enumerate().map(|(i, rw)| rw.iter().enumerate().map(|(j, &v)| {
+                let x = e[i * N + j];
+                let xe = if x >= 0 { x as u64 } else { Q - x.unsigned_abs() };
+                ((v as u128 + xe as u128) % Q as u128) as u64
+            }).collect()).collect()
+        };
+        let dev_err = |base: *const i64, cols: usize, r: usize| -> Vec<i64> {
+            let mut e = vec![0i64; p.rank * N];
+            let src = unsafe { base.add((r * cols + cols - p.rank) * N) };
+            assert_eq!(unsafe { ffi::cuda_memcpy_dtoh(e.as_mut_ptr() as *mut c_void, src as *const c_void, p.rank * N * 8) }, 0);
+            e
+        };
+        let werr = parts.iter().find_map(|x| x.err.clone()).expect("identity error columns");
+        let (mut d, mut d_o) = (Vec::new(), Vec::new());
+        for r in 0..p.tau {
+            let mut pm = vec![0u64; 512];
+            for x in &parts { add_mod(&mut pm, &x.pm[r]); }
+            let hl = h_of(&decode(unsafe { ul.as_ptr().add(r * sl * N) }, A_ENC_COLS), 0);
+            let a = dp0.ev_finish(&pm).add(&hl.scale_k(&dp0.rho_f));
+            d.push(Tuple { c: add_e(&cw[r], &werr[r]), g: add_e(&cl[r], &dev_err(ul.as_ptr(), sl, r)), a });
+            let dec = decode(unsafe { uo.as_ptr().add(r * so * N) }, A_ENC_COLS * p.aux_coeffs);
+            let mut t = AElem::zero();
+            for (i, &dg) in degs.iter().enumerate() {
+                let mut xp = K8::ONE;
+                for k in 1..=dg {
+                    xp = xp.mul(&dp0.x[i]);
+                    t = t.add(&h_of(&dec, A_ENC_COLS * aux_index(&degs, i, k)).scale_k(&xp.sub(&half)));
+                }
+            }
+            d_o.push(AuxTuple { c: add_e(&co[r], &dev_err(uo.as_ptr(), so, r)), t });
+        }
+        timing.first_msg_ms += t0.elapsed().as_secs_f64() * 1e3;
+        // Responses.
+        let t0 = Instant::now();
+        let beta = super::auth::challenges_pub(tr, &d, &d_o, attempt, n);
+        let bb: Vec<i8> = (0..n).flat_map(|e| b2(&beta, e)).collect();
+        let zws: Vec<DeviceBuffer<i64>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = shards.iter().zip(parts.iter_mut()).map(|(sh, pc)| { let bb = &bb; sc.spawn(move || {
+                almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
+                let nc = sh.c1 - sh.c0;
+                let mut zw = pc.uw.clone_on_device().unwrap();
+                let vp: Vec<*const u8> = (0..sh.nsrc).map(|s| unsafe { sh.raw.as_ptr().add(s * nc * 1024) }).collect();
+                let rc = unsafe { ffi::agl_mauth_combine_packed(vp.as_ptr(), sh.nsrc as i32, nc as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(nc * N)) };
+                assert_eq!(rc, 0, "packed combine");
+                zw
+            }) }).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        almost_goldilocks_cuda::set_device(0).unwrap();
+        let mut zl = ul.clone_on_device().unwrap();
+        let vl: Vec<*const i8> = (0..n).map(|e| unsafe { r_all.as_ptr().add(e * sl * N) }).collect();
+        unsafe { assert_eq!(ffi::agl_mauth_combine_multi(vl.as_ptr(), n as i32, sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N)), 0); }
+        let mut zo = uo.clone_on_device().unwrap();
+        let bo = b2(&beta, n);
+        unsafe { assert_eq!(ffi::agl_mauth_combine(s_o.as_ptr(), so as i32, bo.as_ptr(), zo.as_mut_ptr(), zo.as_mut_ptr().add(so * N)), 0); }
+        timing.respond_ms += t0.elapsed().as_secs_f64() * 1e3;
+        // Decision: exact norms summed over devices.
+        let t0 = Instant::now();
+        let mut caps = true;
+        let (mut nu, mut nz) = (0u128, 0u128);
+        let norms: Vec<[(u128, u64, u128); 2]> = std::thread::scope(|sc| {
+            let hs: Vec<_> = shards.iter().zip(&parts).zip(&zws).map(|((sh, pc), zw)| sc.spawn(move || {
+                almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
+                let len = (sh.c1 - sh.c0) * N;
+                [0, 1].map(|r| { let (zn, zm) = norm(unsafe { zw.as_ptr().add(r * len) }, len); let (un, _) = norm(unsafe { pc.uw.as_ptr().add(r * len) }, len); (zn, zm, un) })
+            })).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        almost_goldilocks_cuda::set_device(0).unwrap();
+        for r in 0..p.tau {
+            let (zn, zmax, un) = norms.iter().fold((0u128, 0u64, 0u128), |a, x| (a.0 + x[r].0, a.1.max(x[r].1), a.2 + x[r].2));
+            nu += un; nz += zn;
+            if zmax >= p.b_z || zn > p.r2(sw * N) { caps = false; }
+        }
+        for (ub, zb, cols) in [(&ul, &zl, sl), (&uo, &zo, so)] {
+            for r in 0..p.tau {
+                let (zn, zmax) = norm(unsafe { zb.as_ptr().add(r * cols * N) }, cols * N);
+                let (un, _) = norm(unsafe { ub.as_ptr().add(r * cols * N) }, cols * N);
+                nu += un; nz += zn;
+                if zmax >= p.b_z || zn > p.r2(cols * N) { caps = false; }
+            }
+        }
+        let mut verdict = Coin::Reject;
+        if caps {
+            let x = Ratio { num: BigInt::from(nu) - BigInt::from(nz), den: BigInt::from(2u128 * p.sigma as u128 * p.sigma as u128) };
+            let mut a = Address::new(Purpose::ProtocolCoin, opening);
+            a.attempt = attempt;
+            let mut st = coins.stream(a);
+            let mut ub = BigUint::from(0u8);
+            for _ in 0..rejection::B { ub = (ub << 1u32) + BigUint::from(st.next_bit().map_err(|_| AuthError::CoinAbort)?); }
+            verdict = rejection::decide(&x, &ub);
+        }
+        timing.decide_ms += t0.elapsed().as_secs_f64() * 1e3;
+        match verdict {
+            Coin::Accept => {
+                let t = Instant::now();
+                // Row-major responses: row r is every device's columns in order.
+                let w = if keep_z {
+                    let pieces: Vec<[Vec<u8>; 2]> = std::thread::scope(|sc| {
+                        let hs: Vec<_> = shards.iter().zip(&zws).map(|(sh, zw)| sc.spawn(move || {
+                            almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
+                            let len = (sh.c1 - sh.c0) * N;
+                            [0, 1].map(|r| {
+                                let mut s = DeviceBuffer::<i64>::new(len).unwrap(); s.copy_range_from_device(0, zw, r * len, len).unwrap();
+                                pack_dev(p, &s)
+                            })
+                        })).collect();
+                        hs.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    almost_goldilocks_cuda::set_device(0).unwrap();
+                    let mut w = Vec::with_capacity(pieces.iter().map(|x| x[0].len() + x[1].len()).sum());
+                    for r in 0..p.tau { for x in &pieces { w.extend_from_slice(&x[r]); } }
+                    w
+                } else { Vec::new() };
+                let z = if keep_z { Responses { w, l: pack_dev(p, &zl), o: pack_dev(p, &zo) } } else { Responses::default() };
+                timing.extract_ms += t.elapsed().as_secs_f64() * 1e3;
+                return Ok((AuthProof { attempt, d, d_o, z }, None));
+            }
+            Coin::Reject => {}
+            Coin::Abort => return Err(AuthError::CoinAbort),
+        }
+    }
+    Err(AuthError::Exhausted)
+}
