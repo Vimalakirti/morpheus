@@ -634,7 +634,10 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         let mut fed = None;
         let c_req = if stream {
             pc.streamed = true;
-            if o.auth && o.auth_gpus > 1 && std::env::var("MORPHEUS_AUTH_COLS").as_deref() != Ok("0") { pc.use_cols((0..o.auth_gpus as i32).collect()); }
+            // Column-sharded authentication covers full support only; a
+            // partial support (e.g. PointPillars) uses the kept shards.
+            let full = runs.iter().map(|&(a, b)| b - a).sum::<usize>() == o.profile.source_cols();
+            if o.auth && o.auth_gpus > 1 && full && std::env::var("MORPHEUS_AUTH_COLS").as_deref() != Ok("0") { pc.use_cols((0..o.auth_gpus as i32).collect()); }
             // Registered sources keep their registered commitments; only the
             // request's own sources are committed (MORPHEUS_RECHECK_MODEL=1
             // recommits every source, checked against registration below).
