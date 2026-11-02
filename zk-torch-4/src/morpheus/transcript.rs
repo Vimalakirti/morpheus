@@ -466,10 +466,18 @@ impl MTranscript {
         unrank_k(r, k)
     }
     pub fn challenge_c0_tuple(&mut self, stage: Stage, attempt: u64, count: usize) -> Vec<[i8; 64]> {
-        let mut r = self.query(ChalType::C0Tuple, stage, attempt, 0, count);
-        (0..count).map(|_| {
+        let r = self.query(ChalType::C0Tuple, stage, attempt, 0, count);
+        // Base-4 digits, least significant first: digit j is bits 2j..2j+2
+        // of the rank (read from its limbs; shifting the rank each digit is
+        // quadratic in the count).
+        let limbs = r.to_u64_digits();
+        (0..count).map(|i| {
             let mut out = [0i8; 64];
-            for v in &mut out { *v = [-2, -1, 1, 2][(&r % 4u32).to_usize().unwrap()]; r >>= 2; }
+            for (k, v) in out.iter_mut().enumerate() {
+                let j = i * 64 + k;
+                let d = limbs.get(j / 32).map_or(0, |w| (w >> (2 * (j % 32))) & 3);
+                *v = [-2, -1, 1, 2][d as usize];
+            }
             out
         }).collect()
     }
@@ -501,6 +509,24 @@ mod tests {
             c.absorb(Item::FirstMessage, &[1]); d.absorb(Item::FirstMessage, &[1]);
             assert_eq!(c.challenge_k_not01(Stage::LinkRound, 0, 3), d.challenge_k_not01(Stage::LinkRound, 0, 3));
             t.absorb(Item::FirstMessage, &[6]);
+        }
+    }
+    #[test]
+    fn c0_tuple_digits_equal_shifting() {
+        let mut t = MTranscript::new("p", &[5u8; 64]);
+        t.absorb(Item::FirstMessage, &[1, 2, 3]);
+        for count in [1usize, 3, 37] {
+            let mut a = t.clone();
+            let mut b = t.clone();
+            let fast = a.challenge_c0_tuple(Stage::AuthColumn, 2, count);
+            let mut r = b.query(ChalType::C0Tuple, Stage::AuthColumn, 2, 0, count);
+            let slow: Vec<[i8; 64]> = (0..count).map(|_| {
+                let mut out = [0i8; 64];
+                for v in &mut out { *v = [-2, -1, 1, 2][(&r % 4u32).to_usize().unwrap()]; r >>= 2; }
+                out
+            }).collect();
+            assert_eq!(fast, slow);
+            assert_eq!(a.prefix, b.prefix);
         }
     }
     #[test]

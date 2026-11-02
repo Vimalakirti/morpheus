@@ -41,8 +41,10 @@ refuses debug overrides (`NO_AUTH`, `NO_VERIFY`, fixed coins).
 
 Host memory (905 GB) and the exact conformance gadgets bound some shapes:
 
-* LLaMA2-7B, LLaMA3-8B and GPT-J-6B: full width and vocabulary,
-  `LLM_LAYERS=4` layers. Witnesses take about 30 GB per layer.
+* LLaMA2-7B, LLaMA3-8B and GPT-J-6B run at full depth (32, 32 and 28
+  layers), width and vocabulary, one monolithic request each
+  (`LLM_MONO`, `LLM_MODES`). A request's witness takes about 36 minutes
+  and the run peaks near 670 GB of host memory.
 * YOLOv11n at 320x320. At 640x640 the exact SiLU range checks need about
   1,860 sources.
 * PointPillars on a 64x64 grid with 1,024 pillars. Exact private grid

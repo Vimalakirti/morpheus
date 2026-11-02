@@ -107,12 +107,12 @@ sel() { [ -z "${SEL// /}" ] && return 0; for w in $SEL; do [ "$w" = "$1" ] && re
 # the one-GPU scaling rows (g1).
 C_gpt2=(e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=24 MODEL=gpt2 NUM_LAYERS=12 SEQ_LEN=128 VOCAB_SIZE=50257)
 C_bert=(e2e "${TW[@]}" ZK4_TABLE_SIZE_LOG=10 MODEL=bert NUM_LAYERS=24 SEQ_LEN=128)
-# The 6B-8B LLMs at full width and vocabulary, LLM_LAYERS of their layers:
-# the full models' witnesses exceed host memory (~30 GB per layer).
-LL=${LLM_LAYERS:-4}
-C_llama2=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=llama2 NUM_LAYERS=$LL SEQ_LEN=128 NUM_HEADS=32 HEAD_DIM=128 FFN_DIM=11008 FFN_SHARDS=1 VOCAB_SIZE=32000)
-C_llama3=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=llama3 NUM_LAYERS=$LL SEQ_LEN=128 NUM_HEADS=32 NUM_KV_HEADS=8 HEAD_DIM=128 FFN_DIM=14336 VOCAB_SIZE=128256)
-C_gptj=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=gptj NUM_LAYERS=$LL SEQ_LEN=128 NUM_HEADS=16 HEAD_DIM=256 FFN_DIM=16384 VOCAB_SIZE=50400)
+# The 6B-8B LLMs at full depth, width and vocabulary (32, 32 and 28 layers).
+# A request's witness takes ~36 minutes and ~670 GB of host memory, so each
+# runs one monolithic request (LLM_MONO, LLM_MODES).
+C_llama2=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=llama2 NUM_LAYERS=32 SEQ_LEN=128 NUM_HEADS=32 HEAD_DIM=128 FFN_DIM=11008 FFN_SHARDS=1 VOCAB_SIZE=32000)
+C_llama3=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=llama3 NUM_LAYERS=32 SEQ_LEN=128 NUM_HEADS=32 NUM_KV_HEADS=8 HEAD_DIM=128 FFN_DIM=14336 VOCAB_SIZE=128256)
+C_gptj=(e2e "${TW[@]}" REQ_PLANES_LOG=5 ZK4_TABLE_SIZE_LOG=24 MODEL=gptj NUM_LAYERS=28 SEQ_LEN=128 NUM_HEADS=16 HEAD_DIM=256 FFN_DIM=16384 VOCAB_SIZE=50400)
 C_resnet=(hook:bench_streaming_resnet:cv_config.yaml:1 NUM_LAYERS=53 INPUT_SIZE=224 ZK4_TABLE_SIZE_LOG=12)
 C_vgg=(hook:bench_streaming_vgg:cv_config.yaml:1 VGG_VARIANT=16 NUM_LAYERS=13 INPUT_SIZE=32 ZK4_TABLE_SIZE_LOG=12)
 # YOLOv11n at 320x320 (640x640 needs ~1,860 sources: the exact SiLU range checks).
@@ -131,7 +131,11 @@ MODELS=(gpt2:GPT-2 bert:BERT-Large llama2:LLaMA2-7B llama3:LLaMA3-8B gptj:GPT-J-
 cfg() { local v="C_$1[@]"; printf '%s\0' "${!v}"; }
 for mn in "${MODELS[@]}"; do
   k=${mn%%:*}; sel "$k" || continue
-  mapfile -d '' c < <(cfg "$k"); run "${mn#*:}" "${c[@]}"
+  mapfile -d '' c < <(cfg "$k")
+  case $k in
+    llama2|llama3|gptj) N_MONO=${LLM_MONO:-1} MODES=${LLM_MODES:-mono} run "${mn#*:}" "${c[@]}" ;;
+    *) run "${mn#*:}" "${c[@]}" ;;
+  esac
 done
 
 # ---- Comparisons (selected explicitly, never part of the default set) ----
@@ -166,7 +170,7 @@ CNNFX=${CNNFX:-${DP_WORK:-deepprove_work}/cnn_fixtures}
 # Source-sharding scaling: the same monolithic requests on one GPU (models
 # whose sources fit one device; the LLMs need the memory of four).
 # One-GPU scaling rows (g1): the same configurations on one device. The
-# 6B-8B LLMs are left out (one GPU cannot hold their four-layer requests).
+# 6B-8B LLMs are left out (one GPU cannot hold their requests).
 # G1_MODELS (e.g. "yolo unet3d") restricts the set.
 want_x g1 && MODES=mono && for mn in "${MODELS[@]}"; do
   k=${mn%%:*}; case $k in llama2|llama3|gptj) continue;; esac

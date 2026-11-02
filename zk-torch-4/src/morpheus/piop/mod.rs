@@ -391,11 +391,14 @@ impl ProverData {
         #[cfg(feature = "cuda")]
         {
         // Reverse topological use order is roughly reverse edge order; stop at
-        // half the budget so on-demand uploads do not evict the prefetch.
+        // half the budget so on-demand uploads do not evict the prefetch
+        // (all of them when every large edge fits the budget).
+        let total: usize = self.vals.iter().flatten().filter(|v| v.len() >= gpu::threshold()).map(|v| v.len() * 8).sum();
+        let cap = if total <= gpu::edge_budget() { total } else { gpu::edge_budget() / 2 };
         for e in (0..self.vals.len()).rev() {
             if let Some(v) = &self.vals[e] {
                 if v.len() >= gpu::threshold() {
-                    if self.cache.bytes() + v.len() * 8 > gpu::edge_budget() / 2 { break; }
+                    if self.cache.bytes() + v.len() * 8 > cap { break; }
                     let _ = self.cache.get(e, v);
                 }
             }
