@@ -35,7 +35,7 @@ pub struct PcsGpu {
     pub kept: std::sync::Mutex<Vec<super::link_gpu::Kept>>,
     /// Streamed request sources uploaded ahead of the link (device 0).
     /// Packed sources uploaded to device 0 during the PIOP (one device).
-    pub pre_raw: std::sync::Mutex<Option<DeviceBuffer<u8>>>,
+    pub pre_raw: std::sync::Mutex<Option<super::link_gpu::PreShards>>,
     /// Streamed, several authentication devices: the source block is split
     /// by columns (auth_gpu::prove_cols). `col_devs` are the devices; the
     /// column keys persist, the column shards are per opening.
@@ -310,7 +310,7 @@ impl LinkServices for PcsGpu {
     }
     fn dev_raw(&self) -> Option<&DeviceBuffer<i8>> { self.flat.as_ref() }
     fn kept(&self) -> Option<&std::sync::Mutex<Vec<super::link_gpu::Kept>>> { if self.streamed && self.col_devs.is_empty() { Some(&self.kept) } else { None } }
-    fn take_pre_raw(&self) -> Option<DeviceBuffer<u8>> { self.pre_raw.lock().unwrap().take() }
+    fn take_pre_raw(&self) -> Option<super::link_gpu::PreShards> { self.pre_raw.lock().unwrap().take() }
     fn ev(&mut self, p: &Profile, raw: &dyn super::packed::Sources, xi: &[K8]) -> Vec<AElem> {
         if self.streamed && !self.col_devs.is_empty() {
             // The link's shards are released; the column shards serve the

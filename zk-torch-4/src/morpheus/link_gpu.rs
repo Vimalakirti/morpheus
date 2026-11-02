@@ -124,6 +124,10 @@ struct TermC { pa: u32, aoff: u32, boff: u32, hl_off: u32, hh_off: u32, h1: u32,
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Blk { src: u32, id: u32, region: u32, k: u32 }
+#[derive(Clone, Copy)]
+struct RawBlk(*mut Blk);
+unsafe impl Send for RawBlk {}
+unsafe impl Sync for RawBlk {}
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ConstsC {
@@ -142,10 +146,55 @@ fn kvec(words: &[u64]) -> Vec<K8> { words.chunks(8).map(|c| K8(c.try_into().unwr
 /// messages, the point ξ, the final (w, q, χ) per source, Π eq(α_j, r_j) and
 /// the M_O prefix — exactly what the CPU phases produce.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// Link source shards uploaded ahead of the link (during the PIOP): the
+/// placement they follow and each device's buffer (None: upload later).
+pub struct PreShards { pub owner: Vec<usize>, pub bufs: Vec<Option<DeviceBuffer<u8>>> }
+
+/// Devices the link shards its sources over (MORPHEUS_GPUS).
+pub fn shard_gpus(n: usize) -> usize {
+    std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1).min(n.max(1))
+}
+
+/// Sources go to devices greedily by weighted load, from the raw digits and
+/// the declared bit blocks alone. Streamed mode with kept shards scales device 0
+/// down (MORPHEUS_SHARD0_WEIGHT, default 0.5): it also hosts the authentication.
+pub fn shard_owner(raw: &dyn crate::morpheus::packed::Sources, bits: &[Vec<(usize, usize)>], b0: usize, ngpu: usize, keep: bool) -> Vec<usize> {
+    let n = raw.count();
+    let wgen: usize = std::env::var("MORPHEUS_GEN_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let nblk = raw.src_len() >> b0;
+    let per_src: Vec<usize> = (0..n).into_par_iter().map(|s| {
+        let mut bit = vec![false; nblk];
+        for &(base, lg) in &bits[s] { let (a, c) = (base >> b0, 1usize << lg.saturating_sub(b0)); for x in bit.iter_mut().skip(a).take(c) { *x = true; } }
+        (0..nblk).into_par_iter().map(|k| if !raw.is_zero(s, k << b0, 1usize << b0) { if bit[k] { 1 } else { wgen } } else { 0 }).sum::<usize>()
+    }).collect();
+    let w0: f64 = if keep { std::env::var("MORPHEUS_SHARD0_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5) } else { 1.0 };
+    let cap: Vec<f64> = (0..ngpu).map(|g| if g == 0 { w0 } else { 1.0 }).collect();
+    let mut by_load: Vec<usize> = (0..n).collect();
+    by_load.sort_by_key(|&s| std::cmp::Reverse(per_src[s]));
+    let mut load = vec![0usize; ngpu];
+    let mut owner = vec![0usize; n];
+    for s in by_load {
+        let g = (0..ngpu).min_by(|&a, &b| ((load[a] + per_src[s] + 1) as f64 / cap[a]).partial_cmp(&((load[b] + per_src[s] + 1) as f64 / cap[b])).unwrap()).unwrap();
+        owner[s] = g;
+        load[g] += per_src[s] + 1;
+    }
+    owner
+}
+
+/// Device g's packed sources (those it owns, in order) on device g.
+pub fn shard_upload(raw: &dyn crate::morpheus::packed::Sources, owner: &[usize], g: usize) -> DeviceBuffer<u8> {
+    almost_goldilocks_cuda::set_device(g as i32).expect("set device");
+    let src_len = raw.src_len();
+    let srcs: Vec<usize> = (0..raw.count()).filter(|&s| owner[s] == g).collect();
+    let mut d = DeviceBuffer::<u8>::new((srcs.len() * src_len / 4).max(1)).expect("raw alloc");
+    for (j, &s) in srcs.iter().enumerate() { crate::morpheus::packed::upload_packed(raw, s, &mut d, j * src_len / 4); }
+    d
+}
+
 pub fn phases_v2(
     p: &Profile, st: &Statement, raw: &dyn crate::morpheus::packed::Sources, b0: usize, alpha: &[K8], eta: &K8, gp: &[K8],
     degs: &[usize], a_coef: &[Vec<K8>], tr: &mut MTranscript, dev_raw: Option<&DeviceBuffer<i8>>,
-    keep: Option<&std::sync::Mutex<Vec<Kept>>>, pre_raw: Option<DeviceBuffer<u8>>,
+    keep: Option<&std::sync::Mutex<Vec<Kept>>>, pre_raw: Option<PreShards>,
 ) -> (Vec<Vec<K8>>, Vec<K8>, Vec<K8>, Vec<K8>, Vec<K8>, K8, K8) {
     // The device sources are packed (two bits per digit, packed.rs); the
     // resident int8 copy of small requests is not used here.
@@ -158,40 +207,20 @@ pub fn phases_v2(
     // down (MORPHEUS_SHARD0_WEIGHT, default 0.5), it also hosts the
     // authentication.
     let n = raw.count();
-    let ngpu = std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1).min(n.max(1));
-    let wgen: usize = std::env::var("MORPHEUS_GEN_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let nblk = raw.src_len() >> b0;
-    let per_src: Vec<usize> = (0..n).into_par_iter().map(|s| {
-        let mut bit = vec![false; nblk];
-        for &(base, lg) in &st.bits[s] { let (a, c) = (base >> b0, 1usize << lg.saturating_sub(b0)); for x in bit.iter_mut().skip(a).take(c) { *x = true; } }
-        (0..nblk).into_par_iter().map(|k| if !raw.is_zero(s, k << b0, 1usize << b0) { if bit[k] { 1 } else { wgen } } else { 0 }).sum::<usize>()
-    }).collect();
-    let w0: f64 = if keep.is_some() { std::env::var("MORPHEUS_SHARD0_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5) } else { 1.0 };
-    let cap: Vec<f64> = (0..ngpu).map(|g| if g == 0 { w0 } else { 1.0 }).collect();
-    let mut by_load: Vec<usize> = (0..n).collect();
-    by_load.sort_by_key(|&s| std::cmp::Reverse(per_src[s]));
-    let mut load = vec![0usize; ngpu];
-    let mut owner = vec![0usize; n];
-    for s in by_load {
-        let g = (0..ngpu).min_by(|&a, &b| ((load[a] + per_src[s] + 1) as f64 / cap[a]).partial_cmp(&((load[b] + per_src[s] + 1) as f64 / cap[b])).unwrap()).unwrap();
-        owner[s] = g;
-        load[g] += per_src[s] + 1;
-    }
-    let src_len = raw.src_len();
-    // A single device's sources may already be resident (uploaded during the PIOP).
-    let mut pre_raw = if ngpu == 1 { pre_raw.filter(|b| b.len() == n * src_len / 4) } else { None };
+    let ngpu = shard_gpus(n);
+    // A placement made during the PIOP (with its uploaded shards) is reused;
+    // any placement gives the same proof.
+    let (owner, mut pre) = match pre_raw {
+        Some(pr) if pr.owner.len() == n && pr.bufs.len() == ngpu => (pr.owner, pr.bufs),
+        _ => (shard_owner(raw, &st.bits, b0, ngpu, keep.is_some()), Vec::new()),
+    };
+    pre.resize_with(ngpu, || None);
     std::thread::scope(|sc| {
         let ups: Vec<Option<std::thread::ScopedJoinHandle<'_, DeviceBuffer<u8>>>> = (0..ngpu).map(|g| {
             if g == 0 && dev_raw.is_some() { return None; }
-            if g == 0 { if let Some(b) = pre_raw.take() { return Some(sc.spawn(move || b)); } }
+            if let Some(b) = pre[g].take() { return Some(sc.spawn(move || b)); }
             let owner = &owner;
-            Some(sc.spawn(move || {
-                almost_goldilocks_cuda::set_device(g as i32).expect("set device");
-                let srcs: Vec<usize> = (0..n).filter(|&s| owner[s] == g).collect();
-                let mut d = DeviceBuffer::<u8>::new((srcs.len() * src_len / 4).max(1)).expect("raw alloc");
-                for (j, &s) in srcs.iter().enumerate() { crate::morpheus::packed::upload_packed(raw, s, &mut d, j * src_len / 4); }
-                d
-            }))
+            Some(sc.spawn(move || shard_upload(raw, owner, g)))
         }).collect();
         phases_v2_body(p, st, raw, b0, alpha, eta, gp, degs, a_coef, tr, dev_raw, keep, owner.clone(), ups)
     })
@@ -279,7 +308,7 @@ fn phases_v2_body<'u>(
     let onehot: Vec<bool> = regs.par_iter().map(|r| {
         if r.p == 0 || r.p > DENSE_P || !bits.contains(&(r.src, r.base)) { return false; }
         let np = 1usize << r.p;
-        (0..1usize << r.m).all(|k| raw.nonzeros(r.src, r.base + k * np, np) == (1, true))
+        (0..1usize << r.m).into_par_iter().with_min_len(1 << 12).all(|k| raw.nonzeros(r.src, r.base + k * np, np) == (1, true))
     }).collect();
     lap("one-hot detection");
     // Dense query tables (many-plane regions). When every dense region's terms
@@ -453,10 +482,26 @@ fn phases_v2_body<'u>(
     let no_claim = std::env::var("MORPHEUS_NO_CLAIM").is_ok();
     // Blocks grouped by region plane bits, so each round's one-hot list is a prefix.
     let is_oh = |b: &Blk| b.region != u32::MAX && regions_c[b.region as usize].flags & 2 != 0;
-    let mut oh: Vec<Blk> = blocks.iter().filter(|b| is_oh(b)).copied().collect();
-    // Descending (binned, p): in the reversed generic tail (unbinned by
-    // ascending p, then binned) each round's blocks form a prefix; see `in_gen`.
-    oh.sort_by_key(|b| { let r = &regions_c[b.region as usize]; std::cmp::Reverse((r.flags & 8 != 0, r.p)) });
+    lap("eq tables");
+    // One-hot blocks in a stable parallel bucket pass on the small key
+    // (binned, p), descending.
+    let oh: Vec<Blk> = {
+        let key = |b: &Blk| -> usize { if !is_oh(b) { return 256; } let r = &regions_c[b.region as usize]; 255 - (((r.flags & 8 != 0) as usize) * 128 + r.p as usize).min(255) };
+        let ch = blocks.len().div_ceil(256).max(1 << 14);
+        let hist: Vec<[usize; 256]> = blocks.par_chunks(ch).map(|c| { let mut h = [0usize; 256]; for b in c { let k = key(b); if k < 256 { h[k] += 1; } } h }).collect();
+        let mut off = vec![[0usize; 256]; hist.len()];
+        let mut tot = 0usize;
+        for k in 0..256 { for (c, h) in hist.iter().enumerate() { off[c][k] = tot; tot += h[k]; } }
+        let mut out: Vec<Blk> = Vec::with_capacity(tot);
+        let ptr = RawBlk(out.as_mut_ptr());
+        blocks.par_chunks(ch).zip(off.into_par_iter()).for_each(|(c, mut o)| {
+            let ptr = ptr;
+            for b in c { let k = key(b); if k < 256 { unsafe { ptr.0.add(o[k]).write(*b); } o[k] += 1; } }
+        });
+        unsafe { out.set_len(tot); }
+        out
+    };
+    lap("one-hot order");
     let maxp_oh = oh.iter().map(|b| regions_c[b.region as usize].p as usize).max().unwrap_or(0);
     let n_gen_base = blocks.len() - oh.len();
     if tm { eprintln!("[link2] {} nonzero blocks ({} one-hot), {} regions, {} terms, {} region blocks, {} dense tables, {} GPUs", blocks.len(), oh.len(), regions_c.len(), order.len(), rid.len(), qtabs.len() / tsz, ups.len()); }
@@ -474,11 +519,13 @@ fn phases_v2_body<'u>(
                 let srcs: Vec<usize> = (0..n).filter(|&s| owner[s] == g).collect();
                 let mut loc = vec![u32::MAX; n];
                 if global { for s in 0..n { loc[s] = s as u32; } } else { for (j, &s) in srcs.iter().enumerate() { loc[s] = j as u32; } }
+                let t_sh = std::time::Instant::now();
                 let raw_own = if global { None } else { Some(up.expect("shard upload").join().expect("raw upload")) };
+                let t_raw = t_sh.elapsed().as_secs_f64() * 1e3;
                 let mine = |b: &Blk| owner[b.src as usize] == g;
                 let rl = |b: &Blk| Blk { src: loc[b.src as usize], ..*b };
-                let gen_base: Vec<Blk> = blocks.iter().filter(|b| mine(b) && !(b.region != u32::MAX && regions_c[b.region as usize].flags & 2 != 0)).map(rl).collect();
-                let oh_g: Vec<Blk> = oh.iter().filter(|b| mine(b)).map(rl).collect();
+                let gen_base: Vec<Blk> = blocks.par_iter().filter(|b| mine(b) && !(b.region != u32::MAX && regions_c[b.region as usize].flags & 2 != 0)).map(rl).collect();
+                let oh_g: Vec<Blk> = oh.par_iter().filter(|b| mine(b)).map(rl).collect();
                 let mut gen_all = gen_base.clone();
                 gen_all.extend(oh_g.iter().rev().copied());
                 // Per-block constant slots: cr, cb and one per region term.
@@ -523,6 +570,7 @@ fn phases_v2_body<'u>(
                 let c0 = sh.consts(&d_t0, 0, 0, dptr(&sh.qd));
                 let rc = unsafe { ffi::agl_mlink2_consts(sh.gen_all.as_ptr() as *const c_void, gen_all.len() as u32, &c0 as *const ConstsC as *const c_void, sh.bc.as_mut_ptr()) };
                 assert_eq!(rc, 0, "block constants");
+                if tm { eprintln!("[link2]   shard {g}: raw wait {t_raw:.0} ms, tables {:.0} ms", t_sh.elapsed().as_secs_f64() * 1e3 - t_raw); }
                 sh
             })
         }).collect();
@@ -649,17 +697,21 @@ fn phases_v2_body<'u>(
                         }
                     }
                     os.u4 = vec![K8::ZERO; os.u.len() / 2];
-                    for &(k, kw) in &bin_terms {
+                    // Per term (distinct slots kw): its U4 rows and W bins.
+                    let per: Vec<(usize, Vec<K8>, Vec<K8>)> = bin_terms.par_iter().map(|&(k, kw)| {
                         let (r0, r1) = (terms[order[k]].r[0], terms[order[k]].r[1]);
+                        let mut u4 = vec![K8::ZERO; 64];
                         for par in 0..2 {
                             for s in 0..16 {
-                                os.u4[(kw * 2 + par) * 32 + s] = K8::ONE.sub(&r1).mul(&os.u[(kw * 4 + par) * 32 + s]).add(&r1.mul(&os.u[(kw * 4 + 2 + par) * 32 + s]));
+                                u4[par * 32 + s] = K8::ONE.sub(&r1).mul(&os.u[(kw * 4 + par) * 32 + s]).add(&r1.mul(&os.u[(kw * 4 + 2 + par) * 32 + s]));
                             }
                         }
-                        for s in 0..16 {
-                            let v = K8::ONE.sub(&r0).mul(&os.u4[(kw * 2) * 32 + s]).add(&r0.mul(&os.u4[(kw * 2 + 1) * 32 + s]));
-                            os.w[kw * 32 + s] = os.w[kw * 32 + s].add(&v);
-                        }
+                        let w: Vec<K8> = (0..16).map(|s| K8::ONE.sub(&r0).mul(&u4[s]).add(&r0.mul(&u4[32 + s]))).collect();
+                        (kw, u4, w)
+                    }).collect();
+                    for (kw, u4, w) in per {
+                        os.u4[kw * 64..kw * 64 + 64].copy_from_slice(&u4);
+                        for s in 0..16 { os.w[kw * 32 + s] = os.w[kw * 32 + s].add(&w[s]); }
                     }
                 }
             }
@@ -889,6 +941,8 @@ fn onehot_sums(
     raw_ptr: *const u8, src_len: u64, b0: usize, consts: &ConstsC, oh: &[Blk], d_bc: &DeviceBuffer<u64>,
     n_gen_base: usize, regions_c: &[RegionC], alpha: &[K8], nterms: usize, b5: &[K8],
 ) -> OhSums {
+    let t0 = std::time::Instant::now();
+    let sync = || { almost_goldilocks_cuda::synchronize().ok(); t0.elapsed().as_secs_f64() * 1e3 };
     let maxp = regions_c.iter().map(|r| r.p as usize).max().unwrap_or(0);
     let (mut eai, mut eai_off) = (Vec::new(), Vec::new());
     for pp in 0..=maxp {
@@ -899,14 +953,14 @@ fn onehot_sums(
     let d_eai_off = DeviceBuffer::from_slice(&eai_off).unwrap();
     let d_oh = upload(oh);
     let ng = 6 * 32 * 2;
-    let d_g = DeviceBuffer::from_slice(&vec![0u64; ng * 16]).unwrap();
-    let d_w = DeviceBuffer::from_slice(&vec![0u64; nterms.max(1) * 32 * 16]).unwrap();
+    let d_g = { let mut x = DeviceBuffer::<u64>::new(ng * 16).unwrap(); x.zero().unwrap(); x };
+    let d_w = { let mut x = DeviceBuffer::<u64>::new(nterms.max(1) * 32 * 16).unwrap(); x.zero().unwrap(); x };
     let nu = nterms.max(1) * 4 * 32;
     let nj = 2 * 256;
-    let d_u = DeviceBuffer::from_slice(&vec![0u64; nu * 16]).unwrap();
-    let d_j = DeviceBuffer::from_slice(&vec![0u64; nj * 16]).unwrap();
+    let d_u = { let mut x = DeviceBuffer::<u64>::new(nu * 16).unwrap(); x.zero().unwrap(); x };
+    let d_j = { let mut x = DeviceBuffer::<u64>::new(nj * 16).unwrap(); x.zero().unwrap(); x };
     let ngv = 2 * 2 * 32;
-    let d_gv = DeviceBuffer::from_slice(&vec![0u64; ngv * 16]).unwrap();
+    let d_gv = { let mut x = DeviceBuffer::<u64>::new(ngv * 16).unwrap(); x.zero().unwrap(); x };
     let any_bin = oh.iter().any(|b| regions_c[b.region as usize].flags & 8 != 0);
     let (nj5, j5_rep) = (2 * 65536, 8);
     let mut d_j5 = DeviceBuffer::<u64>::new(if any_bin { j5_rep * nj5 * 16 } else { 16 }).unwrap();
@@ -919,6 +973,7 @@ fn onehot_sums(
     // suffix (onehot_pre_kernel); each kernel gets only its range. Block k of
     // a range starting at s0 (length n) has constants at
     // bco[oh_base + N − 1 − (s0 + k)] = bco[oh_base' + n − 1 − k], oh_base' = oh_base + N − s0 − n.
+    let t_set = sync();
     let nbin = oh.partition_point(|b| regions_c[b.region as usize].flags & 8 != 0);
     let n_all = oh.len();
     let blk_sz = std::mem::size_of::<Blk>();
@@ -932,6 +987,7 @@ fn onehot_sums(
         };
         assert_eq!(rc, 0, "one-hot sums");
     }
+    let t_pre = sync();
     if any_bin {
         let d_ea1 = up_k(&eq_table(&alpha[5..b0]));
         let d_ea5 = up_k(&eq_table(&alpha[6..b0]));
@@ -945,13 +1001,27 @@ fn onehot_sums(
         };
         assert_eq!(rc, 0, "one-hot bins");
     }
+    let t_bin = sync();
     let halves = |v: Vec<u64>| -> Vec<K8> {
         const Q: u128 = 18446744069414584289;
-        v.chunks(16).map(|c| K8(std::array::from_fn(|w| ((c[2 * w] as u128 + ((c[2 * w + 1] as u128 % Q) << 32)) % Q) as u64))).collect()
+        v.par_chunks(16).map(|c| K8(std::array::from_fn(|w| ((c[2 * w] as u128 + ((c[2 * w + 1] as u128 % Q) << 32)) % Q) as u64))).collect()
     };
-    OhSums {
-        g: halves(d_g.read_slice(0, ng * 16).unwrap()), w: halves(d_w.read_slice(0, nterms.max(1) * 32 * 16).unwrap()),
-        u: halves(d_u.read_slice(0, nu * 16).unwrap()), j: halves(d_j.read_slice(0, nj * 16).unwrap()),
+    // Large accumulators are reduced to field elements on the device: half the readback.
+    let reduced = |d: &DeviceBuffer<u64>, n: usize| -> Vec<K8> {
+        let d_s = DeviceBuffer::<u64>::new(n * 8).unwrap();
+        assert_eq!(unsafe { ffi::agl_mlink2_rep_reduce(d.as_ptr(), 1, n as u64, d_s.as_ptr() as *mut u64) }, 0);
+        // Pages faulted in parallel, then one copy straight into the K8s.
+        let mut v = vec![K8::ZERO; 0];
+        v.reserve_exact(n);
+        unsafe { v.set_len(n); }
+        v.par_chunks_mut(1 << 14).for_each(|c| c.fill(K8::ZERO));
+        let w = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u64, n * 8) };
+        d_s.copy_to_slice(w).unwrap();
+        v
+    };
+    let out = OhSums {
+        g: halves(d_g.read_slice(0, ng * 16).unwrap()), w: reduced(&d_w, nterms.max(1) * 32),
+        u: if any_bin { reduced(&d_u, nu) } else { vec![K8::ZERO; nu] }, j: halves(d_j.read_slice(0, nj * 16).unwrap()),
         gv: halves(d_gv.read_slice(0, ngv * 16).unwrap()),
         j5: if any_bin {
             // Replicas summed on the device: 1/8 of the readback.
@@ -960,7 +1030,9 @@ fn onehot_sums(
             kvec(&d_s.to_vec().unwrap())
         } else { vec![K8::ZERO; nj5] },
         u4: Vec::new(),
-    }
+    };
+    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link2]   one-hot sums: {nterms} terms, {:.0} MB readback; setup {t_set:.0} pre {:.0} bin {:.0} read {:.0} ms", (ng + nterms.max(1) * 32 + nu + nj + ngv) as f64 * 128.0 / 1e6, t_pre - t_set, t_bin - t_pre, sync() - t_bin); }
+    out
 }
 
 /// Round-0 B table segments: per term its index coordinates (flattened K8
@@ -1045,17 +1117,16 @@ fn binned_round5(os: &OhSums, bin_terms: &[(usize, usize)], e: &[K8], a_all: &[K
         c[3] = c[3].add(&j3.mul(&dl2.mul(&dl)));
         c
     }).reduce(|| [K8::ZERO; 7], |mut x, y| { for (a, b) in x.iter_mut().zip(&y) { *a = a.add(b); } x });
-    for &(k, kw) in bin_terms {
+    let q = bin_terms.par_iter().map(|&(k, kw)| {
         let u = |b: usize| (0..2).fold(K8::ZERO, |acc, kk| (0..16).fold(acc, |acc, s| acc.add(&e[16 * kk + s].mul(&os.u[(kw * 4 + b * 2 + kk) * 32 + s]))));
         let (u0, u1) = (u(0), u(1));
         let aoff = tc[k].aoff as usize;
         debug_assert_eq!(tc[k].pa, 0);
         let (a0, a1) = (a_all[aoff], a_all[aoff + 1]);
         let (p0, x, p1) = (a0.mul(&u0), a0.mul(&u1).add(&a1.mul(&u0)), a1.mul(&u1));
-        c[4] = c[4].add(&p0);
-        c[5] = c[5].add(&x.sub(&two.mul(&p0)));
-        c[6] = c[6].add(&p0.sub(&x).add(&p1));
-    }
+        [p0, x.sub(&two.mul(&p0)), p0.sub(&x).add(&p1)]
+    }).reduce(|| [K8::ZERO; 3], |a, b| [a[0].add(&b[0]), a[1].add(&b[1]), a[2].add(&b[2])]);
+    for j in 0..3 { c[4 + j] = c[4 + j].add(&q[j]); }
     c
 }
 
@@ -1064,7 +1135,7 @@ fn binned_round5(os: &OhSums, bin_terms: &[(usize, usize)], e: &[K8], a_all: &[K
 struct OhSums { g: Vec<K8>, w: Vec<K8>, u: Vec<K8>, j: Vec<K8>, gv: Vec<K8>, j5: Vec<K8>, u4: Vec<K8> }
 impl OhSums {
     fn add(&self, o: &OhSums) -> OhSums {
-        let f = |a: &[K8], b: &[K8]| a.iter().zip(b).map(|(x, y)| x.add(y)).collect();
+        let f = |a: &[K8], b: &[K8]| a.par_iter().zip(b).map(|(x, y)| x.add(y)).collect();
         OhSums { g: f(&self.g, &o.g), w: f(&self.w, &o.w), u: f(&self.u, &o.u), j: f(&self.j, &o.j), gv: f(&self.gv, &o.gv), j5: f(&self.j5, &o.j5), u4: Vec::new() }
     }
 }
@@ -1090,7 +1161,7 @@ fn binned_round(os: &OhSums, bin_terms: &[(usize, usize)], e: &[K8], a_all: &[K8
             c[3] = c[3].add(&j3.mul(&dl2.mul(&dl)));
         }
     }
-    for &(k, kw) in bin_terms {
+    let q = bin_terms.par_iter().map(|&(k, kw)| {
         let u = |par: usize| (0..16).fold(K8::ZERO, |acc, s| acc.add(&e[s].mul(&os.u4[(kw * 2 + par) * 32 + s])));
         let (u0, u1) = (u(0), u(1));
         let aoff = tc[k].aoff as usize;
@@ -1098,10 +1169,9 @@ fn binned_round(os: &OhSums, bin_terms: &[(usize, usize)], e: &[K8], a_all: &[K8
         let (a0, a1) = (a_all[aoff], a_all[aoff + 1]);
         // A0u0(1 − t)² + (A0u1 + A1u0)t(1 − t) + A1u1 t².
         let (p0, x, p1) = (a0.mul(&u0), a0.mul(&u1).add(&a1.mul(&u0)), a1.mul(&u1));
-        c[4] = c[4].add(&p0);
-        c[5] = c[5].add(&x.sub(&two.mul(&p0)));
-        c[6] = c[6].add(&p0.sub(&x).add(&p1));
-    }
+        [p0, x.sub(&two.mul(&p0)), p0.sub(&x).add(&p1)]
+    }).reduce(|| [K8::ZERO; 3], |a, b| [a[0].add(&b[0]), a[1].add(&b[1]), a[2].add(&b[2])]);
+    for j in 0..3 { c[4 + j] = c[4 + j].add(&q[j]); }
     c
 }
 
@@ -1229,6 +1299,8 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
             sh.qdl_len /= 2;
         }
     }
+    let t0 = std::time::Instant::now();
+    let tm0 = i == 0 && std::env::var("MORPHEUS_TIMING").is_ok();
     let raw_ptr = sh.raw_ptr(dev_raw, rin.src_len);
     let (d_a, d_t) = (up_k(rin.a_all), upload(rin.tc));
     if i == 0 && sh.b_round.is_none() {
@@ -1250,6 +1322,7 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
         std::mem::swap(src, dst);
         sh.b_round = Some(i);
     }
+    let t_b = t0.elapsed().as_secs_f64() * 1e3;
     let d_b = &sh.bdev.as_ref().unwrap().0;
     let (d_e1, d_e2, d_e3, d_ea) = (up_k(rin.e1), up_k(rin.e2), up_k(rin.e3), up_k(rin.ea));
     // Generic tail: one-hot blocks with p < i, and p = i unless binned.
@@ -1291,9 +1364,11 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
         assert_eq!(rc, 0, "link v2 round {i} failed");
         kvec(&out)[..2 * (d + 1)].to_vec()
     };
+    let t_s = t0.elapsed().as_secs_f64() * 1e3;
     let ohs = if i == 0 && !sh.oh.is_empty() {
         Some(onehot_sums(raw_ptr, rin.src_len, b0, &consts, &sh.oh, &sh.bc, sh.gen_base, regions_c, alpha, nterms, rin.b5))
     } else { None };
+    let t_o = t0.elapsed().as_secs_f64() * 1e3;
     // Round-1 range bins over round 1's generic list.
     let rb = if i == 0 && rin.rb1 {
         let n1 = sh.gen_base + (sh.oh.len() - sh.oh.partition_point(|b| !in_gen(&regions_c[b.region as usize], 1)));
@@ -1307,6 +1382,7 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
         const Q: u128 = 18446744069414584289;
         Some(h[..nr - 1].chunks(16).map(|c| K8(std::array::from_fn(|w| ((c[2 * w] as u128 + ((c[2 * w + 1] as u128 % Q) << 32)) % Q) as u64))).collect())
     } else { None };
+    if tm0 { eprintln!("[link2]   round 0 device {}: B {t_b:.0} ms, sum {:.0} ms, one-hot {:.0} ms, bins {:.0} ms", sh.dev, t_s - t_b, t_o - t_s, t0.elapsed().as_secs_f64() * 1e3 - t_o); }
     (sum, ohs, rb)
 }
 

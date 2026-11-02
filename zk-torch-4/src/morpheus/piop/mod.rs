@@ -465,31 +465,47 @@ pub fn tensor_specs(g: &Graph, pd: &ProverData) -> Vec<(TKey, usize, usize, bool
 /// The raw sources `range` of the layout, packed two bits per digit.
 pub fn fill_sources_packed(g: &Graph, pd: &ProverData, lay: &Layout, ell: usize, range: std::ops::Range<usize>) -> Vec<crate::morpheus::packed::Src> {
     use crate::morpheus::packed::{PackedPtr, Src};
+    let t0 = std::time::Instant::now();
     let mut raw: Vec<Src> = range.clone().map(|_| Src::zeros(1usize << ell)).collect();
+    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[fill] zero {} sources {:.2} s", raw.len(), t0.elapsed().as_secs_f64()); }
     let mut ptrs: Vec<Option<PackedPtr>> = vec![None; lay.n_sources];
     for (k, r) in raw.iter_mut().enumerate() { ptrs[range.start + k] = Some(PackedPtr::of(r)); }
     lay.tensors.par_iter().filter(|t| t.pieces.iter().all(|pc| range.contains(&pc.region.source))).for_each(|t| {
         match t.key {
             TKey::Edge(e) => {
                 let v = pd.v(e).clone();
-                lay.fill_packed(&t.key, &ptrs, &move |b, i| {
+                let digit = |b: usize, i: usize| {
                     let x = v[i];
                     let (a, s) = if x > Q / 2 { (Q - x, -1i8) } else { (x, 1i8) };
                     if (a >> b) & 1 == 1 { s } else { 0 }
-                });
+                };
+                // Four bits of |x| spread to 2-bit codes; -1 is code 11.
+                let quad = |b: usize, i: usize| {
+                    let x = v[i];
+                    let (a, neg) = if x > Q / 2 { (Q - x, true) } else { (x, false) };
+                    let nib = if b < 64 { ((a >> b) & 15) as usize } else { 0 };
+                    SPREAD4[nib] * if neg { 3 } else { 1 }
+                };
+                lay.fill_packed4(&t.key, &ptrs, &digit, &quad);
             }
             TKey::Sel { node, chunk } => {
                 let t = &pd.sel[&node];
                 let shift: usize = g.chunks(node)[..chunk].iter().sum();
                 let w = g.chunks(node)[chunk];
-                lay.fill_packed(&t_key(node, chunk), &ptrs, &move |b, i| (((t[i] >> shift) & ((1 << w) - 1)) as usize == b) as i8);
+                let hot = |i: usize| ((t[i] >> shift) & ((1 << w) - 1)) as usize;
+                lay.fill_packed4(&t_key(node, chunk), &ptrs, &|b, i| (hot(i) == b) as i8,
+                    &|b, i| { let h = hot(i); if h >= b && h < b + 4 { 1u8 << (2 * (h - b)) } else { 0 } });
             }
             TKey::Wg => {
                 let bank = &pd.bank;
-                lay.fill_packed(&TKey::Wg, &ptrs, &move |b, s| {
+                lay.fill_packed4(&TKey::Wg, &ptrs, &|b, s| {
                     if s >= bank.len() { return 0; }
                     let (a, h) = (b / 64, b % 64);
                     ((bank[s].0[a] >> h) & 1) as i8
+                }, &|b, s| {
+                    if s >= bank.len() { return 0; }
+                    let (a, h) = (b / 64, b % 64);
+                    SPREAD4[((bank[s].0[a] >> h) & 15) as usize]
                 });
             }
             TKey::Carry => {}
@@ -497,6 +513,14 @@ pub fn fill_sources_packed(g: &Graph, pd: &ProverData, lay: &Layout, ell: usize,
     });
     raw
 }
+
+/// SPREAD4[n]: bit r of n moved to bit 2r (packed code 01 per set bit).
+const SPREAD4: [u8; 16] = {
+    let mut t = [0u8; 16];
+    let mut n = 0;
+    while n < 16 { let mut r = 0; while r < 4 { if (n >> r) & 1 == 1 { t[n] |= 1 << (2 * r); } r += 1; } n += 1; }
+    t
+};
 
 /// Raw digit sources of the layout.
 pub fn fill_sources(g: &Graph, pd: &ProverData, lay: &Layout, ell: usize) -> Vec<Vec<i8>> {

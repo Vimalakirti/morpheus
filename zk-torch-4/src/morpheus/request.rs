@@ -587,8 +587,7 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     let runs = auth_gpu::runs_of(&support);
     let Prepared { g, pd, lay, req, carry, .. } = &*pp;
     // Streamed sources uploaded for the link while the PIOP runs (one device).
-    let pre_raw: std::sync::Mutex<Option<DeviceBuffer<u8>>> = std::sync::Mutex::new(None);
-    let one_gpu = std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) == 1;
+    let pre_raw: std::sync::Mutex<Option<link_gpu::PreShards>> = std::sync::Mutex::new(None);
     // Registered sources, by reference: the model's payload AND hiding suffix
     // (monolithic) and the input's. Only request sources get fresh suffixes.
     let reg_refs: Vec<&super::packed::Src> = if defer { Vec::new() } else { model.raw.iter().collect() };
@@ -634,19 +633,35 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
             c
         };
         lap(&mut times, "commit", t);
-        if stream && one_gpu && std::env::var("MORPHEUS_NO_PRE_RAW").is_err() {
-            let (raw, pre_raw, reg_refs) = (raw.clone(), &pre_raw, &reg_refs);
+        // The link's device shards, uploaded while the PIOP runs. Device 0
+        // (the PIOP's) takes its shard only while it fits in a quarter of
+        // its free memory; the link uploads the rest.
+        if stream && !defer && std::env::var("MORPHEUS_NO_PRE_RAW").is_err() {
+            let (raw, pre_raw, reg_refs, keep) = (raw.clone(), &pre_raw, &reg_refs, link_fast::LinkServices::kept(&*pc).is_some());
+            let bits = lay.bit_blocks_in(&(pp.model.start..req.end));
             sc.spawn(move || {
-                almost_goldilocks_cuda::set_device(0).expect("set device");
                 let refs: Vec<&super::packed::Src> = reg_refs.iter().copied().chain(raw.iter()).collect();
                 let src = super::packed::Refs(&refs);
-                let len = src.src_len();
                 let t = Instant::now();
-                if let Ok(mut d) = DeviceBuffer::<u8>::new(len / 4 * refs.len()) {
-                    for s in 0..refs.len() { super::packed::upload_packed(&src, s, &mut d, s * len / 4); }
-                    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] packed sources uploaded during the PIOP: {:.1} GB in {:.2} s", (len / 4 * refs.len()) as f64 / 1e9, t.elapsed().as_secs_f64()); }
-                    *pre_raw.lock().unwrap() = Some(d);
-                }
+                let ngpu = link_gpu::shard_gpus(refs.len());
+                let owner = link_gpu::shard_owner(&src, &bits, o.b0, ngpu, keep);
+                let bytes = |g: usize| owner.iter().filter(|&&x| x == g).count() * src.src_len() / 4;
+                let bufs: Vec<Option<DeviceBuffer<u8>>> = std::thread::scope(|s2| {
+                    let hs: Vec<_> = (0..ngpu).map(|g| {
+                        let (src, owner) = (&src, &owner);
+                        s2.spawn(move || {
+                            almost_goldilocks_cuda::set_device(g as i32).expect("set device");
+                            let free = almost_goldilocks_cuda::mem_get_info().map(|m| m.0).unwrap_or(0);
+                            let ok = if g == 0 { bytes(0) * 4 < free } else { bytes(g) + (4usize << 30) < free };
+                            if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] device {g} shard {:.1} GB, {:.1} GB free", bytes(g) as f64 / 1e9, free as f64 / 1e9); }
+                            ok.then(|| link_gpu::shard_upload(src, owner, g))
+                        })
+                    }).collect();
+                    hs.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                almost_goldilocks_cuda::set_device(0).expect("set device");
+                if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] shards uploaded during the PIOP: {:?} in {:.2} s", bufs.iter().map(|b| b.is_some()).collect::<Vec<_>>(), t.elapsed().as_secs_f64()); }
+                *pre_raw.lock().unwrap() = Some(link_gpu::PreShards { owner, bufs });
             });
         }
         // Authentication masks of the first attempts, drawn while the PIOP

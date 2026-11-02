@@ -1131,8 +1131,19 @@ pub fn prove_cols(
                         hs.into_iter().map(|h| h.join().unwrap()).collect()
                     });
                     almost_goldilocks_cuda::set_device(0).unwrap();
-                    let mut w = Vec::with_capacity(pieces.iter().map(|x| x[0].len() + x[1].len()).sum());
-                    for r in 0..p.tau { for x in &pieces { w.extend_from_slice(&x[r]); } }
+                    use rayon::prelude::*;
+                    let t_p = t.elapsed().as_secs_f64() * 1e3;
+                    // Row r, device k at its offset; copied in parallel into
+                    // a buffer whose pages are faulted by many threads.
+                    let parts: Vec<&[u8]> = (0..p.tau).flat_map(|r| pieces.iter().map(move |x| &x[r][..])).collect();
+                    let total: usize = parts.iter().map(|x| x.len()).sum();
+                    let mut w: Vec<u8> = Vec::with_capacity(total);
+                    unsafe { w.set_len(total); }
+                    let mut rest = &mut w[..];
+                    let mut dst: Vec<&mut [u8]> = Vec::with_capacity(parts.len());
+                    for x in &parts { let (a, b) = rest.split_at_mut(x.len()); dst.push(a); rest = b; }
+                    dst.into_par_iter().zip(parts.par_iter()).for_each(|(d, x)| d.par_chunks_mut(1 << 20).zip(x.par_chunks(1 << 20)).for_each(|(a, b)| a.copy_from_slice(b)));
+                    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] extract: device packs {t_p:.0} ms, join {:.0} ms", t.elapsed().as_secs_f64() * 1e3 - t_p); }
                     w
                 } else { Vec::new() };
                 let z = if keep_z { Responses { w, l: pack_dev(p, &zl), o: pack_dev(p, &zo) } } else { Responses::default() };

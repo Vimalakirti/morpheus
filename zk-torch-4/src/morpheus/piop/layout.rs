@@ -264,25 +264,52 @@ impl Layout {
     /// different tensors concurrently (pieces never overlap).
     /// fill_ptr into packed sources (crate::morpheus::packed): each row of
     /// 2^p digits is built then stored (byte-aligned rows directly).
-    pub fn fill_packed(&self, k: &TKey, ptrs: &[Option<crate::morpheus::packed::PackedPtr>], digit: &(dyn Fn(usize, usize) -> i8 + Sync)) {
+    pub fn fill_packed<F: Fn(usize, usize) -> i8 + Sync>(&self, k: &TKey, ptrs: &[Option<crate::morpheus::packed::PackedPtr>], digit: &F) {
+        use crate::morpheus::packed::code;
+        self.fill_packed4(k, ptrs, digit, &|b: usize, i: usize| (0..4).fold(0u8, |v, r| v | code(digit(b + r, i)) << (2 * r)));
+    }
+    /// fill_packed with `quad(b, i)`: the packed byte of planes b..b+4 of
+    /// element i (b a multiple of 4), used for rows of 4 or more planes.
+    pub fn fill_packed4<F: Fn(usize, usize) -> i8 + Sync, G: Fn(usize, usize) -> u8 + Sync>(&self, k: &TKey, ptrs: &[Option<crate::morpheus::packed::PackedPtr>], digit: &F, quad: &G) {
+        use crate::morpheus::packed::code;
+        use rayon::prelude::*;
         let t = self.get(k);
         for pc in &t.pieces {
             let (m, pp) = (pc.region.m, pc.region.p);
             let Some(base) = ptrs[pc.region.source] else { continue };
             let n = t.n;
-            use rayon::prelude::*;
-            // Rows of fewer than 4 digits are grouped so each task writes
-            // whole bytes where it can.
-            let g = if pp >= 2 { 1 } else { 1usize << (2 - pp).min(m) };
-            (0..(1usize << m) / g).into_par_iter().for_each(|q| {
-                let mut row = vec![0i8; g << pp];
-                let mut any = false;
-                for r in 0..g {
-                    let i = q * g + r;
-                    if m > n && i >= 1usize << n { continue; }
-                    for b in 0..1usize << pp { let d = digit(pc.plane0 + b, (pc.hb << m) | i); row[(r << pp) + b] = d; any |= d != 0; }
+            // Rows past 2^n stay zero.
+            let rows = if m > n { 1usize << n } else { 1usize << m };
+            let digits = rows << pp;
+            let (b0, hb, plane0, mask) = (pc.region.base, pc.hb << m, pc.plane0, (1usize << pp) - 1);
+            let at = |j: usize| digit(plane0 + (j & mask), hb | (j >> pp));
+            if b0 % 4 != 0 || (1usize << (m + pp)) < 4 {
+                // Region smaller than a byte: shares its bytes, atomic OR.
+                let row: Vec<i8> = (0..digits).map(at).collect();
+                base.write(b0, &row);
+                continue;
+            }
+            // The region owns whole bytes: build each byte and store it.
+            assert!((b0 + digits).div_ceil(4) <= base.1);
+            let out = unsafe { std::slice::from_raw_parts_mut(base.0.add(b0 / 4), digits.div_ceil(4)) };
+            if pp >= 2 && plane0 % 4 == 0 {
+                out.par_chunks_mut(1 << 12).enumerate().for_each(|(c, o)| {
+                    let j0 = c << 14;
+                    for (q, x) in o.iter_mut().enumerate() {
+                        let j = j0 + 4 * q;
+                        *x = quad(plane0 + (j & mask), hb | (j >> pp));
+                    }
+                });
+                continue;
+            }
+            out.par_chunks_mut(1 << 12).enumerate().for_each(|(c, o)| {
+                let j0 = c << 14;
+                for (q, x) in o.iter_mut().enumerate() {
+                    let j = j0 + 4 * q;
+                    let mut v = 0u8;
+                    for r in 0..4 { if j + r < digits { v |= code(at(j + r)) << (2 * r); } }
+                    *x = v;
                 }
-                if any { base.write(pc.region.base + ((q * g) << pp), &row); }
             });
         }
     }

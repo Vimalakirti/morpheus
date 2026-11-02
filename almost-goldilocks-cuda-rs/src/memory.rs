@@ -9,6 +9,24 @@ use crate::error::{CudaError, Result};
 /// is how 3D-UNet at 128^3 produced a sticky illegal access with no bad index
 /// anywhere. Buffers do reach that size: c_out_pad 64 * s_full_pad 2^25 is
 /// exactly 2^31. Fail with a message naming the count instead.
+/// A host vector of `n` defaults for a device-to-host copy. Large ones are
+/// written by several threads first: the copy from the driver's staging
+/// buffer would otherwise fault every fresh page in serially.
+fn host_vec<T: Clone + Default + Send + Sync>(n: usize) -> Vec<T> {
+    let bytes = n * std::mem::size_of::<T>();
+    if bytes < (16 << 20) { return vec![T::default(); n]; }
+    let mut v: Vec<T> = Vec::with_capacity(n);
+    let spare = &mut v.spare_capacity_mut()[..n];
+    let per = n.div_ceil(16);
+    std::thread::scope(|sc| {
+        for c in spare.chunks_mut(per) {
+            sc.spawn(move || for x in c.iter_mut() { x.write(T::default()); });
+        }
+    });
+    unsafe { v.set_len(n); }
+    v
+}
+
 pub fn check_elem_count(n: usize, what: &str) -> Result<()> {
     if n > i32::MAX as usize {
         return Err(CudaError::InvalidArgument(format!(
@@ -84,10 +102,10 @@ impl<T> DeviceBuffer<T> {
 
     pub fn to_vec(&self) -> Result<Vec<T>>
     where
-        T: Clone + Default,
+        T: Clone + Default + Send + Sync,
     {
         trace_copy("D2H to_vec", self.len * std::mem::size_of::<T>());
-        let mut result = vec![T::default(); self.len];
+        let mut result = host_vec::<T>(self.len);
         if !result.is_empty() {
             let size = self.len * std::mem::size_of::<T>();
             let ret = unsafe {
@@ -353,7 +371,7 @@ impl<T> DeviceBuffer<T> {
 
     pub fn read_slice(&self, offset: usize, len: usize) -> Result<Vec<T>>
     where
-        T: Clone + Default,
+        T: Clone + Default + Send + Sync,
     {
         trace_copy("D2H read_slice", len * std::mem::size_of::<T>());
         if offset + len > self.len {
@@ -363,7 +381,7 @@ impl<T> DeviceBuffer<T> {
             )));
         }
         if len == 0 { return Ok(Vec::new()); }
-        let mut result = vec![T::default(); len];
+        let mut result = host_vec::<T>(len);
         let byte_size = len * std::mem::size_of::<T>();
         let ret = unsafe {
             ffi::cuda_memcpy_dtoh(
