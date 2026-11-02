@@ -956,13 +956,31 @@ fn phases_v2_body<'u>(
                 // The authentication reads int8 digits in physical column order.
                 almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
                 let len = src_len as usize;
-                let mut buf = DeviceBuffer::<i8>::new(sh.owned.len() * len).expect("kept sources");
-                for j in 0..sh.owned.len() {
-                    let rc = unsafe { ffi::agl_morpheus_unpack2(pk.as_ptr().add(j * len / 4), buf.as_mut_ptr().add(j * len), len as u64, 1) };
-                    assert_eq!(rc, 0, "unpack kept sources");
+                // int8 when it fits (4x the packed bytes); else the packed
+                // shard itself, permuted in place to physical columns.
+                let _ = almost_goldilocks_cuda::memory::pool_trim(0);
+                let need = sh.owned.len() * len;
+                let fits = std::env::var("MORPHEUS_KEEP_PACKED").is_err()
+                    && almost_goldilocks_cuda::mem_get_info().map(|(free, _)| free > need + (4usize << 30)).unwrap_or(false);
+                if fits {
+                    let mut buf = DeviceBuffer::<i8>::new(need).expect("kept sources");
+                    for j in 0..sh.owned.len() {
+                        let rc = unsafe { ffi::agl_morpheus_unpack2(pk.as_ptr().add(j * len / 4), buf.as_mut_ptr().add(j * len), len as u64, 1) };
+                        assert_eq!(rc, 0, "unpack kept sources");
+                    }
+                    drop(pk);
+                    k.push(Kept { dev: sh.dev, srcs: sh.owned, buf, pk: None, phys: true });
+                } else {
+                    let mut pk = pk;
+                    let mut tmp = DeviceBuffer::<u8>::new(len / 4).expect("permute scratch");
+                    for j in 0..sh.owned.len() {
+                        let rc = unsafe { ffi::agl_morpheus_permute2(pk.as_ptr().add(j * len / 4), tmp.as_mut_ptr(), (len / 4096) as u64) };
+                        assert_eq!(rc, 0, "permute kept sources");
+                        pk.copy_range_from_device(j * len / 4, &tmp, 0, len / 4).unwrap();
+                    }
+                    let buf = DeviceBuffer::<i8>::new(1).unwrap();
+                    k.push(Kept { dev: sh.dev, srcs: sh.owned, buf, pk: Some(pk), phys: true });
                 }
-                drop(pk);
-                k.push(Kept { dev: sh.dev, srcs: sh.owned, buf, phys: true });
             } }
         }
     }
@@ -1275,7 +1293,9 @@ impl SyncPtr { fn get(&self) -> *mut K8 { self.0 } }
 /// A device's range of sources [lo, hi), kept after the link (streamed
 /// mode) for the endpoints and the authentication; logical raw order until
 /// `phys` (then the commitment's physical column order).
-pub struct Kept { pub dev: i32, pub srcs: Vec<usize>, pub buf: DeviceBuffer<i8>, pub phys: bool }
+/// A device's kept sources: int8 digits in `buf`, or (when that does not
+/// fit) packed physical columns in `pk`, 1024 bytes per column.
+pub struct Kept { pub dev: i32, pub srcs: Vec<usize>, pub buf: DeviceBuffer<i8>, pub pk: Option<DeviceBuffer<u8>>, pub phys: bool }
 
 /// One device's share of the plane rounds.
 struct Shard {

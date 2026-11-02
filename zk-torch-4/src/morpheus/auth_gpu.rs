@@ -39,7 +39,7 @@ impl Keys {
 }
 
 /// Point-dependent device state: w[l][j] = e_l e_j and the host factors.
-pub struct DevPoint { w: DeviceBuffer<u64>, cols: usize, gk: AElem, rho_f: K8, x: Vec<K8>, degs: Vec<usize> }
+pub struct DevPoint { pub(crate) w: DeviceBuffer<u64>, cols: usize, gk: AElem, rho_f: K8, x: Vec<K8>, degs: Vec<usize> }
 
 impl DevPoint {
     pub fn new(p: &Profile, pt: &Point) -> Self {
@@ -314,7 +314,9 @@ fn run_attempt(
 /// A device's sources for the sharded authentication: physical columns of
 /// sources `srcs` at `w` (stride `len` bytes, in that order) and their link
 /// columns `r` (same order).
-pub struct ShardSrc { pub dev: i32, pub srcs: Vec<usize>, pub w: *const i8, pub len: usize, pub r: DeviceBuffer<i8> }
+/// `w`: each source's `len` bytes of int8 physical columns, or of packed
+/// physical columns (1024 bytes per column) when `packed`.
+pub struct ShardSrc { pub dev: i32, pub srcs: Vec<usize>, pub w: *const i8, pub len: usize, pub packed: bool, pub r: DeviceBuffer<i8> }
 unsafe impl Send for ShardSrc {}
 unsafe impl Sync for ShardSrc {}
 
@@ -362,7 +364,8 @@ fn run_attempt_sharded(
         let vw: Vec<*const i8> = (0..ns).map(|j| unsafe { sh.w.add(j * sh.len) }).collect();
         let vl: Vec<*const i8> = (0..ns).map(|j| unsafe { sh.r.as_ptr().add(j * sl * N) }).collect();
         unsafe {
-            let rc = ffi::agl_mauth_combine_multi(vw.as_ptr(), ns as i32, sw as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(sw * N));
+            let rc = if sh.packed { ffi::agl_mauth_combine_packed(vw.as_ptr() as *const *const u8, ns as i32, sw as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(sw * N)) }
+                else { ffi::agl_mauth_combine_multi(vw.as_ptr(), ns as i32, sw as i32, bb.as_ptr(), zw.as_mut_ptr(), zw.as_mut_ptr().add(sw * N)) };
             assert_eq!(rc, 0);
             let rc = ffi::agl_mauth_combine_multi(vl.as_ptr(), ns as i32, sl as i32, bb.as_ptr(), zl.as_mut_ptr(), zl.as_mut_ptr().add(sl * N));
             assert_eq!(rc, 0);

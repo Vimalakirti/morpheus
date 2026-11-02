@@ -331,6 +331,14 @@ impl LinkServices for PcsGpu {
                     sc.spawn(move || {
                         almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
                         let dp = DevPoint::new(p, pt);
+                        if let Some(pk) = &sh.pk {
+                            // Packed physical columns: every source in one launch.
+                            let stride = pk.len() / sh.srcs.len();
+                            let mut out = vec![0u64; sh.srcs.len() * 512];
+                            let rc = unsafe { ffi::agl_mauth_ev_packed_batch(pk.as_ptr(), stride as u64, sh.srcs.len() as i32, (stride / 1024) as i32, dp.w.as_ptr(), out.as_mut_ptr()) };
+                            assert_eq!(rc, 0, "packed Ev");
+                            return sh.srcs.iter().zip(out.chunks(512)).map(|(&s, c)| (s, dp.ev_finish(c))).collect::<Vec<_>>();
+                        }
                         let len = sh.buf.len() / sh.srcs.len();
                         sh.srcs.iter().enumerate().map(|(j, &s)| (s, dp.ev(unsafe { sh.buf.as_ptr().add(j * len) } as *const c_void, 1))).collect::<Vec<_>>()
                     })

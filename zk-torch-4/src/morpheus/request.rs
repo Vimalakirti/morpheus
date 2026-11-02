@@ -516,7 +516,10 @@ fn authenticate_streamed(o: &Opts, opening: u64, pc: &mut PcsGpu, fast: &link::L
     let shards: Vec<auth_gpu::ShardSrc> = k.iter().map(|sh| {
         almost_goldilocks_cuda::set_device(sh.dev).unwrap();
         let r: Vec<i8> = sh.srcs.iter().flat_map(|&s| r8[s].iter().copied()).collect();
-        auth_gpu::ShardSrc { dev: sh.dev, srcs: sh.srcs.clone(), w: sh.buf.as_ptr(), len: sh.buf.len() / sh.srcs.len(), r: DeviceBuffer::from_slice(&r).unwrap() }
+        match &sh.pk {
+            Some(pk) => auth_gpu::ShardSrc { dev: sh.dev, srcs: sh.srcs.clone(), w: pk.as_ptr() as *const i8, len: pk.len() / sh.srcs.len(), packed: true, r: DeviceBuffer::from_slice(&r).unwrap() },
+            None => auth_gpu::ShardSrc { dev: sh.dev, srcs: sh.srcs.clone(), w: sh.buf.as_ptr(), len: sh.buf.len() / sh.srcs.len(), packed: false, r: DeviceBuffer::from_slice(&r).unwrap() },
+        }
     }).collect();
     almost_goldilocks_cuda::set_device(0).unwrap();
     let s_o = DeviceBuffer::from_slice(&fast.s_o.iter().flatten().map(|&v| v as i8).collect::<Vec<_>>()).unwrap();
