@@ -395,6 +395,16 @@ fn absorb_layout(tr: &mut MTranscript, lay: &Layout) {
 
 fn request_transcript(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model: &[Vec<Vec<u64>>], c_input: &[Vec<Vec<u64>>], c_req: &[Vec<Vec<u64>>]) -> Option<MTranscript> {
     let t_st = Instant::now();
+    let mut tr = request_transcript_head(o, pp, j, salt, c_model, c_input, c_req.len())?;
+    for c in c_req { for x in c { tr.absorb(Item::SourceCommitment, x); } }
+    if o.timing { eprintln!("[transcript] request prefix {:.1} MB ({:.2} s)", tr.literal_prefix().len() as f64 / 1e6, t_st.elapsed().as_secs_f64()); }
+    Some(tr)
+}
+
+/// The request transcript up to (not including) the request's source
+/// commitments, of which there are `n_req`.
+fn request_transcript_head(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model: &[Vec<Vec<u64>>], c_input: &[Vec<Vec<u64>>], n_req: usize) -> Option<MTranscript> {
+    let t_st = Instant::now();
     let words = super::statement::words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log).ok()?;
     if o.timing { eprintln!("[transcript] statement words {} ({:.2} s)", words.len(), t_st.elapsed().as_secs_f64()); }
     let mut tr = MTranscript::new(o.profile.name, salt);
@@ -412,9 +422,7 @@ fn request_transcript(o: &Opts, pp: &Prepared, j: u64, salt: &[u8; 64], c_model:
     }
     tr.absorb(Item::Statement, &[1]); absorb_model(&mut tr, c_model);
     tr.absorb(Item::Statement, &[2]); absorb_model(&mut tr, c_input);
-    tr.absorb(Item::Statement, &[3, c_req.len() as u64, j]);
-    for c in c_req { for x in c { tr.absorb(Item::SourceCommitment, x); } }
-    if o.timing { eprintln!("[transcript] request prefix {:.1} MB ({:.2} s)", tr.literal_prefix().len() as f64 / 1e6, t_st.elapsed().as_secs_f64()); }
+    tr.absorb(Item::Statement, &[3, n_req as u64, j]);
     Some(tr)
 }
 
@@ -445,11 +453,12 @@ fn extra_devs() -> Vec<i32> {
 
 /// Streamed commitments: device 0 with its key cache, the other devices
 /// with temporary 3-prime caches.
-fn commit_streamed(o: &Opts, pc: &mut PcsGpu, raw: &dyn super::packed::Sources) -> Vec<Vec<Vec<u64>>> {
+fn commit_streamed(o: &Opts, pc: &mut PcsGpu, raw: &dyn super::packed::Sources) -> Vec<Vec<Vec<u64>>> { commit_streamed_with(o, pc, raw, None) }
+fn commit_streamed_with(o: &Opts, pc: &mut PcsGpu, raw: &dyn super::packed::Sources, done: Option<&(dyn Fn(usize, &[Vec<u64>]) + Sync)>) -> Vec<Vec<Vec<u64>>> {
     let ex = extra_devs();
     if ex.is_empty() { pc.ensure_w(); }
     let devs: Vec<(i32, &auth_gpu::Keys)> = if pc.keys.w.buf.len() > 1 { vec![(0, &pc.keys)] } else { vec![] };
-    super::pcs_gpu::commit_streamed_on(&o.profile, Some((&o.seed, &ex)), &devs, raw)
+    super::pcs_gpu::commit_streamed_on(&o.profile, Some((&o.seed, &ex)), &devs, raw, done)
 }
 
 impl Opts {
@@ -595,6 +604,13 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
     let (raw_req, raw8, mut rep_vec, c_req, piop_out) = std::thread::scope(|sc| {
         let pdr = pd;
         sc.spawn(move || pdr.prefetch());
+        // The transcript up to the request commitments, built and hashed
+        // while the sources are filled and committed.
+        let mut head = Some({ let (salt, mc, ic, ppr) = (&salt, &model.c, &input.c, &*pp); sc.spawn(move || {
+            let mut tr = request_transcript_head(o, ppr, j, salt, mc, ic, req.len());
+            if let Some(t) = tr.as_mut() { t.hash_pending(); }
+            tr
+        }) });
         let t = Instant::now();
         // Request sources, packed two bits per digit (packed.rs).
         let mut raw = piop::fill_sources_packed(g, pd, lay, ell, req.clone());
@@ -612,14 +628,52 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         lap(&mut times, "fill", t);
         let jobs = if o.auth && !stream { load_replicas(sc, std::mem::take(&mut reps.r), raw8.clone().unwrap()) } else { Vec::new() };
         let t = Instant::now();
+        let mut fed = None;
         let c_req = if stream {
             pc.streamed = true;
             if o.auth && o.auth_gpus > 1 && std::env::var("MORPHEUS_AUTH_COLS").as_deref() != Ok("0") { pc.use_cols((0..o.auth_gpus as i32).collect()); }
-            let c = commit_streamed(o, pc, &super::packed::Refs(&refs));
+            // Registered sources keep their registered commitments; only the
+            // request's own sources are committed (MORPHEUS_RECHECK_MODEL=1
+            // recommits every source, checked against registration below).
+            // The request commitments are absorbed and hashed in source order
+            // as the devices finish them.
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<Vec<u64>>)>();
+            let nreg = reg_refs.len();
+            let head = head.take().unwrap();
+            let feeder = sc.spawn(move || {
+                let mut tr = head.join().expect("transcript head")?;
+                let mut pend: BTreeMap<usize, Vec<Vec<u64>>> = BTreeMap::new();
+                let mut next = 0usize;
+                for (i, c) in rx {
+                    pend.insert(i, c);
+                    while let Some(c) = pend.remove(&next) {
+                        for x in &c { tr.absorb(Item::SourceCommitment, x); }
+                        next += 1;
+                        if tr.pending_bytes() >= 64 << 20 { tr.hash_pending(); }
+                    }
+                }
+                assert!(pend.is_empty(), "request commitments out of range");
+                tr.hash_pending();
+                Some((tr, next))
+            });
+            let tx = std::sync::Mutex::new(Some(tx));
+            let done = |s: usize, c: &[Vec<u64>]| { if s >= nreg { if let Some(t) = tx.lock().unwrap().as_ref() { let _ = t.send((s - nreg, c.to_vec())); } } };
+            let c = if std::env::var_os("MORPHEUS_RECHECK_MODEL").is_some() { commit_streamed_with(o, pc, &super::packed::Refs(&refs), Some(&done)) } else {
+                let fresh = commit_streamed_with(o, pc, &super::packed::Refs(&refs[nreg..]), Some(&|s: usize, c: &[Vec<u64>]| done(s + nreg, c)));
+                let reg: Vec<Vec<Vec<u64>>> = if defer { Vec::new() } else { model.c.clone() };
+                reg.into_iter().chain(input.c.iter().cloned()).chain(fresh).collect()
+            };
+            tx.lock().unwrap().take();
+            fed = Some(feeder);
             // The source key cache (43 GB at the ternary profile) is freed
             // for the link's resident sources and rebuilt for the
             // authentication, also on a single GPU.
             pc.drop_w();
+            // Hand the cached blocks back to the driver: kernels that allocate
+            // internally do not draw from the DeviceBuffer cache.
+            almost_goldilocks_cuda::set_device(0).unwrap();
+            let _ = almost_goldilocks_cuda::pool_trim(0);
+            if o.timing { eprintln!("[commit] device 0 free after dropping the key cache: {:.1} GB", almost_goldilocks_cuda::mem_get_info().map(|m| m.0).unwrap_or(0) as f64 / 1e9); }
             c
         } else {
             pc.streamed = false;
@@ -633,9 +687,8 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
             c
         };
         lap(&mut times, "commit", t);
-        // The link's device shards, uploaded while the PIOP runs. Device 0
-        // (the PIOP's) takes its shard only while it fits in a quarter of
-        // its free memory; the link uploads the rest.
+        // The link's device shards on devices 1.., uploaded while the PIOP
+        // runs on device 0; the link uploads the rest.
         if stream && !defer && std::env::var("MORPHEUS_NO_PRE_RAW").is_err() {
             let (raw, pre_raw, reg_refs, keep) = (raw.clone(), &pre_raw, &reg_refs, link_fast::LinkServices::kept(&*pc).is_some());
             let bits = lay.bit_blocks_in(&(pp.model.start..req.end));
@@ -652,7 +705,10 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
                         s2.spawn(move || {
                             almost_goldilocks_cuda::set_device(g as i32).expect("set device");
                             let free = almost_goldilocks_cuda::mem_get_info().map(|m| m.0).unwrap_or(0);
-                            let ok = if g == 0 { bytes(0) * 4 < free } else { bytes(g) + (4usize << 30) < free };
+                            // Device 0 runs the PIOP: its shard waits for the link
+                            // (MORPHEUS_PRE_RAW0=1 uploads it when it fits a quarter
+                            // of the free memory).
+                            let ok = if g == 0 { std::env::var_os("MORPHEUS_PRE_RAW0").is_some() && bytes(0) * 4 < free } else { bytes(g) + (4usize << 30) < free };
                             if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[link] device {g} shard {:.1} GB, {:.1} GB free", bytes(g) as f64 / 1e9, free as f64 / 1e9); }
                             ok.then(|| link_gpu::shard_upload(src, owner, g))
                         })
@@ -665,14 +721,14 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
             });
         }
         // Authentication masks of the first attempts, drawn while the PIOP
-        // leaves the device mostly idle (MORPHEUS_PRESAMPLE attempts, default 3).
+        // runs (MORPHEUS_PRESAMPLE attempts, default 0).
         if o.auth {
-            // Default: 3 attempts when one attempt's masks are large (>= 2^27
-            // coordinates, ~0.5 s to sample); smaller masks are cheaper to
-            // draw on demand than the PIOP slowdown of drawing them alongside.
             let coords = o.profile.tau * (support.len() + o.profile.link_cols() + o.profile.aux_cols()) * super::ring::N;
             // Column-sharded authentication samples each device's columns itself.
-            let n: u16 = if !pc.col_devs.is_empty() { 0 } else { std::env::var("MORPHEUS_PRESAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(if coords >= 1 << 27 { 3 } else { 0 }) };
+            // Off by default: drawing masks beside the PIOP slows it more than
+            // it saves (GPT-2 12L on one GPU: 82.6 -> 79.3 s without).
+            let _ = coords;
+            let n: u16 = if !pc.col_devs.is_empty() { 0 } else { std::env::var("MORPHEUS_PRESAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(0) };
             let (prof, coins, runs) = (&o.profile, &o.coins, &runs);
             if n > 0 { sc.spawn(move || auth_gpu::presample(prof, coins, opening, n, Some(runs))); }
         }
@@ -682,7 +738,14 @@ pub fn prove_request(pp: &mut Prepared, o: &Opts, j: u64, model: Option<&ModelRe
         let input_end = model_prefix + pp.input.len();
         assert_eq!(&c_req[model_prefix..input_end], &input.c[..], "registered input commitment changed");
         let t = Instant::now();
-        let tr = request_transcript(o, pp, j, &salt, &model.c, &input.c, &c_req[input_end..]).expect("invalid request statement");
+        let tr = match fed {
+            Some(f) => { let (tr, k) = f.join().expect("transcript feeder").expect("invalid request statement"); assert_eq!(k, c_req.len() - input_end, "request commitments fed"); tr }
+            None => {
+                let mut tr = head.take().unwrap().join().expect("transcript head").expect("invalid request statement");
+                for c in &c_req[input_end..] { for x in c { tr.absorb(Item::SourceCommitment, x); } }
+                tr
+            }
+        };
         lap(&mut times, "statement", t);
         let t = Instant::now();
         let mut ctx = Ctx::prover(tr, &pd.bank, lay, o.cfg.slots_log);

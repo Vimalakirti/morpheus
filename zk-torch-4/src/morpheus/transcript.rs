@@ -360,6 +360,15 @@ impl MTranscript {
     /// A transcript that continues this one exactly like a clone, without
     /// copying its (possibly GB-scale) prefix: the sponge and the cardinality
     /// parser are caught up and only bytes appended after the fork are kept.
+    /// Hash every absorbed byte now (SHAKE absorbs a stream, so later
+    /// queries are unchanged); lets a caller overlap hashing with other work.
+    pub fn hash_pending(&mut self) {
+        self.parse.advance_at(&self.prefix, self.base);
+        self.sponge.update(&self.prefix[self.absorbed - self.base..]);
+        self.absorbed = self.base + self.prefix.len();
+    }
+    /// Bytes absorbed but not hashed yet.
+    pub fn pending_bytes(&self) -> usize { self.base + self.prefix.len() - self.absorbed }
     pub fn fork(&self) -> Self {
         let end = self.base + self.prefix.len();
         let mut sponge = self.sponge.clone();
@@ -510,6 +519,18 @@ mod tests {
             assert_eq!(c.challenge_k_not01(Stage::LinkRound, 0, 3), d.challenge_k_not01(Stage::LinkRound, 0, 3));
             t.absorb(Item::FirstMessage, &[6]);
         }
+    }
+    #[test]
+    fn hash_pending_is_transparent() {
+        let mut a = MTranscript::new("p", &[3u8; 64]);
+        let mut b = a.clone();
+        for i in 0..5u64 {
+            for t in [&mut a, &mut b] { t.absorb(Item::FirstMessage, &[i, i * 7, 9]); }
+            b.hash_pending();
+            if i % 2 == 1 { assert_eq!(a.challenge_k(Stage::LinkRound, 0, i), b.challenge_k(Stage::LinkRound, 0, i)); }
+        }
+        assert_eq!(a.challenge_k_bundle(Stage::LinkInit, 0, 3), b.challenge_k_bundle(Stage::LinkInit, 0, 3));
+        assert_eq!(a.prefix, b.prefix);
     }
     #[test]
     fn c0_tuple_digits_equal_shifting() {

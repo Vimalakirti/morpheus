@@ -156,6 +156,9 @@ impl<'a> Graph<'a> {
         assert!(!dag.nodes.iter().any(|n| matches!(n.kind,BasicBlockType::InstanceNorm3D(_))),
             "unconstrained legacy InstanceNorm advice cannot be registered");
         let protocol_conv_pp = cv::conv_pp();
+        let t0 = std::time::Instant::now();
+        let tm = std::env::var("MORPHEUS_TIMING").is_ok();
+        let lap = |w: &str| if tm { eprintln!("[prep]   graph {w}: {:.2} s", t0.elapsed().as_secs_f64()); };
         let ne = dag.num_edges();
         let shapes: Vec<Vec<usize>> = (0..ne).map(|e| wit[e][0].shape.clone()).collect();
         let edge_meta = (0..ne).map(|e| { let w = &wit[e][0]; (w.data_type, w.poly_type, w.sf, w.role) }).collect();
@@ -172,6 +175,7 @@ impl<'a> Graph<'a> {
                 Role::Output => false,
             };
         }
+        lap("meta");
         let mut lookups = BTreeMap::new();
         for nd in &dag.nodes {
             if advice_kind(&nd.kind) { committed[nd.outputs[0]] = true; }
@@ -190,23 +194,29 @@ impl<'a> Graph<'a> {
                 _ => {}
             }
         }
-        let public = dag.program_literals.iter().map(|(&e,v)| {
+        lap("lookups");
+        // Copied in parallel (the exp guards' literals are full tensors).
+        let lits: Vec<(&usize, &Vec<u64>)> = dag.program_literals.iter().collect();
+        let public = lits.par_iter().map(|&(&e,v)| {
             assert!(dag.producers[e].is_none() && wit[e][0].role == Role::Input,
                 "program literal must be a public input leaf");
-            (e, Arc::new(v.clone()))
-        }).collect();
+            (e, Arc::new(v.par_iter().with_min_len(1 << 16).copied().collect::<Vec<u64>>()))
+        }).collect::<Vec<_>>().into_iter().collect();
         // Program literals are public program data: the verifier evaluates
         // them itself (Walk::push), so they are not committed.
         for &e in dag.program_literals.keys() { committed[e] = false; }
         // Terminal outputs: unconsumed first outputs of compute nodes (not the
         // zero certificate of a product check, not lookup gates).
+        lap("public");
         let outputs: Vec<(usize, Arc<Vec<u64>>)> = (0..ne).filter(|&e| {
             let w = &wit[e][0];
             dag.consumers[e].is_empty() && w.role == Role::Output && w.data.is_some() && !committed[e]
                 && dag.producers[e].map(|p| { let nd = &dag.nodes[p]; nd.outputs[0] == e && !matches!(nd.kind, BasicBlockType::ProductZeroCheck(_) | BasicBlockType::NonNegative(_)) }).unwrap_or(false)
         }).map(|e| (e, witness_vals(&wit[e][0]))).collect();
+        lap("outputs");
         let g = Graph { dag, shapes, edge_meta, nvars, committed, model, bool_typed, lookups, public, outputs, cfg, protocol_conv_pp };
         g.validate_exp_profile().expect("invalid canonical exp guard graph");
+        lap("exp validation");
         if std::env::var("MORPHEUS_LOOKUP_STATS").is_ok() { g.lookup_stats(); }
         g
     }

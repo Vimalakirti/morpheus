@@ -324,78 +324,94 @@ fn phases_v2_body<'u>(
     let tsz = match fac_p { Some(pp) => 1usize << (b0 - pp), None => 1usize << b0 };
     let mut dense_pw: Vec<std::sync::Arc<Vec<K8>>> = Vec::new();
     let mut tab_pw: Vec<u32> = Vec::new();
-    let mut qtabs: Vec<K8> = Vec::new();
     let mut qidx: Vec<u32> = Vec::new();
     let mut regions_c: Vec<RegionC> = Vec::new();
     let mut toff = 0u32;
-    for (ri, r) in regs.iter().enumerate() {
+    // Per region (in parallel): flags and, for dense regions, the block
+    // tables (block k, table); then assembled in region order.
+    let per: Vec<(u32, Vec<(usize, Vec<K8>)>)> = regs.par_iter().enumerate().map(|(ri, r)| {
         let h = r.m + r.p - b0;
         let dense = r.p > DENSE_P || r.terms.len() > 32;
         let mut flags = 0u32;
         if bits.contains(&(r.src, r.base)) { flags |= 1; }
         if onehot[ri] && r.terms.len() <= 4 && r.p <= 5 { flags |= 2; }
-        let qd_off = qidx.len() as u32;
         // Binned one-hot (see `onehot_bin_kernel`): round i = p from class bins.
         if flags & 2 != 0 && r.p == 4 && r.terms.len() <= 2 && b0 == 11 && !(r.p > DENSE_P || r.terms.len() > 32) && !no_bin { flags |= 8; }
-        if dense {
-            flags |= 4;
-            let idx_bits = b0 - r.p;
-            // (block k, term) pairs: a term whose high point bits are boolean
-            // addresses one block, others every block. Each block's table is
-            // accumulated in place (no per-term contribution vectors).
-            let kb = |ti: &TermInfo| -> Option<usize> {
-                if ti.r[idx_bits..].iter().all(|x| *x == K8::ZERO || *x == K8::ONE) { Some(ti.r[idx_bits..].iter().enumerate().fold(0usize, |a, (jj, x)| a | (((*x == K8::ONE) as usize) << jj))) } else { None }
-            };
-            let mut pairs: Vec<(usize, usize)> = r.terms.par_iter().flat_map_iter(|&t| match kb(&terms[t]) {
-                Some(k) => vec![(k, t)],
-                None => (0..1usize << h).map(|k| (k, t)).collect(),
-            }).collect();
-            pairs.par_sort_unstable();
-            let mut groups: Vec<(usize, usize, usize)> = Vec::new();
-            for (q, &(k, _)) in pairs.iter().enumerate() {
-                match groups.last_mut() { Some(g) if g.0 == k => g.2 = q + 1, _ => groups.push((k, q, q + 1)) }
-            }
-            let rp = r.p;
-            let fac = fac_p.is_some();
-            if fac { dense_pw.push(terms[r.terms[0]].pw.clone()); }
-            let tabs: Vec<(usize, Vec<K8>)> = groups.par_iter().map(|&(k, a, b)| {
-                let mut tab = vec![K8::ZERO; tsz];
-                for &(_, t) in &pairs[a..b] {
-                    if fac {
-                        let ti = &terms[t];
-                        let hi = ti.r[idx_bits..].iter().enumerate().fold(K8::ONE, |acc, (jj, x)| acc.mul(&eqb(x, (k >> jj) & 1)));
-                        let c = tcs[t].mul(&hi);
-                        for (il, e) in eq_table(&ti.r[..idx_bits]).iter().enumerate() { tab[il] = tab[il].add(&c.mul(e)); }
-                        continue;
-                    }
+        if !dense { return (flags, Vec::new()); }
+        flags |= 4;
+        let idx_bits = b0 - r.p;
+        // (block k, term) pairs: a term whose high point bits are boolean
+        // addresses one block, others every block. Each block's table is
+        // accumulated in place (no per-term contribution vectors).
+        let kb = |ti: &TermInfo| -> Option<usize> {
+            if ti.r[idx_bits..].iter().all(|x| *x == K8::ZERO || *x == K8::ONE) { Some(ti.r[idx_bits..].iter().enumerate().fold(0usize, |a, (jj, x)| a | (((*x == K8::ONE) as usize) << jj))) } else { None }
+        };
+        let mut pairs: Vec<(usize, usize)> = r.terms.par_iter().flat_map_iter(|&t| match kb(&terms[t]) {
+            Some(k) => vec![(k, t)],
+            None => (0..1usize << h).map(|k| (k, t)).collect(),
+        }).collect();
+        pairs.par_sort_unstable();
+        let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+        for (q, &(k, _)) in pairs.iter().enumerate() {
+            match groups.last_mut() { Some(g) if g.0 == k => g.2 = q + 1, _ => groups.push((k, q, q + 1)) }
+        }
+        let rp = r.p;
+        let fac = fac_p.is_some();
+        let tabs: Vec<(usize, Vec<K8>)> = groups.par_iter().map(|&(k, a, b)| {
+            let mut tab = vec![K8::ZERO; tsz];
+            for &(_, t) in &pairs[a..b] {
+                if fac {
                     let ti = &terms[t];
                     let hi = ti.r[idx_bits..].iter().enumerate().fold(K8::ONE, |acc, (jj, x)| acc.mul(&eqb(x, (k >> jj) & 1)));
                     let c = tcs[t].mul(&hi);
-                    let el = eq_table(&ti.r[..idx_bits]);
-                    for (il, e) in el.iter().enumerate() {
-                        if e.is_zero() { continue; }
-                        let ce = c.mul(e);
-                        let row = &mut tab[il << rp..(il + 1) << rp];
-                        for (bb, w) in ti.pw.iter().enumerate().take(1usize << rp) { if !w.is_zero() { row[bb] = row[bb].add(&ce.mul(w)); } }
-                    }
+                    for (il, e) in eq_table(&ti.r[..idx_bits]).iter().enumerate() { tab[il] = tab[il].add(&c.mul(e)); }
+                    continue;
                 }
-                (k, tab)
-            }).collect();
-            let mut ix = vec![u32::MAX; 1usize << h];
-            if std::env::var("MORPHEUS_LINK_STATS").is_ok() {
-                let mut ptrs: std::collections::HashSet<usize> = Default::default();
-                let mut vals: std::collections::HashSet<Vec<[u64; 8]>> = Default::default();
-                for &t in &r.terms { ptrs.insert(std::sync::Arc::as_ptr(&terms[t].pw) as usize); if vals.len() < 64 { vals.insert(terms[t].pw.iter().map(|x| x.0).collect()); } }
-                eprintln!("[densestats] region p={} m={} h={h} terms {} pairs {} tables {}; distinct pw arcs {} (values among first: {})", r.p, r.m, r.terms.len(), pairs.len(), tabs.len(), ptrs.len(), vals.len());
+                let ti = &terms[t];
+                let hi = ti.r[idx_bits..].iter().enumerate().fold(K8::ONE, |acc, (jj, x)| acc.mul(&eqb(x, (k >> jj) & 1)));
+                let c = tcs[t].mul(&hi);
+                let el = eq_table(&ti.r[..idx_bits]);
+                for (il, e) in el.iter().enumerate() {
+                    if e.is_zero() { continue; }
+                    let ce = c.mul(e);
+                    let row = &mut tab[il << rp..(il + 1) << rp];
+                    for (bb, w) in ti.pw.iter().enumerate().take(1usize << rp) { if !w.is_zero() { row[bb] = row[bb].add(&ce.mul(w)); } }
+                }
             }
-            for (k, tab) in tabs { ix[k] = (qtabs.len() / tsz) as u32; qtabs.extend(tab); if fac { tab_pw.push(dense_pw.len() as u32 - 1); } }
+            (k, tab)
+        }).collect();
+        if std::env::var("MORPHEUS_LINK_STATS").is_ok() {
+            let mut ptrs: std::collections::HashSet<usize> = Default::default();
+            let mut vals: std::collections::HashSet<Vec<[u64; 8]>> = Default::default();
+            for &t in &r.terms { ptrs.insert(std::sync::Arc::as_ptr(&terms[t].pw) as usize); if vals.len() < 64 { vals.insert(terms[t].pw.iter().map(|x| x.0).collect()); } }
+            eprintln!("[densestats] region p={} m={} h={h} terms {} pairs {} tables {}; distinct pw arcs {} (values among first: {})", r.p, r.m, r.terms.len(), pairs.len(), tabs.len(), ptrs.len(), vals.len());
+        }
+        (flags, tabs)
+    }).collect();
+    let ntab: usize = per.iter().map(|x| x.1.len()).sum();
+    let mut dst: Vec<(usize, &[K8])> = Vec::with_capacity(ntab);
+    for (ri, r) in regs.iter().enumerate() {
+        let h = r.m + r.p - b0;
+        let (flags, tabs) = &per[ri];
+        let dense = flags & 4 != 0;
+        let qd_off = qidx.len() as u32;
+        if dense {
+            if fac_p.is_some() { dense_pw.push(terms[r.terms[0]].pw.clone()); }
+            let mut ix = vec![u32::MAX; 1usize << h];
+            for (k, tab) in tabs { ix[*k] = dst.len() as u32; dst.push((dst.len(), &tab[..])); if fac_p.is_some() { tab_pw.push(dense_pw.len() as u32 - 1); } }
             qidx.extend(ix);
         }
         let tcnt = if dense { 0 } else { r.terms.len() as u32 };
         assert!(tcnt as usize <= 32, "region with more than 32 query terms");
-        regions_c.push(RegionC { src: r.src as u32, base_blk: (r.base >> b0) as u32, h: h as u32, p: r.p as u32, flags, toff, tcnt, qd_off });
+        regions_c.push(RegionC { src: r.src as u32, base_blk: (r.base >> b0) as u32, h: h as u32, p: r.p as u32, flags: *flags, toff, tcnt, qd_off });
         toff += r.terms.len() as u32;
     }
+    // Every table at its index, copied in parallel.
+    let mut qtabs: Vec<K8> = Vec::with_capacity(ntab * tsz);
+    unsafe { qtabs.set_len(ntab * tsz); }
+    qtabs.par_chunks_mut(tsz.max(1)).zip(dst.par_iter()).for_each(|(o, (_, t))| o.copy_from_slice(t));
+    drop(dst);
+    drop(per);
     // One-hot regions (never dense-q) keep, in qd_off, the base of their
     // terms in the compact per-term bin sums of the one-hot pass.
     let mut n_ohw = 0u32;
@@ -526,6 +542,7 @@ fn phases_v2_body<'u>(
                 let rl = |b: &Blk| Blk { src: loc[b.src as usize], ..*b };
                 let gen_base: Vec<Blk> = blocks.par_iter().filter(|b| mine(b) && !(b.region != u32::MAX && regions_c[b.region as usize].flags & 2 != 0)).map(rl).collect();
                 let oh_g: Vec<Blk> = oh.par_iter().filter(|b| mine(b)).map(rl).collect();
+                let t_f = t_sh.elapsed().as_secs_f64() * 1e3;
                 let mut gen_all = gen_base.clone();
                 gen_all.extend(oh_g.iter().rev().copied());
                 // Per-block constant slots: cr, cb and one per region term.
@@ -553,6 +570,7 @@ fn phases_v2_body<'u>(
                     }
                     regions_l[ri].qd_off = off;
                 }
+                let t_d = t_sh.elapsed().as_secs_f64() * 1e3;
                 let order_l: Vec<usize> = if global { (0..n).collect() } else { srcs.clone() };
                 let gr: Vec<K8> = order_l.iter().map(|&s| gp[s]).collect();
                 let gb: Vec<K8> = order_l.iter().map(|&s| gp[n + s]).collect();
@@ -570,7 +588,7 @@ fn phases_v2_body<'u>(
                 let c0 = sh.consts(&d_t0, 0, 0, dptr(&sh.qd));
                 let rc = unsafe { ffi::agl_mlink2_consts(sh.gen_all.as_ptr() as *const c_void, gen_all.len() as u32, &c0 as *const ConstsC as *const c_void, sh.bc.as_mut_ptr()) };
                 assert_eq!(rc, 0, "block constants");
-                if tm { eprintln!("[link2]   shard {g}: raw wait {t_raw:.0} ms, tables {:.0} ms", t_sh.elapsed().as_secs_f64() * 1e3 - t_raw); }
+                if tm { eprintln!("[link2]   shard {g}: raw wait {t_raw:.0} ms, tables {:.0} ms (filters {:.0}, block constants + dense {:.0}, uploads {:.0}; {} blocks, {} dense entries)", t_sh.elapsed().as_secs_f64() * 1e3 - t_raw, t_f - t_raw, t_d - t_f, t_sh.elapsed().as_secs_f64() * 1e3 - t_d, gen_all.len(), qt_g.len()); }
                 sh
             })
         }).collect();

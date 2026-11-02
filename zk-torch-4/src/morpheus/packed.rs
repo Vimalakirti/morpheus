@@ -27,11 +27,9 @@ pub struct Src {
 impl Src {
     pub fn zeros(digits: usize) -> Self {
         assert_eq!(digits % 4, 0);
-        // Parallel zero fill faults the pages in parallel.
-        let mut b: Vec<u8> = Vec::with_capacity(digits / 4);
-        unsafe { b.set_len(digits / 4); }
-        b.par_chunks_mut(1 << 20).for_each(|c| c.fill(0));
-        Src { b }
+        // Zeroed allocation: pages are mapped on first write (by the
+        // parallel fill), and never-written ones stay shared zero pages.
+        Src { b: vec![0u8; digits / 4] }
     }
     pub fn from_i8(d: &[i8]) -> Self {
         let mut s = Src::zeros(d.len());

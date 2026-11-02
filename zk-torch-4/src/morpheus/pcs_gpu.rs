@@ -351,18 +351,24 @@ impl LinkServices for PcsGpu {
 /// (device id, its W key cache), contiguous chunks per device; nothing stays
 /// resident.
 pub fn commit_streamed(p: &Profile, devs: &[(i32, &Keys)], raw: &dyn super::packed::Sources) -> Vec<Vec<Vec<u64>>> {
-    commit_streamed_on(p, None, devs, raw)
+    commit_streamed_on(p, None, devs, raw, None)
 }
 
 /// Same; devices in `extra` (id) build a temporary 3-prime source key cache
 /// from `seed` for the duration of the commitment.
-pub fn commit_streamed_on(p: &Profile, extra: Option<(&KeySeed, &[i32])>, devs: &[(i32, &Keys)], raw: &dyn super::packed::Sources) -> Vec<Vec<Vec<u64>>> {
+/// Commitments of every source, on `devs` (with key caches) and the extra
+/// devices. Batches go to devices round-robin, so sources finish roughly in
+/// order; `done(s, c)` is called as each source's commitment is ready.
+pub fn commit_streamed_on(p: &Profile, extra: Option<(&KeySeed, &[i32])>, devs: &[(i32, &Keys)], raw: &dyn super::packed::Sources,
+    done: Option<&(dyn Fn(usize, &[Vec<u64>]) + Sync)>) -> Vec<Vec<Vec<u64>>> {
     let n = raw.count();
     let mut all: Vec<(i32, Option<&Keys>)> = devs.iter().map(|&(d, k)| (d, Some(k))).collect();
     if let Some((_, ex)) = extra { for &d in ex { all.push((d, None)); } }
     let g = all.len().max(1).min(n.max(1));
-    let per = n.div_ceil(g);
-    let mut out: Vec<(usize, Vec<Vec<Vec<u64>>>)> = std::thread::scope(|sc| {
+    let len = raw.src_len();
+    let ncols = p.source_payload_cols + p.hiding;
+    let bv = commit_batch(ncols, len);
+    let mut out: Vec<(usize, Vec<Vec<u64>>)> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..g).map(|k| {
             let (dev, keys) = all[k];
             sc.spawn(move || {
@@ -372,19 +378,14 @@ pub fn commit_streamed_on(p: &Profile, extra: Option<(&KeySeed, &[i32])>, devs: 
                     Some(k) => &k.w,
                     None => { let (seed, _) = extra.unwrap(); tmp = super::commit_gpu::KeyCache::build(seed, super::keys::KeyKind::Source, p.rank, 0, p.source_payload_cols + p.hiding, 3); &tmp }
                 };
-                let (lo, hi) = ((k * per).min(n), ((k + 1) * per).min(n));
-                if lo == hi { return (lo, Vec::new()); }
-                let len = raw.src_len();
                 let rank = p.rank;
-                let ncols = p.source_payload_cols + p.hiding;
                 // Up to MORPHEUS_COMMIT_V sources per pass over the key cache
                 // (multi-vector MAC: each key element read once per pass).
-                let bv = commit_batch(ncols, len);
                 let mut scratch: Option<DeviceBuffer<u8>> = None;
                 let mut phys = DeviceBuffer::<i8>::new(len * bv).unwrap();
-                let mut v = Vec::with_capacity(hi - lo);
-                for s0 in (lo..hi).step_by(bv) {
-                    let nb = bv.min(hi - s0);
+                let mut v = Vec::new();
+                for s0 in (k * bv..n).step_by(g * bv) {
+                    let nb = bv.min(n - s0);
                     let mut err8: Vec<i8> = Vec::with_capacity(nb * rank * N);
                     for q in 0..nb {
                         super::packed::upload_i8(raw, s0 + q, &mut phys, q * len, true, &mut scratch);
@@ -393,16 +394,20 @@ pub fn commit_streamed_on(p: &Profile, extra: Option<(&KeySeed, &[i32])>, devs: 
                     let err = DeviceBuffer::from_slice(&err8.iter().map(|&x| x as i64).collect::<Vec<_>>()).unwrap();
                     let acc = super::commit_gpu::partial_raw(wk, 3, phys.as_ptr() as *const c_void, 1, nb, ncols, len, None);
                     let rr = ring_rows(finish(acc, nb, 3, rank, Some(&err)).to_vec().unwrap());
-                    v.extend(rr.chunks(rank).map(|c| c.to_vec()));
+                    for (q, c) in rr.chunks(rank).enumerate() {
+                        if let Some(f) = done { f(s0 + q, c); }
+                        v.push((s0 + q, c.to_vec()));
+                    }
                 }
-                (lo, v)
+                v
             })
         }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
     almost_goldilocks_cuda::set_device(0).unwrap();
     out.sort_by_key(|x| x.0);
-    out.into_iter().flat_map(|x| x.1).collect()
+    assert_eq!(out.len(), n);
+    out.into_iter().map(|x| x.1).collect()
 }
 
 /// Authentication replica on another device: key caches and the physical

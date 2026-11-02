@@ -401,15 +401,38 @@ pub fn prove_with_sources(
     let degs = p.degs();
     let Masks { u, r_cols, a_aux, s_o, r8 } = svc.masks(p, coins, opening, n);
     lap("masks");
-    let g_commit = match &r8 { Some(r8) => svc.commit_link8(p, seed, r8), None => svc.commit_link(p, seed, &r_cols) };
-    lap("link commitments");
+    // The link commitments are computed in chunks; each chunk is absorbed and
+    // hashed while the next one is computed (the transcript is unchanged).
     let c_o = svc.commit_aux(p, seed, &s_o);
-    for g in &g_commit { for c in g { tr.absorb(Item::LinkCommitment, c); } }
+    lap("aux commitment");
+    let chunk = std::env::var("MORPHEUS_LINK_COMMIT_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(256usize).max(1);
+    let g_commit: Vec<Vec<Vec<u64>>> = std::thread::scope(|sc| {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<Vec<Vec<u64>>>>();
+        let trr = &mut *tr;
+        let h = sc.spawn(move || {
+            let mut all = Vec::new();
+            for part in rx {
+                for g in &part { for c in g { trr.absorb(Item::LinkCommitment, c); } }
+                trr.hash_pending();
+                all.extend(part);
+            }
+            all
+        });
+        for a in (0..n).step_by(chunk) {
+            let b = (a + chunk).min(n);
+            let part = match &r8 { Some(r8) => svc.commit_link8(p, seed, &r8[a..b]), None => svc.commit_link(p, seed, &r_cols[a..b]) };
+            tx.send(part).unwrap();
+        }
+        drop(tx);
+        h.join().unwrap()
+    });
     for c in &c_o { tr.absorb(Item::AuxCommitment, c); }
+    lap("link commitments (hashed alongside)");
     let (alpha, gamma, eta) = super::link::challenges_scalar(tr, ell);
+    lap("link challenges");
     let mut gp = Vec::new();
     { let mut x = K8::ONE; for _ in 0..2 * n + st.rows.len() { gp.push(x); x = x.mul(&gamma); } }
-    lap("aux commitment + coins");
+    lap("row coefficients");
     let a_coef: Vec<Vec<K8>> = { let mut v = Vec::new(); let mut idx = 0; for &d in &degs { v.push((0..d).map(|k| a_aux[idx + k].0[0]).collect()); idx += d; } v };
     let (rounds, xi, w, q, chi, pre_alpha, mo_prefix) = if v2 {
         #[cfg(not(feature = "cuda"))]
@@ -611,13 +634,16 @@ pub fn prove_with_sources(
     let rho = tr.challenge_k_not01(Stage::LinkRound, 0, ell as u64);
     rounds.push(g);
     let point = Point { xi, rho };
+    lap("final round");
     let sources: Vec<SourceVec> = if c_src.is_none() {
         (0..n).zip(&r_cols).map(|(e, r)| SourceVec { w: raw_to_cols(&src.to_i8(e)), r: r.clone() }).collect()
     } else { Vec::new() };
     let (targets, target_o) = match c_src {
         None => (sources.iter().map(|s| f_x(p, seed, &point, &s.w, &s.r)).collect::<Vec<Tuple>>(), f_ox(p, seed, &point, &s_o)),
         Some(cs) => {
+            let t_ev = std::time::Instant::now();
             let ev = svc.ev(p, src, &point.xi);
+            if tm { eprintln!("[link] endpoint evaluations    {:8.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
             let rf = point.rho.mul(&K8::ONE.sub(&point.rho));
             let targets = (0..n).map(|e| Tuple {
                 c: cs[e].clone(),
@@ -629,7 +655,7 @@ pub fn prove_with_sources(
         }
     };
     let a_hat: Vec<AElem> = targets.iter().map(|t| t.a.clone()).collect();
-    lap("final round + targets");
+    lap("endpoints + targets");
     for a in &a_hat { tr.absorb_k(Item::Endpoint, &a.0); }
     tr.absorb_k(Item::Endpoint, &target_o.t.0);
     let proof = LinkProof { g_commit, c_o, rounds, a_hat, t_o: target_o.t.clone() };
