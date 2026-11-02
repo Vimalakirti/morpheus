@@ -883,15 +883,26 @@ pub fn col_shards(p: &Profile, raw: &dyn super::packed::Sources, devs: &[i32]) -
         let hs: Vec<_> = devs.iter().zip(col_ranges(p, devs.len())).map(|(&dev, (c0, c1))| sc.spawn(move || {
             almost_goldilocks_cuda::set_device(dev).expect("set device");
             let nc = c1 - c0;
-            let mut buf = DeviceBuffer::<u8>::new((n * nc * 1024).max(1)).expect("column shard");
-            let mut stage = DeviceBuffer::<u8>::new(nc * 1024).expect("column shard staging");
-            for s in 0..n {
-                let own;
-                let bytes: &[u8] = match raw.packed(s) { Some(x) => &x.b, None => { own = super::packed::Src::from_i8(&raw.to_i8(s)); &own.b } };
-                stage.copy_from_slice_at(0, &bytes[c0 * 1024..c1 * 1024]).expect("column upload");
-                let rc = unsafe { ffi::agl_morpheus_permute2(stage.as_ptr(), buf.as_mut_ptr().add(s * nc * 1024), nc as u64) };
-                assert_eq!(rc, 0, "permute2");
-            }
+            let buf = DeviceBuffer::<u8>::new((n * nc * 1024).max(1)).expect("column shard");
+            // Several copy threads per device (pageable copies of one thread
+            // run at a few GB/s), each with its own staging buffer.
+            let nt = std::env::var("MORPHEUS_COPY_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(4usize).max(1);
+            let dst = buf.as_ptr() as usize;
+            std::thread::scope(|s2| {
+                for t in 0..nt {
+                    s2.spawn(move || {
+                        almost_goldilocks_cuda::set_device(dev).expect("set device");
+                        let mut stage = DeviceBuffer::<u8>::new(nc * 1024).expect("column shard staging");
+                        for s in (t..n).step_by(nt) {
+                            let own;
+                            let bytes: &[u8] = match raw.packed(s) { Some(x) => &x.b, None => { own = super::packed::Src::from_i8(&raw.to_i8(s)); &own.b } };
+                            stage.copy_from_slice_at(0, &bytes[c0 * 1024..c1 * 1024]).expect("column upload");
+                            let rc = unsafe { ffi::agl_morpheus_permute2(stage.as_ptr(), (dst as *mut u8).add(s * nc * 1024), nc as u64) };
+                            assert_eq!(rc, 0, "permute2");
+                        }
+                    });
+                }
+            });
             ColShard { dev, c0, c1, nsrc: n, raw: buf }
         })).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
@@ -926,19 +937,26 @@ pub fn ev_cols(p: &Profile, shards: &[ColShard], xi: &[K8]) -> Vec<AElem> {
     let parts: Vec<Vec<Vec<u64>>> = std::thread::scope(|sc| {
         let hs: Vec<_> = shards.iter().map(|sh| { let pt = &pt; sc.spawn(move || {
             almost_goldilocks_cuda::set_device(sh.dev).expect("set device");
+            let t = Instant::now();
             let dp = DevPoint::new(p, pt);
+            let t_w = t.elapsed().as_secs_f64() * 1e3;
             let nc = sh.c1 - sh.c0;
             // Every source in one launch.
             let mut out = vec![0u64; sh.nsrc * 512];
             let rc = unsafe { ffi::agl_mauth_ev_packed_batch(sh.raw.as_ptr(), (nc * 1024) as u64, sh.nsrc as i32, nc as i32, dp.w.as_ptr().add(sh.c0 * 64 * 8), out.as_mut_ptr()) };
             assert_eq!(rc, 0, "batched Ev");
+            if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] endpoint device {}: weights {t_w:.0} ms, sums {:.0} ms", sh.dev, t.elapsed().as_secs_f64() * 1e3 - t_w); }
             out.chunks(512).map(|c| c.to_vec()).collect::<Vec<_>>()
         }) }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     almost_goldilocks_cuda::set_device(0).unwrap();
+    let t = Instant::now();
     let dp = DevPoint::new(p, &pt);
-    (0..n).map(|s| { let mut acc = vec![0u64; 512]; for d in &parts { add_mod(&mut acc, &d[s]); } dp.ev_finish(&acc) }).collect()
+    use rayon::prelude::*;
+    let out = (0..n).into_par_iter().map(|s| { let mut acc = vec![0u64; 512]; for d in &parts { add_mod(&mut acc, &d[s]); } dp.ev_finish(&acc) }).collect();
+    if std::env::var("MORPHEUS_TIMING").is_ok() { eprintln!("[auth] endpoint combine {:.2} s", t.elapsed().as_secs_f64()); }
+    out
 }
 
 /// One device's share of an attempt.

@@ -186,8 +186,26 @@ pub fn shard_upload(raw: &dyn crate::morpheus::packed::Sources, owner: &[usize],
     almost_goldilocks_cuda::set_device(g as i32).expect("set device");
     let src_len = raw.src_len();
     let srcs: Vec<usize> = (0..raw.count()).filter(|&s| owner[s] == g).collect();
-    let mut d = DeviceBuffer::<u8>::new((srcs.len() * src_len / 4).max(1)).expect("raw alloc");
-    for (j, &s) in srcs.iter().enumerate() { crate::morpheus::packed::upload_packed(raw, s, &mut d, j * src_len / 4); }
+    let d = DeviceBuffer::<u8>::new((srcs.len() * src_len / 4).max(1)).expect("raw alloc");
+    // Several copy threads (pageable copies of one thread run at a few GB/s).
+    let nt = std::env::var("MORPHEUS_COPY_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(4usize).max(1);
+    let (base, len) = (d.as_ptr() as usize, d.len());
+    std::thread::scope(|sc| {
+        for t in 0..nt {
+            let srcs = &srcs;
+            sc.spawn(move || {
+                almost_goldilocks_cuda::set_device(g as i32).expect("set device");
+                for j in (t..srcs.len()).step_by(nt) {
+                    let at = j * src_len / 4;
+                    let own;
+                    let bytes: &[u8] = match raw.packed(srcs[j]) { Some(x) => &x.b, None => { own = crate::morpheus::packed::Src::from_i8(&raw.to_i8(srcs[j])); &own.b } };
+                    assert!(at + bytes.len() <= len);
+                    let rc = unsafe { almost_goldilocks_cuda::ffi::cuda_memcpy_htod((base + at) as *mut std::ffi::c_void, bytes.as_ptr() as *const std::ffi::c_void, bytes.len()) };
+                    assert_eq!(rc, 0, "packed upload");
+                }
+            });
+        }
+    });
     d
 }
 

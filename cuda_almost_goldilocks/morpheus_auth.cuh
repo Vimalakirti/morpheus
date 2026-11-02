@@ -54,6 +54,8 @@ __global__ void ev_partial_kernel(const TW* __restrict__ W, int cols, const K8d*
     __shared__ __align__(16) unsigned char raw[TILE > RED ? TILE : RED];
     TW* s = reinterpret_cast<TW*>(raw);
     __shared__ K8d sw[64];
+    // −w per column: digits ±1 (every raw source digit) add w or −w.
+    __shared__ K8d snw[64];
     const int t = threadIdx.x, m = t & 63, qtr = t >> 6;
     u64 acc[8];
 #pragma unroll
@@ -67,11 +69,23 @@ __global__ void ev_partial_kernel(const TW* __restrict__ W, int cols, const K8d*
             const TW* col = W + (size_t)l * 4096;
             for (int i = t; i < 4096; i += 256) s[(i >> 6) * 65 + (i & 63)] = col[i];  // phys i = j + 64 m -> s[m][j]
         }
-        if (t < 64) sw[t] = w[(size_t)l * 64 + t];
+        if (t < 64) {
+            K8d x = w[(size_t)l * 64 + t];
+            sw[t] = x;
+#pragma unroll
+            for (int a = 0; a < 8; a++) { u64 c = fcanon(x.c[a]); x.c[a] = c ? Q - c : 0; }
+            snw[t] = x;
+        }
         __syncthreads();
         for (int j = qtr * 16; j < qtr * 16 + 16; j++) {
             int64_t v = (int64_t)s[m * 65 + j];
             if (v == 0) continue;
+            if (v == 1 || v == -1) {
+                const u64* c = v > 0 ? sw[j].c : snw[j].c;
+#pragma unroll
+                for (int a = 0; a < 8; a++) acc[a] = fadd(acc[a], c[a]);
+                continue;
+            }
             u64 x = to_field(v);
 #pragma unroll
             for (int a = 0; a < 8; a++) acc[a] = fadd(acc[a], fmul(sw[j].c[a], x));
