@@ -37,6 +37,7 @@
 #include "almost_extension_kernels.cu"
 
 #include <cstdio>
+#include <chrono>
 
 #define WRAPPER_BLOCK_SIZE 256
 
@@ -3515,20 +3516,22 @@ int agl_mlink2_round(const uint8_t* d_raw, uint64_t src_len, int b0, int i, int 
         if (e != cudaSuccess) { cuda_free(part); return -(int)e; }
         ml2_sum(part, grid, tmp.data()); add_into(); cuda_free(part);
     }
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 4; mode++) {
         const uint32_t n_generic = n_lists[mode];
         if (n_generic == 0) continue;
         int grid = sms * 16; if ((uint32_t)grid > n_generic) grid = (int)n_generic;
         void* part = nullptr; if (cuda_malloc(&part, (size_t)grid * mlink2::NACC * 64)) return -1;
         cudaMemset(part, 0, (size_t)grid * mlink2::NACC * 64);
+        const auto tm0 = std::chrono::steady_clock::now();
         const char* gd = getenv("MORPHEUS_DBG_GEN");
         const int dbg = (gd ? atoi(gd) : 0) | (skip_range ? 1 : 0);
-        auto gk = mode == 0 ? mlink2::generic_kernel<2, 0> : mode == 1 ? mlink2::generic_kernel<2, 1> : mlink2::generic_kernel<2, 2>;
+        auto gk = mode == 0 ? mlink2::generic_kernel<2, 0> : mode == 1 ? mlink2::generic_kernel<2, 1> : mode == 2 ? mlink2::generic_kernel<2, 2> : mlink2::generic_kernel<2, 3>;
         gk<<<grid, reduced ? 96 : 32 * (d + 1)>>>(d_raw, src_len, b0, i, d, (reduced ? 1 : 0) | (dbg << 1), (const mlink2::Blk*)d_generic, d_lists[mode], n_generic, C, (const mauth::K8d*)d_bc,
             (const mauth::K8d*)d_e1, (const mauth::K8d*)d_ealpha, (mauth::K8d*)part);
         cudaError_t e = cudaGetLastError(); if (e == cudaSuccess) e = agl_sync_mine();
         if (e != cudaSuccess) { cuda_free(part); return -(int)e; }
         ml2_sum(part, grid, tmp.data()); add_into(); cuda_free(part);
+        if (getenv("MORPHEUS_GEN_TIMES")) fprintf(stderr, "[gen] round %d mode %d: %u blocks %.1f ms\n", i, mode, n_generic, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tm0).count());
     }
     return 0;
 }

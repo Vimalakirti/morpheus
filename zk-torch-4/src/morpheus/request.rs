@@ -952,6 +952,11 @@ fn final_statement(pp: &Prepared, q: &[QueueEntry]) -> Statement {
 }
 
 fn final_transcript(o: &Opts, pp: &Prepared, b: u64, salt: &[u8; 64], c_model: &[Vec<Vec<u64>>], q: &[QueueEntry]) -> Option<MTranscript> {
+    let mut tr = final_transcript_head(o, pp, b, salt, c_model, q.len())?;
+    for e in q { final_transcript_entry(&mut tr, e.j, e.literal_prefix, &e.digest, e.c_carry, false); }
+    Some(tr)
+}
+fn final_transcript_head(o: &Opts, pp: &Prepared, b: u64, salt: &[u8; 64], c_model: &[Vec<Vec<u64>>], jb: usize) -> Option<MTranscript> {
     let words = super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log).ok()?;
     let mut tr = MTranscript::new(o.profile.name, salt);
     tr.absorb(Item::Statement, &[wire::PROTOCOL_VERSION, 1, o.defer as u64]);
@@ -960,37 +965,73 @@ fn final_transcript(o: &Opts, pp: &Prepared, b: u64, salt: &[u8; 64], c_model: &
     tr.absorb(Item::Statement, &words);
     absorb_layout(&mut tr, &pp.lay);
     absorb_model(&mut tr, c_model);
-    tr.absorb(Item::Statement, &[q.len() as u64, b]);
-    for e in q {
-        tr.absorb(Item::Statement, &[e.j]);
-        tr.absorb_bytes(Item::Other, e.literal_prefix);
-        tr.absorb_k(Item::Other, &[e.digest]);
-        for x in e.c_carry { tr.absorb(Item::SourceCommitment, x); }
-    }
+    tr.absorb(Item::Statement, &[jb as u64, b]);
     Some(tr)
+}
+fn final_transcript_entry(tr: &mut MTranscript, j: u64, literal_prefix: &[u8], digest: &K8, c_carry: &[Vec<u64>], hashed: bool) {
+    tr.absorb(Item::Statement, &[j]);
+    if hashed { tr.absorb_bytes_hashed(Item::Other, literal_prefix); } else { tr.absorb_bytes(Item::Other, literal_prefix); }
+    tr.absorb_k(Item::Other, &[*digest]);
+    for x in c_carry { tr.absorb(Item::SourceCommitment, x); }
+}
+
+/// The prover's finalization transcript of batch `b`, absorbed while its
+/// requests are proven: each request's literal prefix (GB-scale at model
+/// scale) is hashed as soon as the request exists and is not kept. The
+/// transcript equals `final_transcript` over the same queue.
+pub struct FinalPrefix { b: u64, jb: usize, salt: [u8; 64], tr: MTranscript, js: Vec<u64>, digests: Vec<K8> }
+impl FinalPrefix {
+    /// Reserves the finalization opening of batch `b` (of `jb` requests).
+    pub fn begin(pp: &Prepared, o: &Opts, b: u64, model: &ModelReg, jb: usize) -> Self {
+        assert!(o.defer && jb > 0);
+        let salt = o.coins.begin_opening(fin_opening(b)).expect("opening identifier already consumed or lifetime exhausted");
+        let mut tr = final_transcript_head(o, pp, b, &salt, &model.c, jb).expect("invalid finalization statement");
+        tr.hash_pending();
+        FinalPrefix { b, jb, salt, tr, js: Vec::new(), digests: Vec::new() }
+    }
+    pub fn push(&mut self, j: u64, literal_prefix: &[u8], digest: &K8, c_carry: &[Vec<u64>]) {
+        assert!(self.js.len() < self.jb, "batch already complete");
+        final_transcript_entry(&mut self.tr, j, literal_prefix, digest, c_carry, true);
+        self.tr.hash_pending();
+        self.js.push(j); self.digests.push(*digest);
+    }
+    pub fn complete(&self) -> bool { self.js.len() == self.jb }
 }
 
 /// Finalize batch `b`: open the model sources and the queued carry banks
 /// against every deferred row.
 pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[QueueEntry], carries: Vec<Vec<i8>>, pc: &mut PcsGpu, reps: &mut Replicas) -> FinalOut {
+    finalize_with(pp, o, b, model, q, carries, pc, reps, None)
+}
+/// `finalize` with the transcript prefix absorbed during the batch
+/// (`FinalPrefix`); the entries' literal prefixes are then not read.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_with(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[QueueEntry], carries: Vec<Vec<i8>>, pc: &mut PcsGpu, reps: &mut Replicas, pre: Option<FinalPrefix>) -> FinalOut {
     assert!(o.defer && !q.is_empty(), "finalization needs a nonempty deferred queue");
     assert_eq!(model.layout, model_layout_words(pp), "registered model layout changed");
     assert_eq!(model.statement, super::statement::model_words(&pp.g, &o.profile, &o.seed, o.b0, o.defer, o.carry_log)
         .expect("invalid finalization program"), "registered program identity changed");
     let mut times = Times::new();
     let opening = fin_opening(b);
+    if let Some(p) = &pre {
+        assert!(p.b == b && p.jb == q.len() && p.js.iter().copied().eq(q.iter().map(|e| e.j)) && p.digests.iter().zip(q).all(|(d, e)| *d == e.digest),
+            "finalization prefix of a different queue");
+    }
     // Reserve before taking/extending model.raw: duplicate/lifetime failures
     // must leave the reusable registered source intact.
-    let salt = o.coins.begin_opening(opening).expect("opening identifier already consumed or lifetime exhausted");
+    let (salt, pre_tr) = match pre { Some(p) => (p.salt, Some(p.tr)), None => (o.coins.begin_opening(opening).expect("opening identifier already consumed or lifetime exhausted"), None) };
     let t = Instant::now();
     let st = final_statement(pp, q);
     // The registered model sources stay packed; this opening uses int8 copies.
-    let raw: Vec<Vec<i8>> = model.raw.iter().map(|r| r.unpack()).chain(carries).collect();
+    // Streamed (as a request): the registered model sources stay packed.
+    // Resident: this opening uses int8 copies.
+    let stream = o.streams(model.raw.len() + carries.len());
+    let carry_src: Vec<super::packed::Src> = if stream { carries.iter().map(|c| super::packed::Src::from_i8(c)).collect() } else { Vec::new() };
+    let raw: Vec<Vec<i8>> = if stream { Vec::new() } else { model.raw.iter().map(|r| r.unpack()).chain(carries).collect() };
     let raw = std::sync::Arc::new(raw);
     let mut c_src = model.c.clone();
     for e in q { c_src.push(e.c_carry.to_vec()); }
-    let mut tr = final_transcript(o, pp, b, &salt, &model.c, q).expect("invalid finalization statement");
-    let stream = o.streams(raw.len());
+    let mut tr = match pre_tr { Some(tr) => tr, None => final_transcript(o, pp, b, &salt, &model.c, q).expect("invalid finalization statement") };
     pc.streamed = stream;
     let (mut rep_vec, raw) = std::thread::scope(|sc| {
         if stream { return (std::mem::take(&mut reps.r), raw); }
@@ -1002,11 +1043,14 @@ pub fn finalize(pp: &Prepared, o: &Opts, b: u64, model: &mut ModelReg, q: &[Queu
     lap(&mut times, "load", t);
     let raw: Vec<Vec<i8>> = std::sync::Arc::try_unwrap(raw).unwrap_or_else(|_| panic!("final sources still shared"));
     let t = Instant::now();
-    let fast = link_fast::prove_with(&o.profile, &o.seed, &o.coins, opening, &mut tr, &st, &raw, o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), true);
+    let refs: Vec<&super::packed::Src> = model.raw.iter().chain(carry_src.iter()).collect();
+    let (packs, i8s) = (super::packed::Refs(&refs), super::packed::I8s(&raw));
+    let src: &dyn super::packed::Sources = if stream { &packs } else { &i8s };
+    let fast = link_fast::prove_with_sources(&o.profile, &o.seed, &o.coins, opening, &mut tr, &st, src, o.b0, &link_gpu::gpu_backend, pc, Some(&c_src), true);
     lap(&mut times, "link", t);
     let support = final_support(pp, o).expect("invalid final public support");
     let runs = auth_gpu::runs_of(&support);
-    if o.auth && support.len() < o.profile.source_cols() { super::auth_compact::check_raw_support(&o.profile, &support, &raw); }
+    if o.auth && support.len() < o.profile.source_cols() { super::auth_compact::check_support(&o.profile, &support, src); }
     let auth = if !o.auth { None } else if pc.streamed { Some(authenticate_streamed(o, opening, pc, &fast, &tr, &runs, &mut times)) } else { Some(authenticate(o, opening, pc, &mut rep_vec, &fast, &tr, &runs, &mut times)) };
     reps.r = rep_vec;
     pc.streamed = false;

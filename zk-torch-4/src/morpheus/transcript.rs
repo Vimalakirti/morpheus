@@ -367,6 +367,29 @@ impl MTranscript {
         self.sponge.update(&self.prefix[self.absorbed - self.base..]);
         self.absorbed = self.base + self.prefix.len();
     }
+    /// `absorb_bytes` followed by `hash_pending`, without keeping the bytes:
+    /// the transcript continues like a fork (no literal prefix), with the
+    /// same sponge and parser state.
+    pub fn absorb_bytes_hashed(&mut self, item: Item, bytes: &[u8]) {
+        self.hash_pending();
+        let mut head = Vec::with_capacity(17);
+        head.push(2u8);
+        head.extend_from_slice(&(item as u64).to_be_bytes());
+        head.extend_from_slice(&u64::try_from(bytes.len()).expect("frame length").to_be_bytes());
+        let end = self.absorbed.checked_add(17).and_then(|n| n.checked_add(bytes.len())).expect("address length overflow");
+        assert!(u64::try_from(end).unwrap() <= MAX_ADDRESS_BYTES, "address cap exceeded");
+        // The parser's checks for an encoding-2 frame (header only).
+        let p = &mut self.parse;
+        if !p.failed {
+            if p.frame_number < 2 || p.pending.is_some() || !matches!(item as u64, 1..=11 | 99) { p.failed = true; }
+            else { p.parsed = end; p.frame_number += 1; }
+        }
+        self.sponge.update(&head);
+        self.sponge.update(bytes);
+        self.prefix.clear();
+        self.absorbed = end;
+        self.base = end;
+    }
     /// Bytes absorbed but not hashed yet.
     pub fn pending_bytes(&self) -> usize { self.base + self.prefix.len() - self.absorbed }
     pub fn fork(&self) -> Self {
@@ -531,6 +554,26 @@ mod tests {
         }
         assert_eq!(a.challenge_k_bundle(Stage::LinkInit, 0, 3), b.challenge_k_bundle(Stage::LinkInit, 0, 3));
         assert_eq!(a.prefix, b.prefix);
+    }
+    #[test]
+    fn absorb_bytes_hashed_is_transparent() {
+        let mut a = MTranscript::new("p", &[4u8; 64]);
+        let mut b = a.clone();
+        let big: Vec<u8> = (0..5000u32).map(|i| (i * 31) as u8).collect();
+        for i in 0..3u64 {
+            for t in [&mut a, &mut b] { t.absorb(Item::Statement, &[i]); }
+            a.absorb_bytes(Item::Other, &big[..1000 * i as usize]);
+            b.absorb_bytes_hashed(Item::Other, &big[..1000 * i as usize]);
+            for t in [&mut a, &mut b] { t.absorb_k(Item::Other, &[K8::ONE]); }
+            assert_eq!(a.challenge_k(Stage::LinkRound, 0, i), b.challenge_k(Stage::LinkRound, 0, i));
+        }
+        assert_eq!(a.challenge_k_bundle(Stage::LinkInit, 0, 3), b.challenge_k_bundle(Stage::LinkInit, 0, 3));
+        // A frame the parser rejects (pending query result) fails the same way.
+        let (mut c, mut d) = (a.clone(), b.clone());
+        c.parse.pending = Some(Card::Q8); d.parse.pending = Some(Card::Q8);
+        c.absorb_bytes(Item::Other, &big[..10]); c.hash_pending(); c.parse.advance_at(&c.prefix, c.base);
+        d.absorb_bytes_hashed(Item::Other, &big[..10]);
+        assert!(c.parse.failed && d.parse.failed);
     }
     #[test]
     fn c0_tuple_digits_equal_shifting() {

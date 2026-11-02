@@ -1396,14 +1396,16 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
         vec![v[0], K8::ZERO, v[2], v[3], K8::ZERO, v[4], K8::ZERO, v[6], K8::ZERO, K8::ZERO]
     } else {
         // Generic blocks by kind (specialised kernels): 0 no query, 1 fast
-        // query (≤ 2 terms, 2^pa ≤ 8, no dense table), 2 general. Blocks
-        // without a query have nothing to do when the range is binned.
-        let mut lists: [Vec<u32>; 3] = Default::default();
+        // query (≤ 2 terms, 2^pa ≤ 8, no dense table), 2 general, 3 many
+        // terms (2^{i+1+pa} ≤ 32: sums by additions). Blocks without a
+        // query have nothing to do when the range is binned.
+        let many = std::env::var_os("MORPHEUS_NO_MANYQ").is_none();
+        let mut lists: [Vec<u32>; 4] = Default::default();
         for (bi, b) in sh.gen_all_h[..n_gen].iter().enumerate() {
             let mode = if b.region == u32::MAX { 0 } else {
                 let r = &regions_c[b.region as usize];
                 let pa = if i < r.p as usize { r.p as usize - i - 1 } else { 0 };
-                if r.flags & 4 != 0 { 2 } else if r.tcnt == 0 { 0 } else if r.tcnt <= 2 && pa <= 3 { 1 } else { 2 }
+                if r.flags & 4 != 0 { 2 } else if r.tcnt == 0 { 0 } else if r.tcnt <= 2 && pa <= 3 { 1 } else if many && i + 1 + pa <= 5 && (r.tcnt as usize) << pa <= 128 { 3 } else { 2 }
             };
             if mode == 0 && rin.skip_range { continue; }
             lists[mode].push(bi as u32);

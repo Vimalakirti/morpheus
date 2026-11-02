@@ -365,6 +365,50 @@ __global__ void __launch_bounds__(160, MINB) generic_kernel(
             __syncthreads();
         }
         if (!(kzero_p(b3) && kzero_p(b2))) acc_r = kadd(acc_r, kadd(kmul(s_cr, b3), kmul(s_cb, b2)));
+        if (MODE == 3 && !(dbg & 2)) {
+            // Many-term query (no dense table, 2^{i+1+pa} ≤ 32): as the fast
+            // query, with rest = (ir << pa) | pr,
+            //   Σ_r q_t w_t = Σ_T Σ_pr c_T (A0 + t dA)[pr]·((1−t)S0 + t S1)[pr],
+            //   S_side[T][pr] = Σ_ir B_T[ir] w_side(ir, pr).
+            // Over the block's digits x = ((2 rest + side) << i) | p, with
+            // w_side = Σ_p e_pre[p] digit(x): S = Σ_p e_pre[p] U_T(pr, side, p),
+            // U_T = Σ_ir ±B_T[ir] by additions only. One warp per term; lane ℓ
+            // takes x ≡ ℓ (mod 32), so its (pr, side, p) = ℓ mod 2^{i+1+pa}.
+            // S lands in QF (unused here); then (term, pr) pairs across lanes.
+            const int nw = (int)(blockDim.x >> 5), np2 = 1 << i, nx = 1 << b0;
+            for (int k = wp; k < tcnt; k += nw) {
+                const Term T = C.terms[toff + k];
+                const int sh = i + 1 + (int)T.pa, cb = 1 << sh;
+                const K8d* Bk = C.B + T.boff;
+                K8d u = kzero(), um = kzero();
+                for (int x = lane; x < nx; x += 32) {
+                    const int v = dig(dg, x);
+                    if (v == 1) u = kadd(u, Bk[x >> sh]); else if (v == -1) um = kadd(um, Bk[x >> sh]);
+                }
+                u = kcanon(ksub(u, um));
+                for (int off = 16; off >= cb; off >>= 1) u = kadd(u, shfl_down_k(u, off));
+                // Lanes < cb: U(pr = ℓ >> (i+1), side = (ℓ >> i) & 1, p = ℓ & (2^i − 1)).
+                if (i > 0) u = kmul(kcanon(u), e_pre[lane & (np2 - 1)]);
+                u = kcanon(u);
+                for (int off = np2 >> 1; off > 0; off >>= 1) u = kadd(u, shfl_down_k(u, off));
+                // Lane (pr << (i+1)) | (side << i): S_side[pr], kept in QF.
+                if (lane < cb && (lane & (np2 - 1)) == 0) QF[((k << T.pa) + (lane >> (i + 1))) * 2 + ((lane >> i) & 1)] = kcanon(u);
+            }
+            __syncthreads();
+            if (doq) {
+                const int pa = s_pa, np = 1 << pa;
+                for (int idx = lane; idx < (tcnt << pa); idx += 32) {
+                    const int k = idx >> pa, pr = idx & (np - 1);
+                    const Term T = C.terms[toff + k];
+                    const K8d a0 = C.A[T.aoff + pr], a1 = C.A[T.aoff + np + pr];
+                    const K8d x = kmul(s_ct[k], a0), y = kmul(s_ct[k], ksub(a1, a0));
+                    const K8d sa = QF[2 * idx], dsx = ksub(QF[2 * idx + 1], sa);
+                    K8d qv, sv;
+                    for (int a = 0; a < 8; a++) { qv.c[a] = mauth::fadd(x.c[a], mauth::fmul(y.c[a], tq)); sv.c[a] = mauth::fadd(sa.c[a], mauth::fmul(dsx.c[a], tq)); }
+                    acc_q = kadd(acc_q, kmul(qv, sv));
+                }
+            }
+        }
         if (fastq) {
             // Sums per pr: within warps over lanes ≡ pr (mod 2^pa), then across
             // warps through QF (unused by fast blocks): RED[warp][pr][4].

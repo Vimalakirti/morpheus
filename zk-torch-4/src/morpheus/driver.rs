@@ -106,10 +106,41 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &mut [Vec<Witness>], public: &[us
     }
     let input_reg = request::register_inputs(&pp, &o, &mut pc);
     println!("private input registration (one-time): {} sources committed in {:.2}s", input_reg.source_count(), input_reg.secs);
+    // Deferred: each batch's finalization transcript absorbs its requests'
+    // literal prefixes on a host thread while later requests are proven
+    // (MORPHEUS_FINAL_EAGER=1 absorbs them at finalization instead).
+    type PrefixMsg = (usize, u64, Vec<u8>, crate::morpheus::field8::K8, Vec<Vec<u64>>);
+    let mut pre_tx: Option<std::sync::mpsc::Sender<PrefixMsg>> = None;
+    let mut pre_rx: Option<std::sync::mpsc::Receiver<(usize, request::FinalPrefix, f64)>> = None;
+    let mut hasher = None;
+    let mut batch_of: Vec<usize> = Vec::new();
+    if o.defer && std::env::var_os("MORPHEUS_FINAL_EAGER").is_none() {
+        let m = model_reg.as_ref().unwrap();
+        let sizes = batch_sizes(n);
+        let mut pres = Vec::new();
+        for (b, &jb) in sizes.iter().enumerate() { pres.push(Some(request::FinalPrefix::begin(&pp, &o, b as u64, m, jb))); batch_of.extend(std::iter::repeat(b).take(jb)); }
+        let (tx, rx) = std::sync::mpsc::channel::<PrefixMsg>();
+        let (btx, brx) = std::sync::mpsc::channel();
+        hasher = Some(std::thread::spawn(move || {
+            for (b, j, lp, dg, cc) in rx {
+                let t = Instant::now();
+                let p: &mut request::FinalPrefix = pres[b].as_mut().expect("batch already complete");
+                p.push(j, &lp, &dg, &cc);
+                drop(lp);
+                let s = t.elapsed().as_secs_f64();
+                if p.complete() { btx.send((b, pres[b].take().unwrap(), s)).unwrap(); }
+            }
+        }));
+        pre_tx = Some(tx); pre_rx = Some(brx);
+    }
     for j in 0..n as u64 {
         let mut out = request::prove_request(&mut pp, &o, j, model_reg.as_ref(), &input_reg, &mut pc, &mut reps);
+        if let (Some(tx), Some(&b)) = (&pre_tx, batch_of.get(j as usize)) {
+            tx.send((b, j, std::mem::take(&mut out.literal_prefix), out.digest, out.c_carry.clone().expect("deferred request carry"))).unwrap();
+        }
         out.times.insert("prep", prep);
         let s = show(&format!("request {j} prove"), &out.times);
+        if std::env::var_os("MORPHEUS_PROOF_HASH").is_some() { println!("request {j} proof hash {}", proof_hash(&out.bytes)); }
         println!("  {} PIOP rows, {} carries, {} PIOP messages, {} proof bytes", out.rows, out.carries, out.piop_len, out.bytes.len());
         req_secs.push(s);
         if o.verify {
@@ -149,8 +180,15 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &mut [Vec<Witness>], public: &[us
             start += jb;
             let carries: Vec<Vec<i8>> = outs[range.clone()].iter_mut().map(|o| o.carry_raw.take().unwrap()).collect();
             let q: Vec<QueueEntry> = range.clone().map(|j| QueueEntry { j: j as u64, deferred: &outs[j].deferred, c_carry: outs[j].c_carry.as_ref().unwrap(), digest: outs[j].digest, literal_prefix: &outs[j].literal_prefix }).collect();
-            let fo = request::finalize(&pp, &o, b as u64, m, &q, carries, &mut pc, &mut reps);
+            // The batch's last prefix is charged to the finalization in full,
+            // as if finalization started right after its last request.
+            let pre = pre_rx.as_ref().map(|rx| { let (bb, p, last) = rx.recv().expect("finalization prefix"); assert_eq!(bb, b); (p, last) });
+            let fo = match pre {
+                Some((p, last)) => { let mut fo = request::finalize_with(&pp, &o, b as u64, m, &q, carries, &mut pc, &mut reps, Some(p)); fo.times.insert("prefix", last); fo }
+                None => request::finalize(&pp, &o, b as u64, m, &q, carries, &mut pc, &mut reps),
+            };
             let fs = show(&format!("finalize batch {b} (J = {jb}, {} deferred rows, {} proof bytes)", fo.rows, fo.bytes.len()), &fo.times);
+            if std::env::var_os("MORPHEUS_PROOF_HASH").is_some() { println!("finalize batch {b} proof hash {}", proof_hash(&fo.bytes)); }
             let mut fv = 0.0;
             if o.verify {
                 let t = Instant::now();
@@ -182,6 +220,8 @@ pub fn run_with_ar(name: &str, dag: &Dag, wit: &mut [Vec<Witness>], public: &[us
             batches.push((jb, fs, fv, fo.bytes.len() as f64));
         }
     }
+    drop(pre_tx);
+    if let Some(h) = hasher { h.join().expect("finalization prefix thread"); }
     let u = units as f64;
     let pr = mean(&req_secs);
     println!("\n=== {} ({}; {} request(s), {}) ===", name, o.profile.name, n, if o.defer { "deferred fixed-weight opening" } else { "monolithic" });
@@ -207,4 +247,11 @@ fn o_defer_batches() -> Option<Vec<usize>> {
     std::env::var("DEFER_BATCHES").ok().map(|v| v.split(',').map(|x| x.trim().parse().expect("DEFER_BATCHES: sizes")).collect())
 }
 /// Batch sizes for `n` requests: DEFER_BATCHES, or one batch of all.
+/// Short SHAKE256 fingerprint of serialized proof bytes (reproducibility checks).
+fn proof_hash(b: &[u8]) -> String {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    let mut h = sha3::Shake256::default(); h.update(b);
+    let mut o = [0u8; 16]; h.finalize_xof().read(&mut o);
+    o.iter().map(|x| format!("{x:02x}")).collect()
+}
 fn batch_sizes(n: usize) -> Vec<usize> { o_defer_batches().unwrap_or_else(|| vec![n]) }
