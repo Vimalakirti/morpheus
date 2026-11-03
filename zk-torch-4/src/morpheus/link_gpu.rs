@@ -151,6 +151,11 @@ fn kvec(words: &[u64]) -> Vec<K8> { words.chunks(8).map(|c| K8(c.try_into().unwr
 pub struct PreShards { pub owner: Vec<usize>, pub bufs: Vec<Option<DeviceBuffer<u8>>> }
 
 /// Devices the link shards its sources over (MORPHEUS_GPUS).
+/// MORPHEUS_DENSE_LINK=1: the same link without structure. Every block of
+/// every source is visited, and the one-hot, binned, factored, reduced-round,
+/// index, fast-query and many-term paths are off (a same-protocol ablation).
+pub fn dense_link() -> bool { std::env::var_os("MORPHEUS_DENSE_LINK").is_some() }
+
 pub fn shard_gpus(n: usize) -> usize {
     std::env::var("MORPHEUS_GPUS").ok().and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1).min(n.max(1))
 }
@@ -162,7 +167,9 @@ pub fn shard_owner(raw: &dyn crate::morpheus::packed::Sources, bits: &[Vec<(usiz
     let n = raw.count();
     let wgen: usize = std::env::var("MORPHEUS_GEN_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
     let nblk = raw.src_len() >> b0;
+    let dense = dense_link();
     let per_src: Vec<usize> = (0..n).into_par_iter().map(|s| {
+        if dense { return nblk; }
         let mut bit = vec![false; nblk];
         for &(base, lg) in &bits[s] { let (a, c) = (base >> b0, 1usize << lg.saturating_sub(b0)); for x in bit.iter_mut().skip(a).take(c) { *x = true; } }
         (0..nblk).into_par_iter().map(|k| if !raw.is_zero(s, k << b0, 1usize << b0) { if bit[k] { 1 } else { wgen } } else { 0 }).sum::<usize>()
@@ -322,9 +329,10 @@ fn phases_v2_body<'u>(
     }
     lap("hi tables");
     // One-hot detection (bit-typed regions whose indices each hold one 1).
-    let no_bin = std::env::var("MORPHEUS_NO_BIN").is_ok();
+    let dense = dense_link();
+    let no_bin = dense || std::env::var("MORPHEUS_NO_BIN").is_ok();
     let onehot: Vec<bool> = regs.par_iter().map(|r| {
-        if r.p == 0 || r.p > DENSE_P || !bits.contains(&(r.src, r.base)) { return false; }
+        if dense || r.p == 0 || r.p > DENSE_P || !bits.contains(&(r.src, r.base)) { return false; }
         let np = 1usize << r.p;
         (0..1usize << r.m).into_par_iter().with_min_len(1 << 12).all(|k| raw.nonzeros(r.src, r.base + k * np, np) == (1, true))
     }).collect();
@@ -335,7 +343,7 @@ fn phases_v2_body<'u>(
     // round's folded tables are expanded on the device (`dense_round_tables`).
     let fac_p: Option<usize> = {
         let dr: Vec<&Reg> = regs.iter().filter(|r| r.p > DENSE_P || r.terms.len() > 32).collect();
-        let ok = !dr.is_empty() && std::env::var("MORPHEUS_NO_FACTOR").is_err()
+        let ok = !dr.is_empty() && !dense && std::env::var("MORPHEUS_NO_FACTOR").is_err()
             && dr.iter().all(|r| r.p == dr[0].p && r.terms.iter().all(|&t| std::sync::Arc::ptr_eq(&terms[t].pw, &terms[r.terms[0]].pw)));
         ok.then_some(dr[0].p)
     };
@@ -473,7 +481,7 @@ fn phases_v2_body<'u>(
         if rs == s && id < rb + rn { Some((ri, id - rb)) } else { None }
     };
     let blocks: Vec<Blk> = (0..n).into_par_iter().flat_map_iter(|s| {
-        (0..nblk_src).filter(move |&id| !raw.is_zero(s, id << b0, 1usize << b0)).map(move |id| (s, id)).collect::<Vec<_>>()
+        (0..nblk_src).filter(move |&id| dense || !raw.is_zero(s, id << b0, 1usize << b0)).map(move |id| (s, id)).collect::<Vec<_>>()
     }).map(|(s, id)| match find(s, id) { Some((ri, k)) => Blk { src: s as u32, id: id as u32, region: ri as u32, k: k as u32 }, None => Blk { src: s as u32, id: id as u32, region: u32::MAX, k: 0 } }).collect();
     lap("nonzero block scan");
     if std::env::var("MORPHEUS_LINK_STATS").is_ok() {
@@ -513,7 +521,7 @@ fn phases_v2_body<'u>(
     let calo_h = eq_table(&alpha[b0..b0 + ca_lo_bits]);
     let cahi_h = eq_table(&alpha[b0 + ca_lo_bits..]);
     let mut claims: Option<(K8, K8)> = None;
-    let no_claim = std::env::var("MORPHEUS_NO_CLAIM").is_ok();
+    let no_claim = dense || std::env::var("MORPHEUS_NO_CLAIM").is_ok();
     // Blocks grouped by region plane bits, so each round's one-hot list is a prefix.
     let is_oh = |b: &Blk| b.region != u32::MAX && regions_c[b.region as usize].flags & 2 != 0;
     lap("eq tables");
@@ -654,7 +662,7 @@ fn phases_v2_body<'u>(
         }
     }
     // Round-1 range sums of the generic blocks from digit classes (`range_bin1_kernel`).
-    let rb1 = b0 >= 3 && std::env::var("MORPHEUS_NO_RB1").is_err();
+    let rb1 = b0 >= 3 && !dense && std::env::var("MORPHEUS_NO_RB1").is_err();
     let mut rb1_bins: Vec<K8> = Vec::new();
     let mut rounds = Vec::new();
     let mut xi: Vec<K8> = Vec::new();
@@ -700,7 +708,7 @@ fn phases_v2_body<'u>(
         // device; t = 1 from the previous round's claims
         //   R_{i-1}(r) = (1 − α_i) R_i(0) + α_i R_i(1),  Q_{i-1}(r) = Q_i(0) + Q_i(1).
         let reduced = d == 4 && claims.is_some() && !alpha[i].is_zero() && !no_claim;
-        let use_index = reduced && (1usize << (b0 - i)) <= 128 && i >= 4 && b0 >= 9 && std::env::var("MORPHEUS_NO_INDEX").is_err();
+        let use_index = reduced && (1usize << (b0 - i)) <= 128 && i >= 4 && b0 >= 9 && !dense && std::env::var("MORPHEUS_NO_INDEX").is_err();
         let rin = RoundIn { i, d, b0, src_len, reduced, use_index, halve: &halve, b_total, bseg: &bseg, r_prev: xi.last().copied(), full: false, b5: &b5, xi: &xi, fac_p, dense_pw: &dense_pw, skip_range: rb1 && i == 1, rb1, a_all: &a_all, b_all: &b_all, tc: &tc, e1: &e1, e2: &e2, e3: &e3, ea: &ea };
         let dev_ms = std::sync::Mutex::new(vec![0f64; shards.len()]);
         let outs: Vec<(Vec<K8>, Option<OhSums>, Option<Vec<K8>>)> = std::thread::scope(|sc| {
@@ -1399,13 +1407,14 @@ fn shard_round(sh: &mut Shard, dev_raw: Option<&DeviceBuffer<i8>>, rin: &RoundIn
         // query (≤ 2 terms, 2^pa ≤ 8, no dense table), 2 general, 3 many
         // terms (2^{i+1+pa} ≤ 32: sums by additions). Blocks without a
         // query have nothing to do when the range is binned.
-        let many = std::env::var_os("MORPHEUS_NO_MANYQ").is_none();
+        let dense = dense_link();
+        let many = !dense && std::env::var_os("MORPHEUS_NO_MANYQ").is_none();
         let mut lists: [Vec<u32>; 4] = Default::default();
         for (bi, b) in sh.gen_all_h[..n_gen].iter().enumerate() {
             let mode = if b.region == u32::MAX { 0 } else {
                 let r = &regions_c[b.region as usize];
                 let pa = if i < r.p as usize { r.p as usize - i - 1 } else { 0 };
-                if r.flags & 4 != 0 { 2 } else if r.tcnt == 0 { 0 } else if r.tcnt <= 2 && pa <= 3 { 1 } else if many && i + 1 + pa <= 5 && (r.tcnt as usize) << pa <= 128 { 3 } else { 2 }
+                if r.flags & 4 != 0 { 2 } else if r.tcnt == 0 { 0 } else if !dense && r.tcnt <= 2 && pa <= 3 { 1 } else if many && i + 1 + pa <= 5 && (r.tcnt as usize) << pa <= 128 { 3 } else { 2 }
             };
             if mode == 0 && rin.skip_range { continue; }
             lists[mode].push(bi as u32);
