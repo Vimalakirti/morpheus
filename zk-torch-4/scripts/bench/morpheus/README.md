@@ -25,6 +25,14 @@ DP_WORK=$DP ./run_paper.sh one      # one-GPU comparisons (GPU 2)
 python3 gpu_tables.py out_paper     # per-row mean/min/max prove, verify, MiB, peak, attempts, stages
 ```
 
+`run_ablations.sh [model ...]` (default `gpt2 yolo whisper`) runs the
+same-protocol ablations on two GPUs (`ABL_DEVS`, `ABL_NG`): the default
+prover, the link kernels off, a fully dense link (`MORPHEUS_DENSE_LINK=1`)
+and the opening on the link's source placement (`MORPHEUS_AUTH_COLS=0`).
+It first checks with fixed coins (dev only) that all variants produce the
+same proof, then times them with fresh coins and writes
+`out_abl/ablation_summary.csv`.
+
 `run_models.sh <selector ...>` runs single rows. Selectors: model names
 (`gpt2 bert llama2 llama3 gptj resnet vgg yolo unet3d pointpillars
 whisper`), `dp1s32 dp1s128 dp1cnn` (DeepProve workloads), `ezkl ezkl8`
